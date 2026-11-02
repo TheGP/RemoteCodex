@@ -1,0 +1,95 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+
+module.exports = async ({ app, window }) => {
+  const local = process.argv.includes('--local');
+  const artifacts = path.join(app.isPackaged ? path.join(app.getPath('temp'), 'remote-codex-artifacts') : path.resolve(__dirname, '..', 'artifacts'), local ? 'local' : 'ssh');
+  fs.mkdirSync(artifacts, { recursive: true });
+  const logs = [];
+  window.webContents.on('console-message', (_event, level, message) => { if (level >= 2) logs.push(message); });
+  const evaluate = expression => window.webContents.executeJavaScript(expression);
+  const wait = async (expression, timeout = 60000) => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (await evaluate(expression)) return;
+      if (await evaluate("!document.getElementById('error').hidden")) throw new Error(await evaluate("document.getElementById('error-text').textContent"));
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
+    throw new Error(`Timeout: ${expression}\n${await evaluate('document.body.innerText')}`);
+  };
+  let threadId;
+  const watchdog = setTimeout(() => { console.error('Desktop test watchdog expired'); app.exit(1); }, 240000);
+  try {
+    const regressions = await require('./renderer.cjs')();
+    for (const result of regressions) console.log('PASS regression:', result);
+    if (window.webContents.isLoading()) await new Promise(resolve => window.webContents.once('did-finish-load', resolve));
+    await wait('state.connected && state.models.length > 0 && !state.connecting');
+    assert.equal(await evaluate('isLocal()'), local);
+    assert.equal(await evaluate("document.getElementById('machine-badge').textContent"), local ? 'LOCAL' : 'REMOTE');
+    if (local) assert.ok(await evaluate("state.models.some(model => model.model === 'gpt-6.1-sol')"), 'Local Codex is missing gpt-6.1-sol');
+    console.log('PASS desktop preload, connection, models, history');
+    fs.writeFileSync(path.join(artifacts, 'welcome.png'), (await window.webContents.capturePage()).toPNG());
+    await evaluate('openProjectPicker()');
+    await evaluate("browseFolders('/tmp')");
+    assert.equal(await evaluate('state.folderPath'), '/tmp');
+    await evaluate("document.getElementById('use-folder').click()");
+    assert.equal(await evaluate("document.getElementById('workspace').value"), '/tmp');
+    console.log('PASS live project folder selection');
+    await evaluate("document.getElementById('permissions').value='read-only'; document.getElementById('prompt').value='Reply exactly DESKTOP_CODEX_OK. Do not use tools.'; document.getElementById('composer').requestSubmit();");
+    await wait("!state.sending && !state.active.size && document.getElementById('messages').innerText.includes('DESKTOP_CODEX_OK') && document.querySelector('.agentMessage')");
+    threadId = await evaluate('state.thread.id');
+    console.log('PASS desktop sends and displays streamed inference');
+    assert.equal(await evaluate("document.querySelectorAll('.userMessage').length"), 1, 'Duplicate user message');
+    assert.equal(await evaluate("document.getElementById('error').hidden"), true, await evaluate("document.getElementById('error-text').textContent"));
+    await evaluate("document.getElementById('new-chat').click()");
+    await evaluate('loadThreads()');
+    await evaluate(`togglePin(state.threads.find(thread => thread.id === ${JSON.stringify(threadId)}))`);
+    assert.ok(await evaluate(`state.pinnedIds.has(${JSON.stringify(threadId)})`));
+    assert.ok(await evaluate(`api.pins().then(ids => ids.includes(${JSON.stringify(threadId)}))`));
+    await evaluate('connect(state.options)');
+    assert.ok(await evaluate(`state.pinnedIds.has(${JSON.stringify(threadId)})`));
+    assert.equal(await evaluate("document.querySelector('#threads .thread-group').textContent"), 'PINNED');
+    console.log('PASS pinned conversations persist after reconnect');
+    await evaluate(`openThread(state.threads.find(thread => thread.id === ${JSON.stringify(threadId)}))`);
+    await wait("!state.loading && document.getElementById('messages').innerText.includes('DESKTOP_CODEX_OK')");
+    console.log('PASS desktop conversation selection and saved history');
+    await evaluate("document.getElementById('prompt').value='What exact token did you just reply with? Reply with that token only. Do not use tools.'; document.getElementById('composer').requestSubmit();");
+    await wait("!state.sending && !state.active.size && document.querySelectorAll('.agentMessage').length >= 2");
+    assert.match(await evaluate("[...document.querySelectorAll('.agentMessage .message-body')].at(-1).textContent"), /DESKTOP_CODEX_OK/);
+    console.log('PASS desktop follow-up retains context');
+    fs.writeFileSync(path.join(artifacts, 'conversation.png'), (await window.webContents.capturePage()).toPNG());
+    await evaluate("document.getElementById('prompt').value='Use your shell tool to run pwd and tell me the result. Do not modify files.'; document.getElementById('composer').requestSubmit();");
+    await wait("!state.sending && !state.active.size && [...document.querySelectorAll('.agentMessage .message-body')].at(-1)?.textContent.includes('/tmp')");
+    assert.ok(await evaluate("document.querySelectorAll('.tool').length > 0"));
+    assert.match(await evaluate("document.getElementById('messages').innerText"), /\/tmp/);
+    console.log('PASS shell activity in the desktop GUI');
+    fs.writeFileSync(path.join(artifacts, 'tools.png'), (await window.webContents.capturePage()).toPNG());
+    await evaluate("document.getElementById('prompt').value='Think carefully through a detailed plan for a new compiler, then explain each phase at length. Do not use tools.'; document.getElementById('composer').requestSubmit();");
+    await wait('!state.sending && state.active.size > 0');
+    await evaluate("document.getElementById('stop').click()");
+    await wait('!state.active.size');
+    const latest = await evaluate(`rpc('thread/turns/list', { threadId: ${JSON.stringify(threadId)}, limit: 1, sortDirection: 'desc', itemsView: 'full' })`);
+    assert.equal(latest.data[0].status, 'interrupted');
+    console.log('PASS interrupt running turn');
+    await evaluate("document.getElementById('open-settings').click()");
+    assert.equal(await evaluate("document.getElementById('connection-mode').value"), local ? 'local' : 'ssh');
+    assert.equal(await evaluate("document.getElementById('ssh-settings').hidden"), local);
+    fs.writeFileSync(path.join(artifacts, 'settings.png'), (await window.webContents.capturePage()).toPNG());
+    await evaluate("document.getElementById('close-settings').click()");
+    assert.equal(await evaluate(`(() => { const el = document.createElement('div'); markdown(el, '<img src=x onerror=alert(1)><script>alert(2)</script><p onclick="alert(3)">Safe</p>'); return el.querySelectorAll('script,img,[onclick]').length; })()`), 0);
+    assert.equal(logs.filter(line => /uncaught|refused|failed|error/i.test(line)).length, 0, JSON.stringify(logs));
+    console.log('PASS settings, safe Markdown, no renderer errors');
+    await evaluate(`togglePin(state.pinnedThreads.get(${JSON.stringify(threadId)}))`);
+    assert.equal(await evaluate(`state.pinnedIds.has(${JSON.stringify(threadId)})`), false);
+    await evaluate(`rpc('thread/archive', { threadId: ${JSON.stringify(threadId)} })`);
+    console.log('PASS test conversation archived');
+    fs.writeFileSync(path.join(artifacts, 'desktop-result.json'), JSON.stringify({ success: true, mode: local ? 'local' : 'ssh', platform: process.platform, electron: process.versions.electron, checks: 10, regressions, rendererWarnings: logs }, null, 2));
+    clearTimeout(watchdog); app.exit(0);
+  } catch (error) {
+    console.error(error);
+    fs.writeFileSync(path.join(artifacts, 'failure.png'), (await window.webContents.capturePage()).toPNG());
+    fs.writeFileSync(path.join(artifacts, 'desktop-result.json'), JSON.stringify({ success: false, error: error.message, logs }, null, 2));
+    clearTimeout(watchdog); app.exit(1);
+  }
+};

@@ -1,0 +1,24 @@
+{
+  "name": "remote-codex",
+  "version": "1.0.1",
+  "description": "A small desktop client for Codex over SSH",
+  "productName": "Remote Codex",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.cjs",
+    "test:live": "node test/live.cjs",
+    "package:mac": "electron-packager . \"Remote Codex\" --icon=assets/icon.icns --platform=darwin --arch=x64 --out=dist --overwrite --asar --ignore=\"^/(dist|artifacts)(/|$)\"",
+    "package:win": "electron-packager . \"Remote Codex\" --icon=assets/icon.ico --platform=win32 --arch=x64 --out=dist --overwrite --asar --ignore=\"^/(dist|artifacts)(/|$)\"",
+    "test:renderer": "electron test/renderer-runner.cjs"
+  },
+  "dependencies": {
+    "dompurify": "3.4.17",
+    "marked": "18.1.1"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "electron": "43.8.3"
+  }
+}
