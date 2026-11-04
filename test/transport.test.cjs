@@ -152,3 +152,28 @@ test('history responses mark the boundary between past and new stream events', a
   assert.ok(events[1].receivedSequence > snapshot.receivedSequence);
   f.connection.disconnect();
 });
+
+test('real RPC and notification routing keeps the app awake through parallel turns and releases failures, timeouts, and disconnects', async () => {
+  const { AgentWakeLock } = require('../wake-lock.cjs');
+  const f = fixture(); const starts = []; const stops = [];
+  const lock = new AgentWakeLock({ start: type => { starts.push(type); return starts.length; }, stop: id => stops.push(id) }, f.connection);
+  await f.connection.connect(); assert.equal(starts.length, 0);
+  const one = f.connection.call('turn/start', { threadId: 'one' });
+  const firstRequest = f.writes.at(-1);
+  f.child.stdout.write(JSON.stringify({ method: 'turn/started', params: { threadId: 'one', turn: { id: 'first' } } }) + '\n');
+  f.child.stdout.write(JSON.stringify({ id: firstRequest.id, result: { turn: { id: 'first', status: 'inProgress' } } }) + '\n'); await one;
+  const two = f.connection.call('turn/start', { threadId: 'two' });
+  f.child.stdout.write(JSON.stringify({ id: f.writes.at(-1).id, result: { turn: { id: 'second', status: 'inProgress' } } }) + '\n'); await two;
+  f.child.stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'one', turn: { id: 'first', status: 'completed' } } }) + '\n');
+  await assert.rejects(f.connection.call('turn/start', { threadId: 'timeout' }, 5), /timed out/);
+  assert.equal(lock.pending.size, 0); assert.equal(stops.length, 0); assert.equal(lock.active.size, 1);
+  f.child.stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'two', turn: { id: 'second', status: 'interrupted' } } }) + '\n');
+  assert.deepEqual(starts, ['prevent-app-suspension']); assert.deepEqual(stops, [1]);
+  const rejected = f.connection.call('turn/start', { threadId: 'rejected' });
+  f.child.stdout.write(JSON.stringify({ id: f.writes.at(-1).id, error: { message: 'Turn rejected' } }) + '\n');
+  await assert.rejects(rejected, /Turn rejected/); assert.deepEqual(stops, [1, 2]);
+  const disconnected = f.connection.call('review/start', { threadId: 'review' });
+  f.connection.disconnect(); await assert.rejects(disconnected, /Disconnected/); assert.deepEqual(stops, [1, 2, 3]);
+  await assert.rejects(f.connection.call('turn/start', { threadId: 'offline' }), /Connect to Codex/);
+  assert.deepEqual(stops, [1, 2, 3, 4]); assert.equal(lock.id, null);
+});

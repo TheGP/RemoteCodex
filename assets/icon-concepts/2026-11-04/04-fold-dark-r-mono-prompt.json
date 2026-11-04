@@ -1,0 +1,6 @@
+{
+  "generator": "Built-in image_gen",
+  "source": "/Users/EugeneBos/.codex/generated_images/01a19944-33f9-7832-bf92-6677ad1e5b5e/exec-8815dba8-47fc-46e8-86f8-4dbd4442cebc.png",
+  "prompt": "Edit the supplied Remote Codex macOS app icon with ONE precise change only: remove the small green accent on the inner diagonal fold of the R, replacing its green color with neutral ivory-white / silver-gray shading that matches the surrounding folded ribbon. The result must be completely monochrome: white and silver R on a charcoal-black rounded-square tile. Preserve the exact R shape, fold geometry, shading depth, material, proportions, positioning, tile, corners, size, lighting, contrast, and all other pixels as closely as possible. Do not simplify or redesign the R, do not add anything, no green or other hue anywhere. Preserve the existing transparent outer margins exactly. Clean finished app icon with no text or mockup.",
+  "output": "04-fold-dark-r-mono.png"
+}

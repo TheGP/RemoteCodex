@@ -1,6 +1,49 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { generateTitle } = require('../titles.cjs');
+const { generateTitle, readThreadForTitle } = require('../titles.cjs');
+
+const emptyRollout = () => new Error('failed to read thread: thread-store internal error: failed to read session metadata /tmp/rollout.jsonl: rollout at /tmp/rollout.jsonl is empty');
+
+test('title reads wait for new rollout metadata and keep read parameters unchanged', async () => {
+  const pauses = []; let calls = 0;
+  const ready = { thread: { id: 'new-chat', name: null } };
+  const connection = { call: async (method, params) => {
+    assert.equal(method, 'thread/read'); assert.deepEqual(params, { threadId: 'new-chat', includeTurns: false });
+    if (++calls < 3) throw emptyRollout();
+    return ready;
+  } };
+  assert.equal(await readThreadForTitle(connection, 'new-chat', () => true, async pause => pauses.push(pause)), ready);
+  assert.deepEqual(pauses, [100, 250]); assert.equal(calls, 3);
+});
+
+test('empty rollout retries are bounded and leave the title available for a later attempt', async () => {
+  let calls = 0; const pauses = [];
+  const connection = { call: async () => { calls++; throw emptyRollout(); } };
+  assert.equal(await readThreadForTitle(connection, 'new-chat', () => true, async pause => pauses.push(pause)), null);
+  assert.equal(calls, 6); assert.deepEqual(pauses, [100, 250, 500, 1000, 2000]);
+  connection.call = async () => ({ thread: { id: 'new-chat' } });
+  assert.equal((await readThreadForTitle(connection, 'new-chat', () => true)).thread.id, 'new-chat');
+});
+
+test('title read retries stop when a connection changes or a manual title arrives', async () => {
+  for (const reason of ['connection changed', 'manually renamed']) {
+    let current = true; let calls = 0;
+    const connection = { call: async () => { calls++; throw emptyRollout(); } };
+    assert.equal(await readThreadForTitle(connection, reason, () => current, async () => { current = false; }), null);
+    assert.equal(calls, 1);
+    assert.equal(await readThreadForTitle(connection, reason, () => false), null);
+    assert.equal(calls, 1);
+  }
+});
+
+test('title reads do not retry or hide unrelated thread errors', async () => {
+  for (const message of ['thread not found', 'Permission denied', 'OpenRouter returned an empty title response.']) {
+    let calls = 0;
+    const connection = { call: async () => { calls++; throw new Error(message); } };
+    await assert.rejects(readThreadForTitle(connection, 'new-chat', () => true, async () => assert.fail('Unexpected retry')), { message });
+    assert.equal(calls, 1);
+  }
+});
 
 test('titles use a fixed cheap model, bounded output, and isolated prompt data', async () => {
   let calls = 0;

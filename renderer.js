@@ -6,7 +6,7 @@ const projects = { data: [], selected: null, focused: null, cursors: new Map(), 
 const preferences = { theme: 'system', startupProjects: {} };
 const threadDrag = { source: null, pending: new Set(), type: 'application/x-remote-codex-thread' };
 const projectDrag = { source: null, pending: null, type: 'application/x-remote-codex-project' };
-const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), queues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Set(), titleTask: Promise.resolve(), titleFailed: false, images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
+const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), queues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Set(), newThreads: new Set(), titleTask: Promise.resolve(), titleFailed: false, images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
 const slash = { index: 0, matches: [], dismissed: null, skills: [], cwd: null, loading: false, generation: 0, skillOnly: false };
 const modes = { plan: false, catalog: [], threads: new Map() };
 const slashCommands = [
@@ -808,7 +808,7 @@ async function submitMessage(message, steer = false) {
       const result = message.review ? await rpc('review/start', { threadId: message.thread.id, target: { type: 'uncommittedChanges' }, delivery: 'inline' }) : await rpc('turn/start', { ...settings, input: message.input });
       if (accessKey() === message.machine && result.turn.status === 'inProgress' && !state.finished.has(result.turn.id)) state.active.set(message.thread.id, result.turn.id);
     }
-    if (accessKey() === message.machine) requestTitle({ ...message.thread, preview: message.text });
+    if (accessKey() === message.machine) { state.newThreads.delete(message.thread.id); requestTitle({ ...message.thread, preview: message.text }); }
   } catch (error) {
     if (visible()) { state.items.get(temporary)?.element.remove(); state.items.delete(temporary); }
     throw error;
@@ -853,6 +853,7 @@ async function send(event, steer = false, action = null) {
     if (!state.thread) {
       const result = await rpc('thread/start', { cwd: $('workspace').value.trim(), ...access, ...(projects.selected ? { projectId: projects.selected } : {}), ...(message.model ? { model: message.model } : {}) });
       if (!result.thread.preview?.trim()) result.thread.preview = text || 'Image';
+      state.newThreads.add(result.thread.id);
       state.owned.add(result.thread.id);
       modes.threads.set(result.thread.id, message.mode === 'plan');
       setThread(result.thread);
@@ -885,14 +886,17 @@ function applyName(threadId, name) {
   renderThreads();
 }
 function requestTitle(thread) {
-  if (!api.title || !thread.preview?.trim() || thread.name || state.names.has(thread.id) || state.titling.has(thread.id) || state.titleFailed) return;
+  if (!api.title || !thread.preview?.trim() || thread.name || state.names.has(thread.id) || state.titling.has(thread.id) || state.newThreads.has(thread.id) || state.titleFailed) return;
   const options = state.options;
   state.titling.add(thread.id);
   state.titleTask = state.titleTask.catch(() => {}).then(async () => {
     if (state.options !== options || state.titleFailed) return;
     try {
       const name = await api.title(thread.id, thread.preview.slice(0, 4000));
-      if (state.options === options && name && !state.names.has(thread.id)) applyName(thread.id, name);
+      if (state.options === options) {
+        if (name && !state.names.has(thread.id)) applyName(thread.id, name);
+        else if (!name) state.titling.delete(thread.id);
+      }
     } catch (error) {
       if (state.options === options) { state.titleFailed = true; showError(error); }
     }
@@ -991,7 +995,7 @@ async function connect(options) {
   try { const saved = JSON.parse(localStorage.getItem(accessKey() + ':collapsed-projects') || '[]'); if (Array.isArray(saved)) projects.collapsed = new Set(saved.filter(id => typeof id === 'string')); } catch {}
   $('project-dialog').close(); state.projectDraft = null; $('move-project-dialog').close(); $('project-view-dialog').close();
   state.owned.clear(); state.resuming.clear();
-  state.names.clear(); state.titling.clear(); state.titleFailed = false;
+  state.names.clear(); state.titling.clear(); state.newThreads.clear(); state.titleFailed = false;
   slash.generation++; slash.skills = []; slash.cwd = null; slash.loading = false; modes.catalog = []; modes.threads.clear();
   $('edit-queue-dialog').close();
   $('thread-menu').hidden = true; $('rename-dialog').close(); $('edit-message-dialog').close();

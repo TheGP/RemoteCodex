@@ -827,11 +827,37 @@ async function checks() {
   $('prompt').value = initialPromptText; const firstSend = send(); await settle();
   const titleRow = () => $('threads').querySelector('[data-thread-id="prompt-title-new-chat"] strong');
   check(titleRow()?.textContent === previewTitle && $('thread-title').textContent === previewTitle, 'New chat showed a placeholder while waiting for its title');
+  renderThreads(); await settle();
+  check(!finishTitle && state.newThreads.has('prompt-title-new-chat'), 'Title generation read a new rollout before its first turn was accepted');
+  finishFirstTurn({ turn: { id: 'prompt-title-first-turn', status: 'completed' } }); await firstSend; await settle();
+  check(typeof finishTitle === 'function' && !state.newThreads.has('prompt-title-new-chat'), 'Title generation did not start after the first turn was accepted');
   finishTitle('Project setup repair'); await state.titleTask;
   check(titleRow()?.textContent === 'Project setup repair' && $('thread-title').textContent === 'Project setup repair', 'Generated title did not replace the initial prompt in both places');
-  finishFirstTurn({ turn: { id: 'prompt-title-first-turn', status: 'completed' } }); await firstSend;
   delete api.title;
-  results.push('new chat immediately shows the beginning of its prompt, then replaces it with the generated title in the sidebar and header');
+  results.push('new chat shows its prompt immediately and waits for first-turn acceptance before reading its rollout for a generated title');
+
+  resetThread(); state.threads = []; state.names.clear(); state.titling.clear(); state.newThreads.clear(); state.titleFailed = false;
+  let startupTitleCalls = 0;
+  api.title = async () => { startupTitleCalls++; return null; };
+  api.rpc = async method => {
+    if (method === 'thread/start') return { thread: { id: 'failed-first-turn-title', preview: '', cwd: '/tmp' } };
+    if (method === 'turn/start') throw new Error('First turn rejected');
+    return { data: [], nextCursor: null };
+  };
+  $('prompt').value = 'Keep my prompt while startup fails'; await send(); renderThreads(); await settle();
+  check(!startupTitleCalls && state.newThreads.has('failed-first-turn-title') && $('prompt').value === 'Keep my prompt while startup fails', 'Failed first turn triggered a title read or lost its draft');
+  api.rpc = async () => ({ turn: { id: 'retried-first-turn', status: 'completed' } });
+  await send(); await state.titleTask;
+  check(startupTitleCalls === 1 && !state.titling.has('failed-first-turn-title') && !state.titleFailed, 'An unready rollout permanently disabled title generation');
+  const deferredTitleThread = state.thread;
+  check(titleOf(deferredTitleThread) === 'Keep my prompt while startup fails', 'Unready title discarded the prompt preview');
+  let laterTitleCalls = 0;
+  api.title = async id => { laterTitleCalls++; return id === deferredTitleThread.id ? 'Recovered startup title' : 'Another conversation title'; };
+  requestTitle({ id: 'another-title-after-startup', preview: 'A different prompt' }); await state.titleTask;
+  requestTitle(deferredTitleThread); await state.titleTask;
+  check(laterTitleCalls === 2 && titleOf(deferredTitleThread) === 'Recovered startup title' && !state.titleFailed, 'An empty rollout blocked other titles or could not be retried');
+  $('error').hidden = true; delete api.title;
+  results.push('failed first turns keep prompt drafts; unready rollout titles remain retryable without disabling titles in other chats');
 
   savedQueues.clear(); state.queues.clear(); resetThread(); state.active.clear(); state.owned.clear();
   state.options = { mode: 'local' }; state.connected = true; projects.data = []; projects.selected = null;

@@ -1,5 +1,17 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const { setTimeout: delay } = require('node:timers/promises');
+
+async function readThreadForTitle(connection, threadId, current, wait = delay) {
+  for (const pause of [0, 100, 250, 500, 1000, 2000]) {
+    if (!current()) return null;
+    if (pause) await wait(pause);
+    if (!current()) return null;
+    try { return await connection.call('thread/read', { threadId, includeTurns: false }); }
+    catch (error) { if (!/rollout at [^\r\n]+ is empty(?:\.|$)/i.test(error.message)) throw error; }
+  }
+  return null;
+}
 
 async function titleResponse(messages, key, request, maxTokens) {
   const response = await request('https://openrouter.ai/api/v1/chat/completions', {
@@ -42,4 +54,4 @@ function titleKey(directory, safeStorage) {
   return safeStorage.decryptString(fs.readFileSync(file));
 }
 
-module.exports = { generateTitle, titleKey };
+module.exports = { generateTitle, titleKey, readThreadForTitle };

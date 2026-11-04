@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, Menu, dialog, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, dialog, safeStorage, powerSaveBlocker } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
@@ -6,7 +6,8 @@ const { CodexConnection, connectionOptions } = require('./transport.cjs');
 const { PinStore } = require('./pins.cjs');
 const { QueueStore } = require('./queues.cjs');
 const { PreferencesStore } = require('./preferences.cjs');
-const { generateTitle, titleKey } = require('./titles.cjs');
+const { generateTitle, titleKey, readThreadForTitle } = require('./titles.cjs');
+const { AgentWakeLock } = require('./wake-lock.cjs');
 
 const connection = new CodexConnection();
 const page = pathToFileURL(path.join(__dirname, 'index.html')).href;
@@ -24,6 +25,8 @@ function checkSender(event) {
 }
 
 app.whenReady().then(async () => {
+  const wakeLock = new AgentWakeLock(powerSaveBlocker, connection, working => connection.emit('diagnostic', { event: 'power.keep-awake', details: { working } }));
+  app.on('before-quit', () => wakeLock.clear());
   const settingsFile = path.join(app.getPath('userData'), 'connection.json');
   settings = connectionOptions({ mode: 'local' });
   try { settings = connectionOptions(JSON.parse(fs.readFileSync(settingsFile, 'utf8'))); } catch (error) {
@@ -74,11 +77,13 @@ app.whenReady().then(async () => {
     const current = () => connection.ready && settings === options && !manualNames.has(nameKey);
     const task = titleQueue.catch(() => {}).then(async () => {
       if (!current()) return null;
-      const before = await connection.call('thread/read', { threadId, includeTurns: false });
+      const before = await readThreadForTitle(connection, threadId, current);
+      if (!before || !current()) return null;
       if (before.thread.name) return before.thread.name;
       const name = await generateTitle(prompt, titleKey(app.getPath('userData'), safeStorage));
       if (!current()) return null;
-      const latest = await connection.call('thread/read', { threadId, includeTurns: false });
+      const latest = await readThreadForTitle(connection, threadId, current);
+      if (!latest || !current()) return null;
       if (latest.thread.name) return latest.thread.name;
       if (!current()) return null;
       await connection.call('thread/name/set', { threadId, name });

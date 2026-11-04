@@ -107,6 +107,7 @@ class CodexConnection extends EventEmitter {
         const request = this.pending.get(message.id);
         this.pending.delete(message.id);
         clearTimeout(request.timer);
+        this.emit('rpc', { phase: 'finished', requestId: message.id, method: request.method, threadId: request.threadId, result: message.result });
         if (message.error) request.reject(new Error(message.error.message));
         else request.resolve(request.method === 'thread/turns/list' ? { ...message.result, receivedSequence } : message.result);
       }
@@ -130,14 +131,17 @@ class CodexConnection extends EventEmitter {
   call(method, params = {}, timeout = 90000) {
     return new Promise((resolve, reject) => {
       const id = ++this.sequence;
+      this.emit('rpc', { phase: 'started', requestId: id, method, threadId: params?.threadId });
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        this.emit('rpc', { phase: 'finished', requestId: id, method, threadId: params?.threadId });
         reject(new Error(`${method} timed out. Reconnect before retrying; the server may have received the request.`));
       }, timeout);
-      this.pending.set(id, { resolve, reject, timer, method });
+      this.pending.set(id, { resolve, reject, timer, method, threadId: params?.threadId });
       try { this.write({ id, method, params }); } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
+        this.emit('rpc', { phase: 'finished', requestId: id, method, threadId: params?.threadId });
         reject(error);
       }
     });
@@ -165,6 +169,7 @@ class CodexConnection extends EventEmitter {
     }
     this.pending.clear();
     this.requests.clear();
+    this.emit('disconnected');
   }
 }
 

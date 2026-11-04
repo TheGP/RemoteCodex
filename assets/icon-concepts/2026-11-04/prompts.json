@@ -1,0 +1,40 @@
+{
+  "generator": "Built-in image_gen",
+  "variants": [
+    {
+      "number": 1,
+      "name": "Terminal",
+      "prompt": "Use case: logo-brand. Create ONE finished macOS Dock app icon for Remote Codex, a desktop app for directing remote coding agents. Square 1024x1024 image. A single centered macOS rounded-square tile occupies about 84% of the canvas, with consistent empty transparent margins on every side. Smooth continuous Apple-style corners, not a circle. Crisp silhouette and outstanding legibility at 32px. Refined modern native desktop product aesthetic, restrained tactile depth, bold simple shapes, very clean edges. No app name, no captions, no labels, no watermark, no mockup scene, no additional icons, no checkerboard. The area OUTSIDE the rounded-square tile must be genuinely transparent. Concept 1, TERMINAL: luminous warm-white porcelain tile with a large near-black terminal prompt glyph, a strong angled chevron on the left and a short baseline underscore on the right. Extremely simple, perfectly balanced, beautifully proportioned; the chevron and underscore form one compact commanding symbol. Only those two dark elements. White tile, near-black glyph. Slight bevel and soft material highlight, no decorative lines or rainbow effects.",
+      "filename": "01-terminal.png",
+      "source": "/Users/EugeneBos/.codex/generated_images/01a19944-33f9-7832-bf92-6677ad1e5b5e/exec-b7f4250e-1c65-4130-8c9c-55fe8e48a707.png"
+    },
+    {
+      "number": 2,
+      "name": "Linked",
+      "prompt": "Use case: logo-brand. Create ONE finished macOS Dock app icon for Remote Codex, a desktop app for directing remote coding agents. Square 1024x1024 image. A single centered macOS rounded-square tile occupies about 84% of the canvas, with consistent empty transparent margins on every side. Smooth continuous Apple-style corners, not a circle. Crisp silhouette and outstanding legibility at 32px. Refined modern native desktop product aesthetic, restrained tactile depth, bold simple shapes, very clean edges. No app name, no captions, no labels, no watermark, no mockup scene, no additional icons, no checkerboard. The area OUTSIDE the rounded-square tile must be genuinely transparent. Concept 2, LINKED: matte charcoal-black tile holding an original bold ivory-white abstract link mark. Two thick rounded rectangular chain links interlock diagonally, one upper-left and one lower-right, with very clear central negative space; geometric and confident rather than delicate. A tiny restrained warm-silver bevel gives the white mark physical polish. The mark represents connecting a local computer to a remote coding agent. No terminal text, no knot, no OpenAI flower, no infinity symbol, no gradients that reduce contrast.",
+      "filename": "02-linked.png",
+      "source": "/Users/EugeneBos/.codex/generated_images/01a19944-33f9-7832-bf92-6677ad1e5b5e/exec-04087304-4fec-464a-9807-1824422203af.png"
+    },
+    {
+      "number": 3,
+      "name": "Portal",
+      "prompt": "Use case: logo-brand. Create ONE finished macOS Dock app icon for Remote Codex, a desktop app for directing remote coding agents. Square 1024x1024 image. A single centered macOS rounded-square tile occupies about 84% of the canvas, with consistent empty transparent margins on every side. Smooth continuous Apple-style corners, not a circle. Crisp silhouette and outstanding legibility at 32px. Refined modern native desktop product aesthetic, restrained tactile depth, bold simple shapes, very clean edges. No app name, no captions, no labels, no watermark, no mockup scene, no additional icons, no checkerboard. The area OUTSIDE the rounded-square tile must be genuinely transparent. Concept 3, PORTAL: rich deep cobalt-blue tile with a bold single white architectural portal symbol. Two broad opposing square corner brackets form an almost-complete square gate around a small white central square, with precisely composed asymmetric breaks suggesting code flowing between two machines. Entire design uses only blue and white. Strong distinctive geometry, beautifully proportioned, light native macOS dimensionality, very legible at tiny Dock sizes. Not a QR code; only two broad brackets and one central square.",
+      "filename": "03-portal.png",
+      "source": "/Users/EugeneBos/.codex/generated_images/01a19944-33f9-7832-bf92-6677ad1e5b5e/exec-775f76a0-6c2a-4292-8c8e-937bd1284a86.png"
+    },
+    {
+      "number": 4,
+      "name": "Fold",
+      "prompt": "Use case: logo-brand. Create ONE finished macOS Dock app icon for Remote Codex, a desktop app for directing remote coding agents. Square 1024x1024 image. A single centered macOS rounded-square tile occupies about 84% of the canvas, with consistent empty transparent margins on every side. Smooth continuous Apple-style corners, not a circle. Crisp silhouette and outstanding legibility at 32px. Refined modern native desktop product aesthetic, restrained tactile depth, bold simple shapes, very clean edges. No app name, no captions, no labels, no watermark, no mockup scene, no additional icons, no checkerboard. The area OUTSIDE the rounded-square tile must be genuinely transparent. Concept 4, FOLD: soft ivory-white tile bearing a large sculptural black folded ribbon that forms an original angular capital-C silhouette with a sharp inner negative-space chevron. The ribbon is broad, confident, and continuous, with just two visible folded planes in black and graphite; no thin strokes. A tiny subtle soft green inner-facing plane is the sole accent. This is a premium graphic monogram, not the literal word Codex, not an OpenAI knot. Overall striking minimal white icon with black sculptural folded-code symbol.",
+      "filename": "04-fold.png",
+      "source": "/Users/EugeneBos/.codex/generated_images/01a19944-33f9-7832-bf92-6677ad1e5b5e/exec-92286607-026d-4d3d-82e3-e976293dc0eb.png"
+    },
+    {
+      "number": 5,
+      "name": "Beacon",
+      "prompt": "Use case: logo-brand. Create ONE finished macOS Dock app icon for Remote Codex, a desktop app for directing remote coding agents. Square 1024x1024 image. A single centered macOS rounded-square tile occupies about 84% of the canvas, with consistent empty transparent margins on every side. Smooth continuous Apple-style corners, not a circle. Crisp silhouette and outstanding legibility at 32px. Refined modern native desktop product aesthetic, restrained tactile depth, bold simple shapes, very clean edges. No app name, no captions, no labels, no watermark, no mockup scene, no additional icons, no checkerboard. The area OUTSIDE the rounded-square tile must be genuinely transparent. Concept 5, BEACON: sophisticated deep forest-green rounded-square tile with a large soft-white minimalist remote-signal symbol. A compact white terminal-like rectangular core sits below two bold concentric upward radiating arcs, creating a calm iconic beacon silhouette with generous negative space. Only two arcs, one small core, no extra dots. The geometry should feel like a beautifully designed native Mac utility icon, bold and friendly; no Wi-Fi triangle, no antenna mast, no words. Restrained enamel-like material, subtle edge light, green and ivory only.",
+      "filename": "05-beacon.png",
+      "source": "/Users/EugeneBos/.codex/generated_images/01a19944-33f9-7832-bf92-6677ad1e5b5e/exec-4a1e03f5-2f48-4587-b132-f61b69b2c3de.png"
+    }
+  ]
+}
