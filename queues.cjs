@@ -11,6 +11,13 @@ class QueueStore {
 
   file(key) { return path.join(this.directory, createHash('sha256').update(key).digest('hex') + '.json'); }
 
+  hasMessages(key) {
+    try {
+      const queue = JSON.parse(fs.readFileSync(this.file(key), 'utf8')); validate(queue);
+      return queue.messages.length > 0;
+    } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  }
+
   list() {
     let files;
     try { files = fs.readdirSync(this.directory); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
@@ -36,4 +43,4 @@ class QueueStore {
   }
 }
 
-module.exports = { QueueStore };
+module.exports = { QueueStore, validateQueue: validate };

@@ -20,6 +20,8 @@ test('queued messages persist through restart with their inputs and settings and
   const saved = store(t); const draft = queue();
   assert.deepEqual(saved.list(), []);
   saved.save(draft);
+  assert.equal(saved.hasMessages(draft.key), true);
+  assert.equal(saved.hasMessages('access:local:another-chat'), false);
   const restored = new QueueStore(saved.directory).list()[0];
   assert.deepEqual(restored.messages, draft.messages);
   assert.equal(restored.paused, true);
@@ -36,6 +38,8 @@ test('text edits, images larger than localStorage, removal, and machine isolatio
   local.messages[0].text = 'Edited draft'; saved.save(local);
   assert.equal(new QueueStore(saved.directory).list().find(entry => entry.machine === local.machine).messages[0].text, 'Edited draft');
   local.messages = []; saved.save(local);
+  assert.equal(saved.hasMessages(local.key), false);
+  assert.equal(saved.hasMessages(ssh.key), true);
   assert.deepEqual(new QueueStore(saved.directory).list().map(entry => entry.machine), [ssh.machine]);
 });
 

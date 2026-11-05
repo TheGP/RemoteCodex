@@ -69,13 +69,17 @@ class CodexConnection extends EventEmitter {
     this.spawnProcess = spawnProcess;
   }
 
-  async connect(options) {
+  async connect(options, schedulerMcp = null) {
     options = connectionOptions(options);
     this.disconnect();
     let command, args, env, cwd;
     if (options.mode === 'local') {
       ({ command, args, env } = localLaunch(options));
       cwd = options.localCwd;
+      if (schedulerMcp) {
+        args.push('-c', `mcp_servers.remote_codex_scheduler.url=${JSON.stringify(schedulerMcp.url)}`, '-c', 'mcp_servers.remote_codex_scheduler.bearer_token_env_var="REMOTE_CODEX_SCHEDULER_TOKEN"');
+        env.REMOTE_CODEX_SCHEDULER_TOKEN = schedulerMcp.token;
+      }
     } else {
       command = process.platform === 'win32' ? 'ssh.exe' : '/usr/bin/ssh';
       args = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=12', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', '-p', String(options.port)];
@@ -107,6 +111,7 @@ class CodexConnection extends EventEmitter {
         const request = this.pending.get(message.id);
         this.pending.delete(message.id);
         clearTimeout(request.timer);
+        this.emit('diagnostic', { event: message.error ? 'rpc.failed' : 'rpc.completed', details: { ...request.diagnostic, durationMs: Date.now() - request.startedAt, status: message.result?.turn?.status || message.result?.thread?.status?.type, error: message.error?.message } });
         this.emit('rpc', { phase: 'finished', requestId: message.id, method: request.method, threadId: request.threadId, result: message.result });
         if (message.error) request.reject(new Error(message.error.message));
         else request.resolve(request.method === 'thread/turns/list' ? { ...message.result, receivedSequence } : message.result);
@@ -131,16 +136,21 @@ class CodexConnection extends EventEmitter {
   call(method, params = {}, timeout = 90000) {
     return new Promise((resolve, reject) => {
       const id = ++this.sequence;
+      const diagnostic = { requestId: id, method, threadId: params?.threadId, turnId: params?.turnId || params?.expectedTurnId };
+      const startedAt = Date.now();
+      this.emit('diagnostic', { event: 'rpc.started', details: diagnostic });
       this.emit('rpc', { phase: 'started', requestId: id, method, threadId: params?.threadId });
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        this.emit('diagnostic', { event: 'rpc.timeout', details: { ...diagnostic, durationMs: Date.now() - startedAt } });
         this.emit('rpc', { phase: 'finished', requestId: id, method, threadId: params?.threadId });
         reject(new Error(`${method} timed out. Reconnect before retrying; the server may have received the request.`));
       }, timeout);
-      this.pending.set(id, { resolve, reject, timer, method, threadId: params?.threadId });
+      this.pending.set(id, { resolve, reject, timer, method, threadId: params?.threadId, diagnostic, startedAt });
       try { this.write({ id, method, params }); } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
+        this.emit('diagnostic', { event: 'rpc.failed', details: { ...diagnostic, error: error.message } });
         this.emit('rpc', { phase: 'finished', requestId: id, method, threadId: params?.threadId });
         reject(error);
       }
@@ -165,6 +175,7 @@ class CodexConnection extends EventEmitter {
     if (child) { child.stdin.end(); child.kill(); }
     for (const request of this.pending.values()) {
       clearTimeout(request.timer);
+      this.emit('diagnostic', { event: 'rpc.disconnected', details: { ...request.diagnostic, durationMs: Date.now() - request.startedAt } });
       request.reject(new Error('Disconnected from server.'));
     }
     this.pending.clear();

@@ -60,6 +60,18 @@ test('local discovery prefers the current managed Codex over an older CLI on PAT
   f.connection.disconnect();
   await assert.rejects(fixture().connection.connect({ mode: 'local', codexPath: path.join(dir, 'missing-override') }), /executable not found/);
 });
+test('the app scheduler is injected only into local Codex without changing user config or exposing its token in arguments', async () => {
+  const f = fixture(); const scheduler = { url: 'http://127.0.0.1:12345/mcp', token: 'private-scheduler-token' };
+  await f.connection.connect({ mode: 'local', codexPath: process.execPath }, scheduler);
+  const [, args, options] = f.invocation();
+  assert.ok(args.includes('mcp_servers.remote_codex_scheduler.url="http://127.0.0.1:12345/mcp"'));
+  assert.ok(!args.join(' ').includes(scheduler.token));
+  assert.equal(options.env.REMOTE_CODEX_SCHEDULER_TOKEN, scheduler.token);
+  f.connection.disconnect();
+  const remote = fixture(); await remote.connection.connect({ host: 'root@warmer' }, scheduler);
+  assert.ok(!remote.invocation()[1].join(' ').includes('scheduler'));
+  remote.connection.disconnect();
+});
 test('a local npm launcher with spaces is passed as one argument to Node', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-launcher-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -150,6 +162,22 @@ test('history responses mark the boundary between past and new stream events', a
   const snapshot = await pending;
   assert.ok(events[0].receivedSequence < snapshot.receivedSequence);
   assert.ok(events[1].receivedSequence > snapshot.receivedSequence);
+  f.connection.disconnect();
+});
+
+test('RPC diagnostics correlate sends and replies without retaining user inputs', async () => {
+  const f = fixture(); const events = [];
+  f.connection.on('diagnostic', event => events.push(event));
+  await f.connection.connect();
+  const pending = f.connection.call('turn/start', { threadId: 'log-thread', input: [{ type: 'text', text: 'PRIVATE_MESSAGE_BODY' }] });
+  const request = f.writes.at(-1);
+  f.child.stdout.write(JSON.stringify({ id: request.id, result: { turn: { id: 'log-turn', status: 'inProgress' } } }) + '\n');
+  await pending;
+  assert.ok(events.some(event => event.event === 'rpc.started' && event.details.threadId === 'log-thread' && event.details.requestId === request.id));
+  assert.ok(events.some(event => event.event === 'rpc.completed' && event.details.requestId === request.id && event.details.status === 'inProgress'));
+  assert.ok(!JSON.stringify(events).includes('PRIVATE_MESSAGE_BODY'));
+  await assert.rejects(f.connection.call('turn/start', { threadId: 'timed-out-thread' }, 5), /timed out/);
+  assert.ok(events.some(event => event.event === 'rpc.timeout' && event.details.threadId === 'timed-out-thread'));
   f.connection.disconnect();
 });
 
