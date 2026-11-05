@@ -49,7 +49,7 @@ module.exports = async ({ app, window }) => {
     assert.ok(await evaluate(`api.pins().then(ids => ids.includes(${JSON.stringify(threadId)}))`));
     await evaluate('connect(state.options)');
     assert.ok(await evaluate(`state.pinnedIds.has(${JSON.stringify(threadId)})`));
-    assert.equal(await evaluate("document.querySelector('#threads .thread-group').textContent"), 'PINNED');
+    assert.equal(await evaluate("document.querySelector('#threads .thread').dataset.threadId"), threadId);
     console.log('PASS pinned conversations persist after reconnect');
     await evaluate(`openThread(state.threads.find(thread => thread.id === ${JSON.stringify(threadId)}))`);
     await wait("!state.loading && document.getElementById('messages').innerText.includes('DESKTOP_CODEX_OK')");
@@ -67,7 +67,7 @@ module.exports = async ({ app, window }) => {
     fs.writeFileSync(path.join(artifacts, 'tools.png'), (await window.webContents.capturePage()).toPNG());
     await evaluate("document.getElementById('prompt').value='Think carefully through a detailed plan for a new compiler, then explain each phase at length. Do not use tools.'; document.getElementById('composer').requestSubmit();");
     await wait('!state.sending && state.active.size > 0');
-    await evaluate("document.getElementById('stop').click()");
+    await evaluate("document.getElementById('send').click()");
     await wait('!state.active.size');
     const latest = await evaluate(`rpc('thread/turns/list', { threadId: ${JSON.stringify(threadId)}, limit: 1, sortDirection: 'desc', itemsView: 'full' })`);
     assert.equal(latest.data[0].status, 'interrupted');
