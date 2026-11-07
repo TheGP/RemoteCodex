@@ -1,5 +1,5 @@
 const { spawn } = require('node:child_process');
-const { createInterface } = require('node:readline');
+const { StringDecoder } = require('node:string_decoder');
 const { EventEmitter } = require('node:events');
 const os = require('node:os');
 const fs = require('node:fs');
@@ -98,11 +98,11 @@ class CodexConnection extends EventEmitter {
     child.on('error', fail);
     child.stdin.on('error', fail);
     child.on('close', code => fail(new Error(stderr.trim() || `${options.mode === 'local' ? 'Local Codex' : 'SSH connection'} closed (${code}).`)));
-    const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    lines.on('line', line => {
+    const receive = line => {
       if (this.child !== child || !line.trim()) return;
       let message;
-      try { message = JSON.parse(line); } catch { return; }
+      try { message = JSON.parse(line); }
+      catch { this.emit('diagnostic', { event: 'rpc.invalid-message', details: { source: 'stdout', error: 'Codex returned invalid JSON.' } }); return; }
       const receivedSequence = ++this.receivedSequence;
       if (message.method) {
         if (message.id !== undefined) this.requests.set(message.id, message);
@@ -116,6 +116,18 @@ class CodexConnection extends EventEmitter {
         if (message.error) request.reject(new Error(message.error.message));
         else request.resolve(request.method === 'thread/turns/list' ? { ...message.result, receivedSequence } : message.result);
       }
+    };
+    const decoder = new StringDecoder('utf8');
+    let fragments = [];
+    child.stdout.on('data', chunk => {
+      const parts = decoder.write(chunk).split('\n');
+      for (let index = 0; index < parts.length - 1; index++) {
+        fragments.push(parts[index]); const line = fragments.join(''); fragments = []; receive(line);
+      }
+      if (parts.at(-1)) fragments.push(parts.at(-1));
+    });
+    child.stdout.on('end', () => {
+      fragments.push(decoder.end()); receive(fragments.join('')); fragments = [];
     });
     try {
       const result = await this.call('initialize', { clientInfo: { name: 'remote_codex', title: 'Remote Codex', version }, capabilities: { experimentalApi: true } });

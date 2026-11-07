@@ -165,6 +165,32 @@ test('history responses mark the boundary between past and new stream events', a
   f.connection.disconnect();
 });
 
+test('large UTF-8 history with Unicode line separators remains one JSON-RPC response', async () => {
+  const f = fixture(); await f.connection.connect();
+  const text = 'マイメロディ\u2028next\u2029paragraph 🐈\n'.repeat(12000);
+  const pending = f.connection.call('thread/turns/list', { threadId: 'unicode-history', itemsView: 'full' });
+  const id = f.writes.at(-1).id;
+  const data = [{ id: 'history-turn', items: [{ id: 'history-reply', type: 'agentMessage', text }] }];
+  const response = Buffer.from(JSON.stringify({ id, result: { data, nextCursor: null } }) + '\r\n');
+  for (let offset = 0; offset < response.length; offset += 4093) f.child.stdout.write(response.subarray(offset, offset + 4093));
+  assert.deepEqual((await pending).data, data);
+  assert.equal(f.child.killed, undefined);
+  assert.equal(f.connection.pending.size, 0);
+  f.connection.disconnect();
+});
+
+test('malformed RPC diagnostics omit contents and an unterminated final frame flushes on EOF', async () => {
+  const f = fixture(); await f.connection.connect(); const entries = [];
+  f.connection.on('diagnostic', event => entries.push(event));
+  const pending = f.connection.call('thread/read', { threadId: 'final-frame' }); const id = f.writes.at(-1).id;
+  f.child.stdout.write('PRIVATE_INVALID_RESPONSE\n');
+  f.child.stdout.end(JSON.stringify({ id, result: { thread: { id: 'final-frame' } } }));
+  assert.equal((await pending).thread.id, 'final-frame');
+  assert.ok(entries.some(event => event.event === 'rpc.invalid-message'));
+  assert.ok(!JSON.stringify(entries).includes('PRIVATE_INVALID_RESPONSE'));
+  f.connection.disconnect();
+});
+
 test('RPC diagnostics correlate sends and replies without retaining user inputs', async () => {
   const f = fixture(); const events = [];
   f.connection.on('diagnostic', event => events.push(event));
