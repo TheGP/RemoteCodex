@@ -8,18 +8,20 @@ async function checks() {
   api.editLock = async (_threadId, token) => token ? undefined : 'test-edit-lock';
   const diagnostics = [];
   api.log = (event, details) => diagnostics.push({ event, details: structuredClone(details) });
-  let savedPreferences = { theme: 'system', startupProjects: {}, conversationStates: {}, threadOrders: {} };
+  let savedPreferences = { theme: 'system', startupProjects: {}, conversationStates: {}, threadOrders: {}, threadOrderCutoffs: {} };
   api.saveConversationState = value => { savedPreferences.conversationStates[value.machine] = { unread: [...value.unread], completions: { ...value.completions } }; };
   api.preferences = async () => structuredClone(savedPreferences);
   api.savePreferences = async patch => {
     if (patch.theme) savedPreferences.theme = patch.theme;
+    if (patch.fileOpener) savedPreferences.fileOpener = patch.fileOpener;
     if (patch.startupProject) {
       const { machine, projectId } = patch.startupProject;
       if (projectId === null) delete savedPreferences.startupProjects[machine]; else savedPreferences.startupProjects[machine] = projectId;
     }
     if (patch.threadOrder) {
-      const { machine, projectId, ids } = patch.threadOrder;
-      savedPreferences.threadOrders[machine] = { ...savedPreferences.threadOrders[machine], [projectId]: [...ids] };
+      const { machine, projectId, ids, cutoff } = patch.threadOrder;
+      if (ids !== undefined) savedPreferences.threadOrders[machine] = { ...savedPreferences.threadOrders[machine], [projectId]: [...ids] };
+      if (cutoff !== undefined && (ids !== undefined || savedPreferences.threadOrderCutoffs[machine]?.[projectId] === undefined)) savedPreferences.threadOrderCutoffs[machine] = { ...savedPreferences.threadOrderCutoffs[machine], [projectId]: cutoff };
     }
     return structuredClone(savedPreferences);
   };
@@ -67,6 +69,68 @@ async function checks() {
   state.active.delete('link-background-task'); $('error').hidden = true;
   if (priorOpenLink) api.openLink = priorOpenLink; else delete api.openLink;
   results.push('web links open through the browser bridge for normal, modified, middle, and keyboard clicks without navigating the app or interrupting chats; launch failures remain visible');
+
+  const fileLinkOptions = state.options; const fileLinkThread = state.thread;
+  state.options = { mode: 'local' }; state.thread = { id: 'file-link-chat', cwd: '/work/project' };
+  const fileLinks = [];
+  api.openLink = async (href, context) => fileLinks.push({ href, context });
+  const fileReply = renderItem({ id: 'file-link-reply', type: 'agentMessage', text: '[Code](/work/project/src/a.ts:12:3) · [Relative](src/a.ts#L12) · [File URL](file:///work/project/src/a.ts#L12) · [Windows](C:/work/a.ts:2) · [Bare](submitAppeal.ts:77) · [Column](submitAppeal.ts:77:3) · [Unsafe](javascript:alert) · [Number](javascript:77) · [Command](command:execute)' });
+  const safeFileLinks = [...fileReply.body.querySelectorAll('a[href]')];
+  check(safeFileLinks.length === 6, 'File links were stripped or unsafe protocols survived Markdown rendering: ' + safeFileLinks.map(link => link.getAttribute('href')).join(', '));
+  state.thread = { id: 'changed-file-link-chat', cwd: '/other/project' };
+  for (const link of safeFileLinks) link.click();
+  await Promise.resolve();
+  check(fileLinks.length === 6 && fileLinks.every(entry => entry.context.machine === 'access:local' && entry.context.cwd === '/work/project'), 'File clicks lost their original conversation machine or folder');
+  check(fileLinks[0].href.endsWith(':12:3') && fileLinks[2].href.startsWith('file:///'), 'File links lost their line/column or file URL');
+  check(fileLinks[4].href === './submitAppeal.ts:77' && fileLinks[5].href === './submitAppeal.ts:77:3', 'Bare filename links were mistaken for URL schemes');
+  const filePreferenceWriter = api.savePreferences;
+  check(!$('file-opener').closest('form'), 'File opener changes can submit the connection form');
+  for (const opener of ['gitferry', 'antigravity', 'reveal', 'vscode']) {
+    $('file-opener').value = opener; await $('file-opener').onchange(); fillSettings(state.options);
+    check(preferences.fileOpener === opener && $('file-opener').value === opener, 'File opener did not persist or restore in Settings');
+  }
+  api.savePreferences = async () => { throw new Error('Preference write failed'); };
+  $('file-opener').value = 'gitferry'; await $('file-opener').onchange();
+  check($('file-opener').value === 'vscode' && !$('file-opener').disabled && !$('error').hidden, 'A failed opener save lost the previous setting or failed silently');
+  api.savePreferences = filePreferenceWriter; state.options = fileLinkOptions; state.thread = fileLinkThread;
+  if (priorOpenLink) api.openLink = priorOpenLink; else delete api.openLink;
+  $('error').hidden = true;
+  results.push('file links preserve local/relative/file-URL/Windows paths and positions, remember their chat context, reject unsafe protocols, and use a persistent opener setting outside the connection form');
+
+  const recovering = { threadId: 'network-recovery', turnId: 'network-recovery-turn' };
+  const reconnecting = () => handleNotification({ method: 'error', params: { ...recovering, willRetry: true, error: { message: 'Reconnecting... waiting for network' } } });
+  reconnecting();
+  check(!$('error').hidden, 'The reconnecting warning was not shown');
+  for (const notification of [
+    { method: 'item/agentMessage/delta', params: { ...recovering, threadId: 'other-chat', delta: 'Other chat' } },
+    { method: 'item/agentMessage/delta', params: { ...recovering, turnId: 'old-turn', delta: 'Old turn' } },
+    { method: 'thread/status/changed', params: { threadId: recovering.threadId, status: { type: 'active' } } },
+    { method: 'item/commandExecution/outputDelta', params: { ...recovering, delta: 'Local output' } }
+  ]) {
+    handleNotification(notification);
+    check(!$('error').hidden, 'Unrelated activity cleared the reconnecting warning');
+  }
+  for (const notification of [
+    { method: 'item/agentMessage/delta', params: { ...recovering, delta: 'Recovered response' } },
+    { method: 'item/reasoning/summaryTextDelta', params: { ...recovering, delta: 'Recovered thinking' } },
+    { method: 'item/started', params: { ...recovering, item: { type: 'commandExecution' } } },
+    { method: 'item/completed', params: { ...recovering, item: { type: 'agentMessage' } } },
+    { method: 'turn/completed', params: { threadId: recovering.threadId, turn: { id: recovering.turnId, status: 'completed' } } }
+  ]) {
+    reconnecting(); handleNotification(notification);
+    check($('error').hidden && !state.retryError, 'Recovered model progress left a stale reconnecting warning');
+  }
+  reconnecting(); showError('Could not save queued messages');
+  handleNotification({ method: 'item/agentMessage/delta', params: { ...recovering, delta: 'Recovered' } });
+  check(!$('error').hidden && $('error-text').textContent === 'Could not save queued messages', 'Recovery erased a newer unrelated error');
+  handleNotification({ method: 'error', params: { ...recovering, willRetry: false, error: { message: 'Request failed permanently' } } });
+  handleNotification({ method: 'item/agentMessage/delta', params: { ...recovering, delta: 'Late output' } });
+  check(!$('error').hidden && $('error-text').textContent === 'Request failed permanently', 'Late progress erased a permanent error');
+  reconnecting();
+  handleNotification({ method: 'turn/completed', params: { threadId: recovering.threadId, turn: { id: recovering.turnId, status: 'failed', error: { message: 'Retry exhausted' } } } });
+  check(!$('error').hidden && $('error-text').textContent === 'Retry exhausted', 'A terminal turn failure disappeared with the reconnecting warning');
+  $('error').hidden = true;
+  results.push('retryable reconnecting warnings clear when the same turn resumes, while other chats, local output, newer errors, and permanent failures stay untouched');
 
   state.connected = true;
   const thread = { id: 'renderer-review', cwd: '/tmp', preview: 'Renderer test', updatedAt: 1 };
@@ -1238,6 +1302,34 @@ async function checks() {
   state.queues.clear(); savedQueues.clear(); state.active.clear(); $('error').hidden = true;
   results.push('interruption races cannot dispatch saved drafts or resume pending retries; terminal errors pause queues while temporary retries do not');
 
+  const freshQueueRpc = api.rpc;
+  const freshThread = { id: 'fresh-queue-after-stop', name: 'New queue after stop', cwd: '/tmp', status: { type: 'idle' } };
+  const freshKey = queueKey(freshThread.id); const freshSends = [];
+  state.threads = [freshThread]; setThread(freshThread); state.owned.add(freshThread.id);
+  api.rpc = async (method, params) => {
+    if (method === 'turn/start') { freshSends.push(params); return { turn: { id: 'fresh-queue-turn-' + freshSends.length, status: 'inProgress' } }; }
+    if (method === 'thread/list') return { data: [freshThread], nextCursor: null };
+    return { data: [], nextCursor: null };
+  };
+  const emptyQueue = { key: freshKey, machine: accessKey(), thread: freshThread, messages: [], paused: false };
+  state.queues.set(freshKey, emptyQueue); state.active.set(freshThread.id, 'older-interrupted-turn');
+  handleNotification({ method: 'turn/completed', params: { threadId: freshThread.id, turn: { id: 'older-interrupted-turn', status: 'interrupted' } } }); await settle();
+  check(emptyQueue.paused && !savedQueues.has(freshKey), 'An interrupted empty queue did not reproduce the stale pause state');
+  $('prompt').value = 'Start a new task'; await send();
+  $('prompt').value = 'Follow up after it finishes'; await send();
+  check(freshSends.length === 1 && emptyQueue.messages.length === 1 && !emptyQueue.paused && savedQueues.get(freshKey)?.paused === false, 'A new follow-up inherited an empty queue’s old pause flag');
+  handleNotification({ method: 'turn/completed', params: { threadId: freshThread.id, turn: { id: 'fresh-queue-turn-1', status: 'completed' } } }); await settle();
+  check(freshSends.length === 2 && freshSends[1].input.some(part => part.text === 'Follow up after it finishes') && !emptyQueue.messages.length && !savedQueues.has(freshKey), 'A fresh follow-up did not send once after normal completion');
+  await flushQueue(freshThread.id); check(freshSends.length === 2, 'A completed queue dispatched its follow-up twice');
+  const retained = { text: 'Keep this older paused draft', images: [], input: [{ type: 'text', text: 'Keep this older paused draft' }], access: policy(), machine: accessKey(), thread: freshThread, mode: 'default' };
+  const pausedQueue = { key: freshKey, machine: accessKey(), thread: freshThread, messages: [retained], paused: true };
+  state.queues.set(freshKey, pausedQueue); await persistQueue(pausedQueue);
+  $('prompt').value = 'Another follow-up'; await send();
+  handleNotification({ method: 'turn/completed', params: { threadId: freshThread.id, turn: { id: 'fresh-queue-turn-2', status: 'completed' } } }); await settle();
+  check(pausedQueue.paused && pausedQueue.messages.length === 2 && savedQueues.get(freshKey)?.paused && freshSends.length === 2, 'Adding a new message resumed existing paused drafts');
+  api.rpc = freshQueueRpc; state.queues.clear(); savedQueues.clear(); state.active.clear(); $('error').hidden = true;
+  results.push('new follow-ups reset stale empty-queue pauses and send once on normal completion, while existing paused drafts still require Retry');
+
   const unreadOptions = state.options;
   state.options = { mode: 'ssh', host: 'unread-test-machine', port: 22 };
   const unreadStorage = accessKey() + ':unread'; localStorage.removeItem(unreadStorage); state.unread.clear();
@@ -1399,7 +1491,7 @@ async function checks() {
   results.push('dragging search results reveals destinations; external/stale/no-op drags are ignored and failed moves preserve the original conversation');
   resetThread(); state.options = { mode: 'ssh', host: 'thread-order-test', port: 22 }; state.connected = true;
   projects.data = [rapidProject, memeProject]; projects.expanded.add(rapidProject.id);
-  const orderedChats = ['a', 'b', 'c', 'd', 'pin-a', 'pin-b'].map(id => ({ id: 'order-' + id, name: 'Chat ' + id, projectId: rapidProject.id, cwd: '/original-workspace' }));
+  const orderedChats = ['a', 'b', 'c', 'd', 'pin-a', 'pin-b'].map(id => ({ id: 'order-' + id, name: 'Chat ' + id, projectId: rapidProject.id, cwd: '/original-workspace', createdAt: 100 }));
   state.threads = [...orderedChats]; state.pinnedIds = new Set(['order-pin-a', 'order-pin-b']);
   state.pinnedThreads = new Map(orderedChats.filter(thread => state.pinnedIds.has(thread.id)).map(thread => [thread.id, thread]));
   state.thread = orderedChats[1]; $('prompt').value = 'Keep my draft while sorting'; state.active.set('order-c', 'order-running'); setUnread('order-d', true);
@@ -1451,10 +1543,15 @@ async function checks() {
   renderThreads(); check(orderIds().slice(0, 2).join() === 'order-pin-a,order-pin-b', 'Saved order crossed machines');
   state.options = savedOrderMachine; renderThreads();
   check(orderIds().join() === 'order-pin-b,order-pin-a,order-c,order-b,order-d,order-a', 'An external or stale drag changed the saved order');
-  state.threads.unshift({ id: 'order-new', name: 'New chat', projectId: rapidProject.id, cwd: '/new' }); renderThreads();
+  state.threads.unshift({ id: 'order-new', name: 'New chat', projectId: rapidProject.id, cwd: '/new', createdAt: 200 }); renderThreads();
   check(orderIds()[2] === 'order-new', 'New conversations disappeared below the custom order');
-  state.threads.push({ id: 'order-older-page', name: 'Older page', projectId: rapidProject.id, cwd: '/old' }); renderThreads();
+  state.threads.push({ id: 'order-older-page', name: 'Older page', projectId: rapidProject.id, cwd: '/old', createdAt: 50 }); renderThreads();
   check(orderIds().at(-1) === 'order-older-page', 'Loading older conversations moved them ahead of the custom order');
+  state.threads = [orderedChats[0], ...state.threads.filter(thread => thread.id !== orderedChats[0].id)]; renderThreads();
+  check(orderIds()[2] === 'order-new' && orderIds().at(-1) === 'order-older-page', 'Activity in an older saved chat buried the new conversation after refreshing the list');
+  state.threads.find(thread => thread.id === 'order-new').createdAt = 100; renderThreads();
+  check(orderIds()[2] === 'order-new', 'Second-resolution creation times buried a new conversation created alongside a saved chat');
+  state.threads.find(thread => thread.id === 'order-new').createdAt = 200;
   $('search').value = 'Chat '; renderThreads();
   await orderDrop('order-a', 'order-c');
   $('search').value = ''; renderThreads();
@@ -1469,6 +1566,25 @@ async function checks() {
   api.savePreferences = orderSave;
   state.active.clear(); setUnread('order-d', false); state.pinnedIds.clear(); state.pinnedThreads.clear(); projects.expanded.clear(); $('error').hidden = true;
   results.push('conversations reorder above/below within projects and pin groups, persist across restarts and refreshes, preserve drafts/activity/unread, and reject unsafe or failed drops');
+  const pagedProject = { id: 'order-pagination', name: 'Paged order', roots: [{ path: '/paged' }] };
+  const pagedOld = { id: 'paged-old', name: 'Saved old', projectId: pagedProject.id, cwd: '/paged', createdAt: 100 };
+  const pagedNew = { id: 'paged-saved-new', name: 'Saved new', projectId: pagedProject.id, cwd: '/paged', createdAt: 300 };
+  const pagedUnsorted = { id: 'paged-unsorted', name: 'Unsorted', projectId: pagedProject.id, cwd: '/paged', createdAt: 200 };
+  const pagedIds = [pagedOld.id, pagedNew.id];
+  await api.savePreferences({ threadOrder: { machine: accessKey(), projectId: pagedProject.id, ids: pagedIds } });
+  Object.assign(preferences, await api.preferences()); projects.data = [pagedProject]; state.threads = [];
+  api.rpc = async (method, params) => ({ data: params.projectId === pagedProject.id ? params.cursor ? [pagedNew] : [pagedOld, pagedUnsorted] : [], nextCursor: params.projectId === pagedProject.id && !params.cursor ? 'next-page' : null });
+  await loadThreads();
+  const pagedOrder = () => sortProjectThreads([...state.threads], pagedProject.id).map(thread => thread.id).join();
+  check(pagedOrder() === 'paged-unsorted,paged-old' && preferences.threadOrderCutoffs[accessKey()][pagedProject.id] === 100, 'Legacy order did not acquire a persistent cutoff');
+  await loadThreads(true, pagedProject.id);
+  check(pagedOrder() === 'paged-unsorted,paged-old,paged-saved-new', 'Loading a page with a newer saved chat changed the cutoff and buried a conversation');
+  Object.assign(preferences, await api.preferences()); await loadThreads(); await loadThreads(true, pagedProject.id);
+  check(pagedOrder() === 'paged-unsorted,paged-old,paged-saved-new' && preferences.threadOrders[accessKey()][pagedProject.id].join() === pagedIds.join(), 'Restart or cutoff migration changed conversation positions or manual order');
+  state.pinnedIds.add(pagedNew.id); renderThreads();
+  check(pagedOrder() === 'paged-saved-new,paged-unsorted,paged-old', 'Pinning a saved chat changed the cutoff for unpinned conversations');
+  state.pinnedIds.clear();
+  results.push('legacy custom order acquires a stable saved cutoff; pagination, refreshes, restarts, and pin changes preserve unsorted conversation positions');
   resetThread(); state.options = { mode: 'local' }; state.connected = true;
   const managedProjects = [structuredClone(rapidProject), structuredClone(memeProject), { id: 'project-third', name: 'Third', roots: [{ path: '/third' }] }];
   const managementCalls = [];
@@ -1574,25 +1690,47 @@ async function checks() {
   const usageSnapshot = { rateLimits: { limitId: 'codex', primary: { usedPercent: 11, windowDurationMins: 10080, resetsAt: quotaReset }, secondary: null }, ordinaryUsageAllowed: true };
   let usageReads = 0;
   api.rpc = async (method, params) => {
-    check(method === 'account/rateLimits/read' && params.excludeResetCreditDetails === true, 'Usage refresh used a write or unrelated operation');
+    check(method === 'account/rateLimits/read' && params.excludeResetCreditDetails === false, 'Usage refresh skipped reset details or used a write or unrelated operation');
     usageReads++; return structuredClone(usageSnapshot);
   };
   await refreshUsage();
   const usageRows = () => [...$('usage-meter').querySelectorAll('.usage-line')];
   const usagePercent = index => usageRows()[index].querySelector('.usage-percent').textContent;
   check($('permissions').nextElementSibling === $('usage-meter') && $('usage-meter').type === 'button' && !$('usage-meter').hidden, 'Usage bars are not beside access or could submit a message');
-  check(usagePercent(0) === '—' && usagePercent(1) === '89%' && usageRows()[1].querySelector('.usage-label').textContent === 'Week' && $('usage-details').textContent.includes('resets'), 'Weekly remaining usage or unknown context was misreported');
+  check(usagePercent(0) === '—' && usagePercent(1) === '89%' && usageRows()[1].querySelector('.usage-label').textContent === 'Week' && $('usage-details').textContent.includes('Weekly reset'), 'Weekly remaining usage or unknown context was misreported');
   check(!$('usage-meter').title && !$('usage-panel').matches(':popover-open'), 'Usage still uses a native hover tooltip or opens without a click');
   await $('usage-meter').onclick();
-  const resetDate = new Date(quotaReset * 1000).toLocaleString([], { dateStyle: 'full', timeStyle: 'short' });
-  check($('usage-panel').matches(':popover-open') && $('usage-details').textContent.includes(resetDate) && $('usage-details').textContent.includes('local time'), 'Clicking usage did not open its own panel with the real weekly reset time');
+  const resetTime = $('usage-details').querySelector('time');
+  check($('usage-panel').matches(':popover-open') && resetTime?.dateTime === new Date(quotaReset * 1000).toISOString() && resetTime.querySelector('strong') && resetTime.querySelector('span') && !$('usage-details').textContent.includes('%'), 'Usage reset dates are missing, embedded in prose, or repeat the graph percentages');
   const readsBeforeClose = usageReads;
   await $('usage-meter').onclick();
   check(!$('usage-panel').matches(':popover-open') && usageReads === readsBeforeClose, 'Clicking an open usage panel refreshed instead of closing it');
   await $('usage-meter').onclick(); $('close-usage').click();
   check(!$('usage-panel').matches(':popover-open'), 'Usage panel close button did not dismiss it');
-  await $('refresh-usage').onclick();
-  check(usageReads === readsBeforeClose + 2, 'The panel Refresh button did not read account quota');
+  check(usageReads === readsBeforeClose + 1 && !document.getElementById('refresh-usage') && $('usage-title').textContent === 'Usage', 'Opening usage did not refresh automatically or the redundant controls remain');
+  usageSnapshot.rateLimitResetCredits = { availableCount: 3, credits: [
+    { id: 'later-reset', status: 'available', title: 'Full reset', expiresAt: quotaReset + 86400 },
+    { id: 'earlier-reset', status: 'available', title: 'Full reset', expiresAt: quotaReset },
+    { id: 'used-reset', status: 'redeemed', title: 'Used reset', expiresAt: quotaReset },
+    { id: 'expired-reset', status: 'available', title: 'Expired reset', expiresAt: 1 },
+  ] };
+  await $('usage-meter').onclick();
+  const creditSection = $('usage-details').querySelector('.usage-credits');
+  check(creditSection?.querySelector('h3').textContent === 'Early resets · 3 available' && creditSection.querySelectorAll('time').length === 2 && creditSection.querySelector('time').dateTime === new Date(quotaReset * 1000).toISOString(), 'Available early resets or sorted expiry dates were not shown');
+  check(!creditSection.textContent.includes('Used reset') && !creditSection.textContent.includes('Expired reset') && creditSection.textContent.includes('Some expiry dates unavailable.'), 'Unavailable credits were offered or a capped list hid missing expiry details');
+  $('close-usage').click();
+  usageSnapshot.rateLimitResetCredits = { availableCount: 1, credits: null };
+  await refreshUsage();
+  check($('usage-details').querySelector('.usage-credits').textContent.includes('1 available') && !$('usage-details').querySelector('.usage-credits time'), 'Count-only reset data invented expiry dates');
+  usageSnapshot.rateLimitResetCredits.credits = [{ status: 'available', title: 'Full reset', expiresAt: null }];
+  await refreshUsage();
+  check($('usage-details').querySelector('.usage-credits').textContent.includes('No expiry'), 'A reset without an expiry was reported as an unknown date');
+  usageSnapshot.rateLimitResetCredits = { availableCount: 0, credits: [] };
+  await refreshUsage();
+  check($('usage-details').querySelector('.usage-credits').textContent === 'Early resets · 0 available', 'Zero available resets retained stale credit details');
+  usageSnapshot.rateLimitResetCredits = null;
+  await refreshUsage();
+  check(!$('usage-details').querySelector('.usage-credits'), 'Unavailable reset data was presented as zero available');
   handleNotification({ method: 'thread/tokenUsage/updated', params: { threadId: usageThread.id, tokenUsage: { last: { totalTokens: 26000 }, total: { totalTokens: 99000000 }, modelContextWindow: 100000 } } });
   check(usagePercent(0) === '74%' && usageRows()[0].querySelector('[role="progressbar"]').getAttribute('aria-valuenow') === '74', 'Context remaining used cumulative tokens instead of the current request');
   handleNotification({ method: 'thread/tokenUsage/updated', params: { threadId: usageOtherThread.id, tokenUsage: { last: { totalTokens: 90000 }, total: { totalTokens: 90000 }, modelContextWindow: 100000 } } });
@@ -1602,11 +1740,11 @@ async function checks() {
   handleNotification({ method: 'thread/tokenUsage/updated', params: { threadId: usageThread.id, tokenUsage: { last: { totalTokens: 10000 }, total: { totalTokens: 99000000 }, modelContextWindow: 100000 } } });
   check(usagePercent(0) === '90%', 'Compaction did not restore reported context capacity');
   handleNotification({ method: 'account/rateLimits/updated', params: { rateLimits: { limitId: 'codex', primary: { usedPercent: 17 }, secondary: null } } });
-  check(usagePercent(1) === '83%' && usageRows()[1].querySelector('.usage-label').textContent === 'Week' && $('usage-details').textContent.includes('resets'), 'Sparse quota updates lost the known window or reset time');
+  check(usagePercent(1) === '83%' && usageRows()[1].querySelector('.usage-label').textContent === 'Week' && $('usage-details').querySelector('time')?.dateTime === new Date(quotaReset * 1000).toISOString(), 'Sparse quota updates lost the known window or reset time');
   handleNotification({ method: 'account/rateLimits/updated', params: { rateLimits: { limitId: 'codex', primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 1 }, secondary: { usedPercent: 55, windowDurationMins: 10080, resetsAt: quotaReset } } } });
-  check(usagePercent(1) === '0%' && usageRows()[1].querySelector('.usage-label').textContent === '5h' && $('usage-details').textContent.includes('Week: 45% left'), 'The tightest quota, secondary window, or expired reset was misreported');
+  check(usagePercent(1) === '0%' && usageRows()[1].querySelector('.usage-label').textContent === '5h' && $('usage-details').querySelectorAll('.usage-reset').length === 2 && $('usage-details').textContent.includes('Weekly reset'), 'The tightest quota, secondary window, or expired reset was misreported');
   handleNotification({ method: 'account/rateLimits/updated', params: { rateLimits: { limitId: 'codex', primary: null, secondary: { usedPercent: 80, windowDurationMins: null, resetsAt: null } } } });
-  check(usagePercent(1) === '0%' && $('usage-details').textContent.includes('Week: 20% left'), 'Unavailable sparse fields falsely restored quota or cleared window metadata');
+  check(usagePercent(1) === '0%' && $('usage-details').querySelectorAll('time')[1]?.dateTime === new Date(quotaReset * 1000).toISOString(), 'Unavailable sparse fields falsely restored quota or cleared window metadata');
   usage.account.ordinaryUsageAllowed = false;
   handleNotification({ method: 'account/rateLimits/updated', params: { rateLimits: { limitId: 'codex', primary: { usedPercent: 0 } } } });
   check($('usage-details').textContent.includes('currently blocked'), 'Percentages incorrectly overrode the backend account restriction');
@@ -1675,6 +1813,10 @@ async function checks() {
   check(!themeConnectCalls && !$('settings-dialog').open, 'Submitting unchanged connection settings reconnected Codex');
   openSettings(); $('local-cwd').value = '/changed-project'; $('local-cwd').dispatchEvent(new Event('input', { bubbles: true }));
   check(!$('save-connect').hidden, 'Changed connection settings cannot be saved');
+  status(connectedStatus());
+  check($('connect').hidden && $('save-connect').disabled, 'A connected app exposed reconnect or allowed changing the connection during live work');
+  await connect({ ...themeConnection, localCwd: '/changed-project' });
+  check(!themeConnectCalls && state.connected && state.thread === themeThread && state.active.size === 2 && !themeQueue.paused && $('prompt').value === 'Keep this unsent draft' && $('messages').innerHTML === themeHistory, 'A blocked reconnect erased running chats, history, queues, or drafts');
   $('local-cwd').value = themeConnection.localCwd; $('local-cwd').dispatchEvent(new Event('input', { bubbles: true }));
   check($('save-connect').hidden, 'Restoring the original connection still offered a reconnect');
   $('host').value = 'unused-local-mode-host'; await $('settings-form').onsubmit({ preventDefault() {} });
@@ -1684,16 +1826,44 @@ async function checks() {
   await $('settings-form').onsubmit({ preventDefault() {} });
   check(!themeConnectCalls && state.connected, 'Equivalent SSH settings or hidden local fields reconnected a remote session');
   state.options = themeConnection; openSettings(); $('local-cwd').value = '/changed-project';
+  state.active.clear(); updateBusy();
+  check(!$('save-connect').disabled, 'Idle connection settings stayed blocked after tasks finished');
+  themeThread.status = { type: 'active' }; updateBusy();
+  check($('save-connect').disabled, 'A background task reported by the native thread list allowed a connection change');
+  await connect({ ...themeConnection, localCwd: '/changed-project' });
+  check(!themeConnectCalls && state.thread === themeThread && state.connected, 'A native background task was missed by the connection guard');
+  handleNotification({ method: 'thread/status/changed', params: { threadId: themeThread.id, status: { type: 'idle' } } });
+  check(!$('save-connect').disabled, 'A completed background task left connection settings disabled');
   await $('settings-form').onsubmit({ preventDefault() {} });
   check(themeConnectCalls === 1, 'Explicitly changing connection settings did not attempt a connection');
+  check(state.connected && state.options === themeConnection && state.thread === themeThread && state.threads.includes(themeThread) && !themeQueue.paused && $('prompt').value === 'Keep this unsent draft' && $('messages').innerHTML === themeHistory, 'A backend-refused connection change erased the current chats or paused their queue');
+  const refuseConnection = api.connect; let rejectConnection;
+  api.connect = () => { themeConnectCalls++; return new Promise((_resolve, reject) => { rejectConnection = reject; }); };
+  const connectionRace = connect({ ...themeConnection, localCwd: '/changed-project' });
+  check(state.connected && state.thread === themeThread && $('prompt').disabled, 'A pending connection request cleared the live chat or allowed typing during transition');
+  state.active.set('late-background-task', 'late-turn');
+  rejectConnection(new Error('Finish or stop running tasks before changing the connection.')); await connectionRace;
+  check(state.connected && !state.connecting && state.active.get('late-background-task') === 'late-turn' && state.thread === themeThread && !themeQueue.paused && $('prompt').value === 'Keep this unsent draft', 'A background task starting during a connection request lost its state when the backend refused');
+  state.active.clear(); api.connect = refuseConnection;
   state.options = themeConnection; state.connected = false; openSettings();
   check(!$('save-connect').hidden, 'Disconnected app cannot reconnect with its saved settings');
   await $('settings-form').onsubmit({ preventDefault() {} });
-  check(themeConnectCalls === 2, 'Explicit reconnect with unchanged settings was blocked');
+  check(themeConnectCalls === 3, 'Explicit reconnect with unchanged settings was blocked');
+  api.connect = async () => { handleNotification({ method: 'connection/closed', params: { message: 'Failed to start Codex' } }); throw new Error('Failed to start Codex'); };
+  state.connected = true;
+  await connect({ ...themeConnection, localCwd: '/changed-project' });
+  check(!state.connected && !state.connecting && state.thread === themeThread && state.threads.includes(themeThread), 'A failed replacement connection pretended the old engine was still connected or removed readable history');
+  const connectionRpc = api.rpc; const connectionPins = api.pins;
+  api.rpc = async () => ({ data: [], nextCursor: null }); api.pins = async () => []; api.connect = async () => ({});
+  const acceptedConnection = { ...themeConnection, localCwd: '/accepted-project' };
+  await connect(acceptedConnection);
+  check(state.connected && !state.connecting && state.options === acceptedConnection && !state.thread && !state.threads.length && !$('prompt').value && !drafts.suspended, 'An accepted connection failed to replace the old machine state or kept the composer locked');
+  api.rpc = connectionRpc;
+  if (connectionPins) api.pins = connectionPins; else delete api.pins;
   if (previousConnectApi) api.connect = previousConnectApi; else delete api.connect;
   $('settings-dialog').close(); $('error').hidden = true; state.connected = true;
   await savePreferences({ theme: 'system' }); applyTheme('system');
-  results.push('all themes preserve fonts, live connections, active chats, queues, history, and drafts; Done and unchanged forms never reconnect, while changed or disconnected connections still work');
+  results.push('themes preserve fonts and live chats; connected apps hide reconnect, active tasks block connection changes without losing state, and idle or disconnected connections still work');
 
   resetThread(); state.active.clear(); state.queues.clear(); projects.expanded.clear();
   const focusOptions = state.options; state.options = { mode: 'local' }; state.connected = true;
@@ -2083,7 +2253,10 @@ module.exports = async () => {
       schedules.tasks = [{ id: 'preview-scheduled', threadId: state.thread.id, machine: 'access:local', prompt: 'Check the tests again tomorrow', runAt: new Date(Date.now() + 86400000).toISOString(), status: 'pending' }];
       renderThreads(); renderSchedules();
       $('send-time').value = '24';
-      usage.account = { rateLimits: { primary: { usedPercent: 28, windowDurationMins: 300, resetsAt: Math.floor(Date.now() / 1000) + 7200 }, secondary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 259200 } } };
+      usage.account = { rateLimits: { primary: { usedPercent: 28, windowDurationMins: 300, resetsAt: Math.floor(Date.now() / 1000) + 7200 }, secondary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 259200 } }, rateLimitResetCredits: { availableCount: 2, credits: [
+        { status: 'available', title: 'Full reset', expiresAt: Math.floor(Date.now() / 1000) + 86400 * 23 },
+        { status: 'available', title: 'Full reset', expiresAt: Math.floor(Date.now() / 1000) + 86400 * 24 }
+      ] } };
       usage.threads.set(state.thread.id, { modelContextWindow: 100000, last: { totalTokens: 26000 } });
       api.rpc = async () => structuredClone(usage.account);
       state.owned.add(state.thread.id); state.active.set(state.thread.id, 'preview-running'); updateBusy();

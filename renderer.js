@@ -3,8 +3,9 @@ const controls = new Map([...document.querySelectorAll('[id]')].map(element => [
 const $ = id => controls.get(id);
 const api = window.codex;
 const projects = { data: [], selected: null, expanded: new Set(), cursors: new Map(), collapsed: new Set(), generation: 0 };
-const preferences = { theme: 'system', startupProjects: {}, conversationStates: {}, threadOrders: {} };
+const preferences = { theme: 'system', startupProjects: {}, conversationStates: {}, threadOrders: {}, threadOrderCutoffs: {} };
 const imageLoads = new Map();
+const linkContexts = new WeakMap();
 const schedules = { tasks: [], generation: 0 };
 const drafts = { target: null, snapshot: null, images: [], suspended: false, restoring: false };
 for (let hours = 1; hours <= 24; hours++) $('send-time').add(new Option(`${hours} hour${hours === 1 ? '' : 's'}`, String(hours)));
@@ -113,15 +114,24 @@ function applyTheme(value) {
 async function savePreferences(patch) {
   const markers = preferences.conversationStates;
   const orders = preferences.threadOrders;
+  const cutoffs = preferences.threadOrderCutoffs;
   Object.assign(preferences, await api.savePreferences(patch));
   preferences.conversationStates = markers;
   preferences.threadOrders = orders;
+  preferences.threadOrderCutoffs = cutoffs;
 }
 $('theme-select').onchange = async () => {
   const theme = $('theme-select').value; const previous = document.documentElement.dataset.theme || 'system';
   applyTheme(theme);
   try { await savePreferences({ theme }); }
   catch (error) { if (document.documentElement.dataset.theme === theme) applyTheme(previous); showError(error); }
+};
+$('file-opener').onchange = async () => {
+  const control = $('file-opener'); const previous = preferences.fileOpener || 'vscode';
+  control.disabled = true;
+  try { await savePreferences({ fileOpener: control.value }); }
+  catch (error) { control.value = previous; showError(error); }
+  finally { control.disabled = false; }
 };
 
 function connectionLabels() {
@@ -156,11 +166,19 @@ function connectionSettingsChanged() {
   const fields = next.mode === 'local' ? ['localCwd', 'codexPath'] : ['host', 'port', 'key', 'cwd'];
   return next.mode !== (current.mode || 'ssh') || fields.some(key => key === 'port' ? Number(next[key]) !== Number(current[key] ?? 22) : String(next[key] || '').trim() !== String(current[key] || '').trim());
 }
+function connectionBusy() {
+  const working = thread => thread?.status?.type === 'active';
+  return state.connected && Boolean(state.active.size || state.dispatching.size || state.sending || state.commandBusy || working(state.thread) || state.threads.some(working) || [...state.pinnedThreads.values()].some(working));
+}
 function updateSettingsActions() {
   $('save-connect').hidden = state.connected && !connectionSettingsChanged();
+  $('save-connect').disabled = state.connecting || connectionBusy();
+  $('save-connect').title = connectionBusy() ? 'Finish or stop running tasks before changing the connection' : '';
 }
 
 function fillSettings(options) {
+  $('file-opener').value = preferences.fileOpener || 'vscode';
+  $('file-opener').querySelector('[value="reveal"]').textContent = navigator.platform.includes('Mac') ? 'Show in Finder' : 'Show in file manager';
   $('connection-mode').value = options.mode || 'ssh';
   $('host').value = options.host;
   $('port').value = options.port;
@@ -173,6 +191,7 @@ function fillSettings(options) {
 
 function isWriterConflict(error) { return /already has an active writer/i.test(error.message || String(error)); }
 function showError(error) {
+  state.retryError = null;
   let message = (error.message || String(error)).replace(/^Error invoking remote method '[^']+':\s*/, '').replace(/^Error:\s*/, '');
   if (isWriterConflict(error)) {
     if (state.writerConflicts.has(queueKey(state.thread?.id))) { $('error').hidden = true; updateBusy(); return; }
@@ -184,7 +203,8 @@ function showError(error) {
 function status(text) {
   $('server-status').textContent = text;
   $('connection-dot').classList.toggle('online', state.connected);
-  $('connect').textContent = state.connecting ? 'Connecting…' : state.connected ? 'Reconnect' : 'Connect';
+  $('connect').hidden = state.connected;
+  $('connect').textContent = state.connecting ? 'Connecting…' : 'Connect';
   $('connect').disabled = state.connecting;
   $('save-connect').disabled = state.connecting;
   updateSettingsActions();
@@ -219,6 +239,7 @@ function updateBusy() {
   $('activity').hidden = !$('writer-notice').hidden && !busy && !state.sending && !state.loading;
   $('retry-writer').disabled = state.sending || state.loading || !state.connected;
   updateSendButton();
+  updateSettingsActions();
   $('attach-images').disabled = state.sending || state.loading;
   $('prompt').disabled = state.loading || state.connecting || drafts.suspended;
   $('prompt').readOnly = state.sending || Boolean(state.commandBusy);
@@ -268,7 +289,7 @@ async function refreshUsage() {
   const request = { options: state.options, generation: usage.generation, updates: [] }; usage.reading = request;
   renderUsage();
   try {
-    const result = await rpc('account/rateLimits/read', { excludeResetCreditDetails: true });
+    const result = await rpc('account/rateLimits/read', { excludeResetCreditDetails: false });
     if (request.options !== state.options || request.generation !== usage.generation || !state.connected) return;
     usage.account = result;
     for (const snapshot of request.updates) applyRateLimit(snapshot);
@@ -281,6 +302,20 @@ function usageWindowLabel(minutes, fallback) {
   if (!Number.isFinite(minutes) || minutes <= 0) return fallback;
   if (minutes === 10080) return 'Week';
   return minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`;
+}
+function usageDateRow(label, timestamp, fallback = 'Not available') {
+  const row = document.createElement('div'); row.className = 'usage-reset';
+  const caption = document.createElement('span'); caption.className = 'usage-reset-label'; caption.textContent = label; row.append(caption);
+  const date = new Date(timestamp * 1000);
+  if (Number.isFinite(timestamp) && timestamp > 0 && Number.isFinite(date.getTime())) {
+    const time = document.createElement('time'); time.dateTime = date.toISOString();
+    const day = document.createElement('strong'); day.textContent = date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', year: date.getFullYear() === new Date().getFullYear() ? undefined : 'numeric' });
+    const clock = document.createElement('span'); clock.textContent = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    time.append(day, clock); row.append(time);
+  } else {
+    const unknown = document.createElement('span'); unknown.className = 'muted'; unknown.textContent = fallback; row.append(unknown);
+  }
+  return row;
 }
 function renderUsage() {
   const meter = $('usage-meter'); meter.hidden = !state.connected;
@@ -307,14 +342,25 @@ function renderUsage() {
     const percent = document.createElement('span'); percent.className = 'usage-percent'; percent.textContent = value.unlimited ? '∞' : value.left == null ? '—' : `${value.left}%`;
     row.append(label, track, percent); meter.append(row);
   }
-  const details = [context == null ? 'Context: not reported yet; updates when Codex runs this conversation.' : `Context: ${context}% left (${tokens.toLocaleString()} / ${capacity.toLocaleString()} tokens reported).`];
-  for (const value of windows) details.push(`${value.label}: ${value.left}% left${Number.isFinite(value.resetsAt) && value.resetsAt > 0 ? '; resets ' + new Date(value.resetsAt * 1000).toLocaleString([], { dateStyle: 'full', timeStyle: 'short' }) : ''}.`);
-  if (unlimited) details.push('Credits: unlimited; included usage limits not reported.');
-  else if (!windows.length) details.push(usage.reading ? 'Loading account quota…' : 'Account quota: not reported.');
-  if (account?.ordinaryUsageAllowed === false) details.push('Included usage is currently blocked by the account limit.');
-  if (usage.error) details.push(`Could not refresh quota: ${usage.error}`);
-  details.push('Percentages show remaining usage. Reset times use your local time.');
-  $('usage-details').replaceChildren(...details.map(text => { const paragraph = document.createElement('p'); paragraph.textContent = text; return paragraph; }));
+  const details = windows.map(value => usageDateRow(value.label === 'Week' ? 'Weekly reset' : `${value.label} reset`, value.resetsAt));
+  const resets = account?.rateLimitResetCredits;
+  if (Number.isSafeInteger(resets?.availableCount) && resets.availableCount >= 0) {
+    const section = document.createElement('section'); section.className = 'usage-credits';
+    const heading = document.createElement('h3'); heading.textContent = `Early resets · ${resets.availableCount} available`; section.append(heading);
+    const available = (resets.credits || []).filter(credit => credit.status === 'available' && (credit.expiresAt == null || credit.expiresAt > Date.now() / 1000))
+      .sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity));
+    for (const credit of available) section.append(usageDateRow(`${credit.title || 'Reset'} · expires`, credit.expiresAt, credit.expiresAt === null ? 'No expiry' : 'Expiry unavailable'));
+    if (available.length < resets.availableCount) {
+      const unknown = document.createElement('p'); unknown.className = 'muted'; unknown.textContent = 'Some expiry dates unavailable.'; section.append(unknown);
+    }
+    details.push(section);
+  }
+  const notices = [];
+  if (!windows.length) notices.push(usage.reading ? 'Loading reset times…' : 'No reset time reported.');
+  if (account?.ordinaryUsageAllowed === false) notices.push('Usage currently blocked.');
+  if (usage.error) notices.push(`Could not refresh: ${usage.error}`);
+  for (const text of notices) { const paragraph = document.createElement('p'); paragraph.textContent = text; details.push(paragraph); }
+  $('usage-details').replaceChildren(...details);
   positionUsagePanel();
 }
 function positionUsagePanel() {
@@ -331,7 +377,6 @@ $('usage-meter').onclick = () => {
 };
 $('usage-panel').addEventListener('toggle', event => $('usage-meter').setAttribute('aria-expanded', String(event.newState === 'open')));
 $('close-usage').onclick = () => $('usage-panel').hidePopover();
-$('refresh-usage').onclick = () => refreshUsage();
 addEventListener('resize', positionUsagePanel);
 function scrollToBottom(force = false) {
   const el = $('timeline');
@@ -609,6 +654,17 @@ async function loadThreads(more = false, projectId = null) {
   const filters = more ? [projectId] : [null, ...projects.data.map(project => project.id)];
   const pages = await Promise.all(filters.map(id => rpc('thread/list', { limit: id && !projects.expanded.has(id) ? 5 : 50, sortKey: 'updated_at', modelProviders: [], searchTerm: $('search').value.trim() || null, cursor: more ? (id ? projects.cursors.get(id) : state.threadCursor) : null, ...(projects.data.length ? { projectId: id } : {}) })));
   if (generation !== state.listGeneration) return;
+  const machine = accessKey();
+  for (const [index, id] of filters.entries()) {
+    const ids = preferences.threadOrders[machine]?.[id];
+    if (!id || !ids?.length || preferences.threadOrderCutoffs[machine]?.[id] !== undefined) continue;
+    const known = new Set(ids);
+    const dates = pages[index].data.filter(thread => known.has(thread.id) && Number.isSafeInteger(thread.createdAt) && thread.createdAt >= 0).map(thread => thread.createdAt);
+    if (!dates.length) continue;
+    const saved = await api.savePreferences({ threadOrder: { machine, projectId: id, cutoff: Math.max(...dates) } });
+    if (generation !== state.listGeneration) return;
+    preferences.threadOrderCutoffs[machine] = { ...saved.threadOrderCutoffs[machine], ...preferences.threadOrderCutoffs[machine] };
+  }
   const combined = [...(more ? state.threads : []), ...pages.flatMap(page => page.data)];
   state.threads = [...new Map(combined.map(thread => [thread.id, thread])).values()];
   if (!more) projects.cursors.clear();
@@ -619,6 +675,7 @@ async function loadThreads(more = false, projectId = null) {
   if (generation !== state.listGeneration) return;
   for (const result of pinned) if (result.status === 'fulfilled' && state.pinnedIds.has(result.value.thread.id)) state.pinnedThreads.set(result.value.thread.id, result.value.thread);
   renderThreads();
+  updateSettingsActions();
 }
 function resetThread(folder) {
   saveComposerDraft(); drafts.target = null;
@@ -678,8 +735,8 @@ async function openThread(thread, allowBusy = false) {
   state.items.clear();
   state.historyEvents = [];
   $('messages').replaceChildren();
-  setThread(thread);
   try {
+    setThread(thread);
     const result = await rpc('thread/read', { threadId: thread.id, includeTurns: false });
     if (selection !== state.selection) return;
     setThread(result.thread);
@@ -753,13 +810,19 @@ $('image-preview-dialog').onclose = () => $('image-preview').removeAttribute('sr
 function markdown(element, text) {
   const images = [];
   const renderer = new marked.Renderer();
+  renderer.link = function(token) {
+    if (/^[^/\\:?#]+\.[^/\\:?#]+:\d+(?::\d+)?$/.test(token.href)) token = { ...token, href: './' + token.href };
+    return marked.Renderer.prototype.link.call(this, token);
+  };
   renderer.image = token => { const index = images.push(token) - 1; return `<span data-codex-image="${index}"></span>`; };
   element.innerHTML = DOMPurify.sanitize(marked.parse(text || '', { breaks: true, renderer }), {
     ALLOWED_TAGS: ['p', 'br', 'strong', 'b', 'em', 'i', 's', 'del', 'a', 'ul', 'ol', 'li', 'pre', 'code', 'blockquote', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'sup', 'sub', 'span'],
     ALLOWED_ATTR: ['href', 'title', 'colspan', 'rowspan', 'data-codex-image'],
     ALLOW_DATA_ATTR: false,
-    ALLOW_ARIA_ATTR: false
+    ALLOW_ARIA_ATTR: false,
+    ALLOWED_URI_REGEXP: /^(?:(?:https?|file):|[a-z]:[\\/]|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
   });
+  for (const link of element.querySelectorAll('a[href]')) linkContexts.set(link, { machine: accessKey(), cwd: state.thread?.cwd || $('workspace').value });
   for (const placeholder of element.querySelectorAll('[data-codex-image]')) {
     const token = images[Number(placeholder.dataset.codexImage)];
     if (token) placeholder.replaceWith(messageImage(token.href, token.text || 'Image')); else placeholder.remove();
@@ -1340,6 +1403,7 @@ async function send(event, steer = false, action = null) {
     const key = queueKey(state.thread.id);
     if (!steer && (state.active.has(state.thread.id) || state.dispatching.has(key) || state.queues.get(key)?.messages.length)) {
       const queue = state.queues.get(key) || { key, machine: message.machine, thread: state.thread, messages: [], paused: false };
+      if (!queue.messages.length) queue.paused = false;
       queue.messages.push(message); state.queues.set(key, queue);
       try { await persistQueue(queue); } catch (error) { queue.messages = queue.messages.filter(entry => entry !== message); throw error; }
       trace('send.queued', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, paused: queue.paused });
@@ -1521,12 +1585,21 @@ function updateEfforts(preferred) {
 }
 async function connect(options) {
   if (state.connecting) return;
-  saveComposerDraft(); drafts.target = null; drafts.suspended = true;
+  if (connectionBusy()) { showError('Finish or stop running tasks before changing the connection.'); return; }
+  saveComposerDraft();
+  state.connecting = true; status('Connecting…'); updateBusy();
+  try { await api.connect(options); }
+  catch (error) {
+    state.connecting = false; status(state.connected ? connectedStatus() : 'Not connected'); updateBusy();
+    $('settings-error').textContent = error.message;
+    if (!state.connected && !$('settings-dialog').open) $('settings-dialog').showModal();
+    showError(error); return;
+  }
+  drafts.target = null; drafts.suspended = true;
   clearQueueDrag(false);
   clearThreadDrag();
   clearProjectDrag(); $('project-menu').hidden = true;
   pauseQueues();
-  state.connecting = true;
   state.connected = false;
   state.options = options;
   usage.generation++; usage.threads.clear(); usage.account = null; usage.reading = null; usage.updatedAt = 0; usage.error = null;
@@ -1558,7 +1631,6 @@ async function connect(options) {
   renderRequests();
   $('settings-error').textContent = '';
   try {
-    await api.connect(options);
     state.connected = true;
     $('workspace').value = isLocal() ? options.localCwd : options.cwd;
     $('thread-path').textContent = $('workspace').value;
@@ -1594,6 +1666,13 @@ async function connect(options) {
 function handleNotification(message) {
   if (message.method === 'scheduler/updated') { refreshSchedules().catch(showError); return; }
   const { method, params = {}, id } = message;
+  const retry = state.retryError;
+  const progress = ['turn/completed', 'item/agentMessage/delta', 'item/plan/delta', 'item/reasoning/summaryTextDelta', 'item/reasoning/summaryPartAdded', 'item/reasoning/textDelta'].includes(method)
+    || method === 'item/started' && params.item?.type && params.item.type !== 'userMessage'
+    || method === 'item/completed' && ['agentMessage', 'reasoning', 'plan'].includes(params.item?.type);
+  if (retry && retry.threadId === params.threadId && retry.turnId === (params.turnId || params.turn?.id) && progress) {
+    state.retryError = null; $('error').hidden = true;
+  }
   if (method === 'thread/tokenUsage/updated') {
     if (state.connected && typeof params.threadId === 'string' && params.tokenUsage) { usage.threads.set(params.threadId, params.tokenUsage); renderUsage(); }
     return;
@@ -1630,7 +1709,7 @@ function handleNotification(message) {
   if (method === 'project/changed') { refreshProjects().catch(showError); return; }
   if (method === 'thread/project/updated') { applyProject(params.threadId, params.projectId); loadThreads().catch(showError); return; }
   if (method === 'serverRequest/resolved') { state.requests.delete(params.requestId); renderRequests(); return; }
-  if (method === 'thread/status/changed') { setThreadRuntimeStatus(params.threadId, params.status); renderThreadIndicators(); return; }
+  if (method === 'thread/status/changed') { setThreadRuntimeStatus(params.threadId, params.status); renderThreadIndicators(); updateSettingsActions(); return; }
   if (method === 'turn/started' && !state.finished.has(params.turn.id)) {
     state.owned.add(params.threadId); state.writerConflicts.delete(queueKey(params.threadId));
     setCompletion(params.threadId);
@@ -1662,6 +1741,7 @@ function handleNotification(message) {
     const queue = state.queues.get(queueKey(params.threadId));
     if (queue && !params.willRetry) { pauseQueue(queue, 'native-error').catch(showError); renderQueue(); }
     showError(params.error?.message || params.message || 'Codex reported an error.');
+    if (params.willRetry && params.threadId && params.turnId) state.retryError = { threadId: params.threadId, turnId: params.turnId };
   }
   if (!state.thread || params.threadId !== state.thread.id) return;
   if (state.historyEvents && (method.startsWith('item/') || method === 'turn/completed' || method === 'turn/started')) { state.historyEvents.push(message); return; }
@@ -1968,12 +2048,8 @@ function clearThreadDrag() {
 function sortProjectThreads(threads, projectId) {
   const ids = preferences.threadOrders[accessKey()]?.[projectId] || [];
   const rank = new Map(ids.map((id, index) => [id, index]));
-  const seen = new Set(); const newer = new Set();
-  for (const thread of threads) {
-    const pinned = state.pinnedIds.has(thread.id);
-    if (rank.has(thread.id)) seen.add(pinned); else if (!seen.has(pinned)) newer.add(thread.id);
-  }
-  const position = thread => rank.get(thread.id) ?? (newer.has(thread.id) ? -1 : Number.MAX_SAFE_INTEGER);
+  const cutoff = preferences.threadOrderCutoffs[accessKey()]?.[projectId] ?? Infinity;
+  const position = thread => rank.get(thread.id) ?? (Number.isFinite(thread.createdAt) && thread.createdAt >= cutoff ? -1 : Number.MAX_SAFE_INTEGER);
   return threads.sort((a, b) => Number(state.pinnedIds.has(b.id)) - Number(state.pinnedIds.has(a.id)) || position(a) - position(b));
 }
 function bindThreadOrder(row, thread) {
@@ -2015,8 +2091,10 @@ async function reorderThread(source, target, after, options = state.options) {
   if (ids.every((id, index) => next[index] === id)) return;
   threadDrag.orderPending.add(key); renderThreads();
   try {
-    await api.savePreferences({ threadOrder: { machine, projectId, ids: next } });
+    const cutoff = Math.max(preferences.threadOrderCutoffs[machine]?.[projectId] || 0, ...members.map(thread => Number.isSafeInteger(thread.createdAt) && thread.createdAt >= 0 ? thread.createdAt : 0));
+    await api.savePreferences({ threadOrder: { machine, projectId, ids: next, cutoff } });
     preferences.threadOrders[machine] = { ...preferences.threadOrders[machine], [projectId]: next };
+    preferences.threadOrderCutoffs[machine] = { ...preferences.threadOrderCutoffs[machine], [projectId]: cutoff };
   } finally { threadDrag.orderPending.delete(key); if (machine === accessKey()) renderThreads(); }
 }
 function bindThreadDrop(target, projectId) {
@@ -2199,10 +2277,16 @@ async function openMessageLink(event) {
   const link = event.target.closest('a[href]');
   if (!link || event.defaultPrevented || event.button > 1 || event.type === 'auxclick' && event.button !== 1) return;
   event.preventDefault();
-  try { await api.openLink(link.getAttribute('href')); } catch (error) { showError(error); }
+  try { await api.openLink(link.getAttribute('href'), linkContexts.get(link)); } catch (error) { showError(error); }
 }
 document.addEventListener('click', openMessageLink);
 document.addEventListener('auxclick', openMessageLink);
+document.addEventListener('contextmenu', async event => {
+  const link = event.target.closest('a[href]');
+  if (!link || event.defaultPrevented) return;
+  event.preventDefault();
+  try { await api.linkMenu(link.getAttribute('href'), linkContexts.get(link)); } catch (error) { showError(error); }
+});
 document.addEventListener('drop', event => { if (threadDrag.source && event.dataTransfer?.types.includes(threadDrag.type)) { event.preventDefault(); clearThreadDrag(); } });
 document.addEventListener('drop', event => { if (queueDrag.source && event.dataTransfer?.types.includes(queueDrag.type)) { event.preventDefault(); clearQueueDrag(); } });
 document.addEventListener('drop', event => { if (projectDrag.source && event.dataTransfer?.types.includes(projectDrag.type)) { event.preventDefault(); clearProjectDrag(); } });

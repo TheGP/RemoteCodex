@@ -33,6 +33,18 @@ test('invalid preferences and failed writes leave saved settings unchanged', t =
   assert.equal(new PreferencesStore(file).read().theme, 'dark');
 });
 
+test('file opener preferences persist without changing connection or other preferences', t => {
+  const file = fixture(t); const store = new PreferencesStore(file);
+  store.update({ theme: 'purple', startupProject: { machine: 'access:local', projectId: 'rapidcode' } });
+  for (const fileOpener of ['gitferry', 'antigravity', 'reveal', 'vscode']) {
+    store.update({ fileOpener });
+    assert.equal(new PreferencesStore(file).read().fileOpener, fileOpener);
+    assert.equal(store.read().theme, 'purple'); assert.equal(store.read().startupProjects['access:local'], 'rapidcode');
+  }
+  assert.throws(() => store.update({ fileOpener: 'shell-command' }));
+  assert.equal(store.read().fileOpener, 'vscode');
+});
+
 test('unread and completion markers survive process restarts and remain separate per machine', t => {
   const file = fixture(t); const store = new PreferencesStore(file);
   store.update({ theme: 'purple', startupProject: { machine: 'access:local', projectId: 'rapidcode' } });
@@ -72,4 +84,26 @@ test('conversation order survives restart independently for each project and mac
   fs.mkdirSync(file + '.tmp');
   assert.throws(() => store.update({ threadOrder: order }));
   assert.deepEqual(new PreferencesStore(file).read().threadOrders['access:local'].rapidcode, ['b', 'a']);
+});
+
+test('conversation cutoffs persist and late migration preserves manual ordering', t => {
+  const file = fixture(t); const store = new PreferencesStore(file);
+  const target = { machine: 'access:local', projectId: 'rapidcode' };
+  store.update({ threadOrder: { ...target, ids: ['b', 'a'] } });
+  store.update({ threadOrder: { ...target, cutoff: 100 } });
+  store.update({ threadOrder: { ...target, cutoff: 300 } });
+  assert.equal(new PreferencesStore(file).read().threadOrderCutoffs['access:local'].rapidcode, 100);
+  assert.deepEqual(store.read().threadOrders['access:local'].rapidcode, ['b', 'a']);
+  store.update({ threadOrder: { ...target, ids: ['a', 'b'], cutoff: 400 } });
+  store.update({ threadOrder: { ...target, cutoff: 100 } });
+  assert.equal(store.read().threadOrderCutoffs['access:local'].rapidcode, 400);
+  assert.deepEqual(store.read().threadOrders['access:local'].rapidcode, ['a', 'b']);
+  store.update({ threadOrder: { ...target, machine: 'access:other:22', ids: ['remote'], cutoff: 0 } });
+  assert.equal(store.read().threadOrderCutoffs['access:other:22'].rapidcode, 0);
+  const before = store.read();
+  for (const cutoff of [-1, null, '100', 1.5, NaN, Infinity]) assert.throws(() => store.update({ threadOrder: { ...target, cutoff } }));
+  assert.deepEqual(store.read(), before);
+  fs.mkdirSync(file + '.tmp');
+  assert.throws(() => store.update({ threadOrder: { ...target, ids: ['b', 'a'], cutoff: 500 } }));
+  assert.deepEqual(new PreferencesStore(file).read(), before);
 });

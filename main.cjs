@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, Menu, dialog, safeStorage, shell, powerMonitor, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, dialog, safeStorage, shell, clipboard, powerMonitor, powerSaveBlocker } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
@@ -8,7 +8,7 @@ const { PinStore } = require('./pins.cjs');
 const { QueueStore } = require('./queues.cjs');
 const { PreferencesStore } = require('./preferences.cjs');
 const { readImage } = require('./images.cjs');
-const { openWebLink } = require('./links.cjs');
+const { openWebLink, openFileLink, parseFileLink } = require('./links.cjs');
 const { generateTitle, titleKey, readThreadForTitle } = require('./titles.cjs');
 const { ScheduleStore, Scheduler } = require('./scheduler.cjs');
 const { DiagnosticLog } = require('./diagnostics.cjs');
@@ -99,7 +99,31 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('settings', event => { checkSender(event); return settings; });
   ipcMain.handle('read-image', (event, file) => { checkSender(event); return readImage(connection, file); });
-  ipcMain.handle('open-link', (event, href) => { checkSender(event); return openWebLink(href, url => shell.openExternal(url)); });
+  ipcMain.handle('link-menu', (event, href, context) => {
+    checkSender(event);
+    if (typeof href !== 'string' || !href.trim() || href.length > 8192 || /[\u0000-\u001f\u007f]/.test(href)) throw new Error('Invalid link.');
+    let target = href.trim();
+    if (!/^https?:/i.test(target)) {
+      const { file, line, column } = parseFileLink(target, context?.cwd);
+      target = file + (line ? `:${line}${column ? ':' + column : ''}` : '');
+    }
+    Menu.buildFromTemplate([{ label: 'Copy link', click: () => clipboard.writeText(target) }]).popup({ window });
+  });
+  let fileOpens = Promise.resolve();
+  ipcMain.handle('open-link', (event, href, context) => {
+    checkSender(event);
+    if (typeof href === 'string' && /^https?:/i.test(href.trim())) return openWebLink(href, url => shell.openExternal(url));
+    const options = settings; const child = connection.child;
+    const current = () => { if (settings !== options || connection.child !== child || context?.machine !== scheduleMachine()) throw new Error('The conversation’s machine changed. Open the file link again.'); };
+    current();
+    const opener = preferences.read().fileOpener || 'vscode';
+    const opening = fileOpens.then(() => openFileLink(href, {
+      cwd: context?.cwd, settings: options, opener, current,
+      openExternal: url => shell.openExternal(url), reveal: file => shell.showItemInFolder(file), application: url => app.getApplicationNameForProtocol(url)
+    }));
+    fileOpens = opening.catch(() => {});
+    return opening;
+  });
   ipcMain.handle('pins', event => { checkSender(event); return pins.get(settings); });
   ipcMain.handle('set-pin', (event, threadId, pinned) => {
     checkSender(event);
@@ -114,14 +138,22 @@ app.whenReady().then(async () => {
   ipcMain.handle('connect', async (event, value) => {
     checkSender(event);
     const next = connectionOptions(value);
+    if (connection.ready && Object.keys(next).every(key => next[key] === settings[key])) return {};
+    if (connection.ready && wakeLock.id !== null) throw new Error('Finish or stop running tasks before changing the connection.');
     editLocks.clear();
-    const result = await connection.connect(next);
-    settings = next;
-    fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
-    fs.writeFileSync(settingsFile + '.tmp', JSON.stringify(settings, null, 2), { mode: 0o600 });
-    fs.renameSync(settingsFile + '.tmp', settingsFile);
-    setImmediate(tickSchedules);
-    return result;
+    try {
+      const result = await connection.connect(next);
+      fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
+      fs.writeFileSync(settingsFile + '.tmp', JSON.stringify(next, null, 2), { mode: 0o600 });
+      fs.renameSync(settingsFile + '.tmp', settingsFile);
+      settings = next;
+      setImmediate(tickSchedules);
+      return result;
+    } catch (error) {
+      if (connection.ready) connection.disconnect();
+      connection.emit('notification', { method: 'connection/closed', params: { message: error.message } });
+      throw error;
+    }
   });
   ipcMain.handle('rpc', async (event, method, params) => {
     checkSender(event);

@@ -7,7 +7,8 @@ function draftRequest(operation, target, patch) {
 contextBridge.exposeInMainWorld('codex', {
   settings: () => ipcRenderer.invoke('settings'),
   readImage: file => ipcRenderer.invoke('read-image', file),
-  openLink: href => ipcRenderer.invoke('open-link', href),
+  openLink: (href, context) => ipcRenderer.invoke('open-link', href, context),
+  linkMenu: (href, context) => ipcRenderer.invoke('link-menu', href, context),
   preferences: () => ipcRenderer.invoke('preferences'),
   savePreferences: patch => ipcRenderer.invoke('save-preferences', patch),
   saveConversationState: value => {
