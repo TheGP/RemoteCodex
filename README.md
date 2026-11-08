@@ -14,6 +14,8 @@ Open **Remote Codex** from Applications or Spotlight. It reconnects to your last
 
 Choose a theme in **Settings → Theme**: System, Light, Dark, Purple, Claude Code, Nord, or Midnight. Themes change colors immediately, keep the same fonts, and persist after restarting. Click **Done** to close settings. **Save & connect** appears only when connection settings change or Codex is disconnected.
 
+**Settings → Sound on completion** is enabled by default. A quiet half-second chime plays when a chat finishes, including background chats. Intermediate queued turns, failures, interruptions, and duplicate events stay silent; nearby completions share one chime. Use **Preview** to hear it or turn it off. The preference saves immediately without reconnecting.
+
 The compact usage bars beside the access selector show conversation context remaining and the tightest reported account limit. Click the graphs to see reset dates and times, plus available early resets and their expiry dates when Codex reports them. Percentages stay in the graphs. Times use your local timezone. Opening the popup refreshes the data; click outside or press Escape to close. Quotas also refresh automatically once a minute while the app is visible. Context appears when Codex reports token usage for the conversation; unavailable data shows **—**. Each connected machine uses its own Codex account and usage data.
 
 Right-click a project → **Expand conversations** to show 50 conversations inline in the sidebar, with pagination below. **Show fewer conversations** returns to the five-chat preview. In **Project settings…**, enable **Expand this project when the app starts** to expand it automatically and use its folder for new conversations. Other projects and your current conversation remain available. Themes and startup choices are saved in the app's local `preferences.json`.
@@ -70,6 +72,10 @@ File links open in the app selected under **Settings → Open file links with**:
 
 GitFerry opens the working file in its normal editable side editor at the requested line and column using its registered `gitferry://open` URL handler. No MCP server, configuration, token, or extra package is needed. The OS launches or activates GitFerry, which handles repeated clicks, startup, and unsaved editor buffers. Local and explicit SSH file locations stay separate, and GitFerry discovers the nearest repository/worktree. File opening requests are sent in click order. Opening a link never edits or saves files, stages changes, or switches branches.
 
+Each reply with applied file edits shows a changed-files summary outside the activity log. Expand or collapse the list, click a file to expand its highlighted diff inline, or open it in your selected editor. Click the file again to collapse it; expanded files stay open when more edits arrive. Counts describe added and removed lines across the recorded edits; failed or declined patches are excluded. Summaries also appear when reopening conversation history. Changes made only through shell commands are shown when Codex reports them as file-change items.
+
+The small shortcut row above the prompt sends a saved message immediately, or queues it behind the current turn. **Review** sends `$cr ur changes` with the actual `cr` skill attached from the conversation’s workspace. Use **+** to add a shortcut and right-click one to edit or delete it. Each shortcut has a **When clicked** choice: **Send / queue immediately** or **Fill prompt only**. Fill mode adds its text to your existing draft, focuses the prompt, and waits for you to send; skill references resolve when sent. Existing shortcuts keep autosending by default. Shortcuts and their click behavior survive restarts. Autosend shortcuts preserve your typed message and image drafts and send now regardless of the composer’s scheduling selector. Missing skills show an error instead of sending plain text.
+
 ## Development
 
 Requires Node.js 22+. For local use, install and sign in to Codex; for SSH use, have an SSH key that connects without an interactive prompt.
@@ -101,6 +107,8 @@ These check reply sanitization, history streaming, approval drafts, mode setting
 npm run package:mac
 npm run package:win
 ```
+
+For local macOS updates, run `npm run package:mac` then `npm run install:mac`. Reuse the fixed `dist/Remote Codex-darwin-x64` output instead of per-feature build folders. The installer verifies the staged app, swaps it without restarting running chats, and keeps just one compressed rollback at `~/Applications/.Remote-Codex-rollback.zip`. Old `.Remote-Codex-before-*` folders are removed unless a running app still uses them; after restarting, `npm run cleanup:mac` removes those remaining copies. Cleanup verifies the rollback archive before deleting backups. Builds exclude tests, installer scripts, and icon design previews.
 
 The app bundles its runtime; SSH mode does not need a local Node.js installation. The macOS build targets Intel Macs and macOS 12+. Electron 43 is pinned because Electron 44+ requires macOS 13. For an Apple Silicon build, use the same packager command with `--arch=arm64`. Builds are unsigned local builds. Windows output is a portable folder containing `Remote Codex.exe`; copy the whole folder.
 

@@ -5,6 +5,7 @@ const path = require('node:path');
 async function checks() {
   const check = (condition, message) => { if (!condition) throw new Error(message); };
   const results = [];
+  completionSound.audio = { volume: 0, currentTime: 0, pause() {}, play: async () => {} };
   api.editLock = async (_threadId, token) => token ? undefined : 'test-edit-lock';
   const diagnostics = [];
   api.log = (event, details) => diagnostics.push({ event, details: structuredClone(details) });
@@ -14,6 +15,8 @@ async function checks() {
   api.savePreferences = async patch => {
     if (patch.theme) savedPreferences.theme = patch.theme;
     if (patch.fileOpener) savedPreferences.fileOpener = patch.fileOpener;
+    if ('completionSound' in patch) savedPreferences.completionSound = patch.completionSound;
+    if (patch.shortcuts) savedPreferences.shortcuts = structuredClone(patch.shortcuts);
     if (patch.startupProject) {
       const { machine, projectId } = patch.startupProject;
       if (projectId === null) delete savedPreferences.startupProjects[machine]; else savedPreferences.startupProjects[machine] = projectId;
@@ -1566,6 +1569,45 @@ async function checks() {
   api.savePreferences = orderSave;
   state.active.clear(); setUnread('order-d', false); state.pinnedIds.clear(); state.pinnedThreads.clear(); projects.expanded.clear(); $('error').hidden = true;
   results.push('conversations reorder above/below within projects and pin groups, persist across restarts and refreshes, preserve drafts/activity/unread, and reject unsafe or failed drops');
+  resetThread(); state.threads = []; state.threadQuery = null; state.options = { mode: 'local' }; state.connected = true;
+  const refreshProject = { id: 'rename-refresh-project', name: 'Refresh project', roots: [{ path: '/refresh' }] };
+  projects.data = [refreshProject]; projects.expanded.add(refreshProject.id);
+  const refreshChats = Array.from({ length: 120 }, (_, index) => ({ id: `refresh-${index}`, name: `Chat ${index}`, projectId: refreshProject.id, cwd: '/refresh', createdAt: 200 - index }));
+  let serverChats = [...refreshChats]; const refreshCalls = [];
+  api.rpc = async (method, params) => {
+    refreshCalls.push({ method, params });
+    if (method === 'thread/name/set') { serverChats.find(thread => thread.id === params.threadId).name = params.name; return {}; }
+    if (method === 'thread/list') {
+      if (params.projectId !== refreshProject.id) return { data: [], nextCursor: null };
+      const matches = serverChats.filter(thread => !params.searchTerm || thread.name.includes(params.searchTerm));
+      const start = Number(params.cursor || 0); const end = start + params.limit;
+      return { data: structuredClone(matches.slice(start, end)), nextCursor: end < matches.length ? String(end) : null };
+    }
+    return {};
+  };
+  await loadThreads(); await loadThreads(true, refreshProject.id);
+  state.thread = state.threads.find(thread => thread.id === 'refresh-70'); state.contextThread = state.thread;
+  openRename(); $('conversation-name').value = 'Mac-runners health'; await $('rename-form').onsubmit({ preventDefault() {} });
+  await loadThreads();
+  const refreshRow = id => $('threads').querySelector(`[data-thread-id="${id}"]`);
+  check(state.threads.length === 100 && refreshRow('refresh-70')?.textContent.includes('Mac-runners health') && refreshRow('refresh-99'), 'Renaming or refreshing discarded a previously loaded conversation page');
+  check(projects.cursors.get(refreshProject.id) === '100', 'Refresh left the next-page cursor at the first page');
+  state.active.set('refresh-25', 'keep-running');
+  serverChats = serverChats.filter(thread => !['refresh-70', 'refresh-25', 'refresh-90'].includes(thread.id));
+  await loadThreads();
+  check(refreshRow('refresh-70') && refreshRow('refresh-25')?.querySelector('.thread-state.working') && !refreshRow('refresh-90'), 'A partial server list hid an open/running chat or retained an ordinary removed chat');
+  check(state.threads.findIndex(thread => thread.id === 'refresh-70') === 70, 'An omitted conversation jumped down the list instead of keeping its position');
+  check(diagnostics.some(entry => entry.event === 'threads.refresh-retained' && entry.details.threadId === 'refresh-70'), 'Retaining an omitted conversation was not logged');
+  const repeatedRefreshStart = refreshCalls.length; await loadThreads();
+  check(refreshCalls.slice(repeatedRefreshStart).filter(call => call.params.projectId === refreshProject.id).length === 2, 'Retaining omitted chats caused refreshes to keep loading extra pages');
+  $('search').value = 'no-match'; await loadThreads();
+  check(!refreshRow('refresh-70') && !refreshRow('refresh-25') && !state.threads.length, 'Protected conversations leaked into unrelated search results');
+  $('search').value = ''; await loadThreads();
+  check(refreshRow('refresh-70'), 'Clearing search did not restore the open conversation');
+  projects.expanded.delete(refreshProject.id); await loadThreads();
+  check(refreshCalls.at(-1).params.limit === 5 && state.threads.filter(thread => thread.id !== state.thread.id).length === 5, 'Protecting loaded pages prevented showing fewer conversations');
+  state.active.clear(); resetThread(); state.threadQuery = null;
+  results.push('renaming and background refresh preserve loaded pages and cursors, keep omitted open/running chats visible, log recoveries, and respect search and show-fewer actions');
   const pagedProject = { id: 'order-pagination', name: 'Paged order', roots: [{ path: '/paged' }] };
   const pagedOld = { id: 'paged-old', name: 'Saved old', projectId: pagedProject.id, cwd: '/paged', createdAt: 100 };
   const pagedNew = { id: 'paged-saved-new', name: 'Saved new', projectId: pagedProject.id, cwd: '/paged', createdAt: 300 };
@@ -2208,6 +2250,214 @@ async function checks() {
   for (const method of ['draft', 'saveDraft', 'clearDraft', 'moveDraft', 'lastDraft']) delete api[method];
   drafts.target = null; drafts.snapshot = null; drafts.images = []; state.queues.clear(); $('error').hidden = true;
   state.options = { mode: 'local' };
+  resetThread(); state.options = { mode: 'local' }; state.connected = true; state.active.clear(); state.queues.clear();
+  const shortcutThread = { id: 'shortcut-chat', name: 'Shortcuts', cwd: '/shortcut-project' };
+  state.threads = [shortcutThread]; setThread(shortcutThread); state.owned.add(shortcutThread.id);
+  const shortcutCalls = []; const shortcutNative = api.rpc;
+  api.rpc = async (method, params) => {
+    shortcutCalls.push({ method, params });
+    if (method === 'skills/list') return { data: [{ skills: [{ name: 'cr', path: '/skills/cr/SKILL.md', enabled: true }] }] };
+    if (method === 'turn/start') return { turn: { id: 'shortcut-turn', status: 'inProgress' } };
+    return { data: [], nextCursor: null };
+  };
+  const shortcutImage = { name: 'keep.png', url: png };
+  $('prompt').value = 'Keep my typed message'; state.images = [shortcutImage]; renderImages(); $('send-time').value = '24';
+  renderShortcuts(); updateBusy();
+  await $('shortcut-buttons').firstElementChild.onclick();
+  const shortcutSent = shortcutCalls.find(call => call.method === 'turn/start')?.params;
+  check(shortcutSent?.input[0].text === '$cr ur changes' && shortcutSent.input.some(input => input.type === 'skill' && input.name === 'cr' && input.path === '/skills/cr/SKILL.md') && !shortcutSent.input.some(input => input.type === 'image'), 'Review shortcut did not attach the real skill or sent the composer image draft');
+  check($('prompt').value === 'Keep my typed message' && state.images[0] === shortcutImage && $('send-time').value === '24', 'A shortcut cleared the typed draft, attachments, or scheduling selector');
+  await runShortcut(defaultShortcuts[0]);
+  const shortcutQueue = state.queues.get(queueKey(shortcutThread.id));
+  check(shortcutQueue.messages.length === 1 && shortcutQueue.messages[0].text === '$cr ur changes' && shortcutQueue.messages[0].input.some(input => input.type === 'skill') && shortcutCalls.filter(call => call.method === 'turn/start').length === 1, 'A shortcut interrupted the current turn instead of queuing a skill follow-up');
+  const shortcutBeforeFailure = shortcutQueue.messages.length;
+  api.rpc = async () => ({ data: [{ skills: [] }] });
+  await runShortcut(defaultShortcuts[0]);
+  check(shortcutQueue.messages.length === shortcutBeforeFailure && $('error-text').textContent.includes('Skill $cr is unavailable') && $('prompt').value === 'Keep my typed message', 'A missing skill was sent as plain text or damaged the existing draft');
+  state.active.clear(); state.queues.clear();
+  api.rpc = async method => { if (method === 'skills/list') return { data: [{ skills: [{ name: 'cr', path: '/skills/cr/SKILL.md' }] }] }; throw new Error('Shortcut send failed'); };
+  await runShortcut(defaultShortcuts[0]);
+  check($('error-text').textContent === 'Shortcut send failed' && $('prompt').value === 'Keep my typed message' && state.images[0] === shortcutImage, 'A failed shortcut send overwrote the typed or image draft');
+  let finishShortcutSkills; let pendingShortcutReads = 0;
+  api.rpc = () => { pendingShortcutReads++; return new Promise(resolve => { finishShortcutSkills = resolve; }); };
+  const pendingShortcut = runShortcut(defaultShortcuts[0]); await runShortcut(defaultShortcuts[0]);
+  check(pendingShortcutReads === 1 && state.sending, 'Repeated shortcut clicks duplicated a pending skill lookup');
+  const shortcutOptions = state.options; state.options = { ...state.options };
+  finishShortcutSkills({ data: [{ skills: [{ name: 'cr', path: '/skills/cr/SKILL.md' }] }] }); await pendingShortcut;
+  check(!state.sending && pendingShortcutReads === 1, 'A delayed skill lookup sent its shortcut after the connection changed');
+  state.options = shortcutOptions;
+  $('add-shortcut').click(); $('shortcut-label').value = 'Fix'; $('shortcut-prompt').value = 'Fix the review findings';
+  $('shortcut-mode').value = 'fill';
+  await $('shortcut-form').onsubmit({ preventDefault() {} });
+  check(!$('shortcut-dialog').open && promptShortcuts().length === 2 && $('shortcut-buttons').lastElementChild.textContent === 'Fix', 'A new shortcut did not save and appear');
+  Object.assign(preferences, await api.preferences()); renderShortcuts();
+  check(promptShortcuts()[1].prompt === 'Fix the review findings' && promptShortcuts()[1].mode === 'fill', 'Prompt shortcuts or their click behavior were lost after preference reload');
+  const beforeFill = $('prompt').value; const beforeFillCalls = pendingShortcutReads;
+  await $('shortcut-buttons').lastElementChild.onclick();
+  check($('prompt').value === beforeFill + '\nFix the review findings' && state.images[0] === shortcutImage && document.activeElement === $('prompt') && pendingShortcutReads === beforeFillCalls, 'Fill-only shortcut sent a request, erased the draft/images, or did not focus the prompt');
+  $('prompt').value = ''; state.connected = false; updateBusy();
+  check(!$('shortcut-buttons').lastElementChild.disabled && $('shortcut-buttons').firstElementChild.disabled, 'Fill-only shortcuts require a connection or offline autosend is enabled');
+  await runShortcut({ id: 'fill-skill', prompt: '$cr ur changes', mode: 'fill' });
+  check($('prompt').value === '$cr ur changes' && pendingShortcutReads === beforeFillCalls, 'Filling a skill prompt performed an RPC or changed its text');
+  state.connected = true; $('send-time').value = '0';
+  const filledSends = [];
+  api.rpc = async (method, params) => {
+    if (method === 'skills/list') return { data: [{ skills: [{ name: 'cr', enabled: true, path: '/skills/cr/SKILL.md' }] }] };
+    if (method === 'turn/start') { filledSends.push(params); return { turn: { id: 'filled-skill-turn', status: 'inProgress' } }; }
+    return { data: [], nextCursor: null };
+  };
+  $('prompt').value += ' and check edge cases';
+  await send();
+  check(filledSends[0]?.input[0].text === '$cr ur changes and check edge cases' && filledSends[0].input.some(input => input.type === 'skill' && input.name === 'cr'), 'Sending an edited fill-only prompt failed to attach its actual skill');
+  $('prompt').value = 'Keep my typed message'; state.images = [shortcutImage]; renderImages();
+  $('shortcut-buttons').lastElementChild.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+  check($('shortcut-dialog').open && $('shortcut-prompt').value === 'Fix the review findings' && $('shortcut-mode').value === 'fill', 'Right-click did not restore the shortcut editor or its click behavior');
+  await $('delete-shortcut').onclick();
+  check(promptShortcuts().length === 1, 'Deleting a shortcut removed another shortcut or failed to save');
+  const shortcutPreferenceWriter = api.savePreferences;
+  api.savePreferences = async () => { throw new Error('Shortcut save failed'); };
+  $('add-shortcut').click(); $('shortcut-label').value = 'Keep'; $('shortcut-prompt').value = 'Keep this edit';
+  await $('shortcut-form').onsubmit({ preventDefault() {} });
+  check($('shortcut-dialog').open && !$('shortcut-error').hidden && $('shortcut-prompt').value === 'Keep this edit' && promptShortcuts().length === 1, 'A failed shortcut save silently replaced preferences or lost the editor text');
+  $('cancel-shortcut').click(); api.savePreferences = shortcutPreferenceWriter; api.rpc = shortcutNative;
+  state.active.clear(); state.queues.clear(); state.images = []; $('send-time').value = '0'; $('error').hidden = true;
+  results.push('compact shortcuts send or queue exact prompts with resolved skills, preserve typed and image drafts, reject missing skills, and support persistent adding, editing, deleting, and failed-save recovery');
+  resetThread(); state.thread = { id: 'changed-files-chat', cwd: '/work/project' };
+  const summaryTurn = 'changed-files-turn';
+  const summaryPatch = { id: 'changed-files-patch', type: 'fileChange', status: 'inProgress', changes: [
+    { path: '/work/project/src/example.ts', kind: { type: 'update' }, diff: '--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1,2 @@\n-old\n+new\n+++literal added line' },
+    { path: '/work/project/new.ts', kind: { type: 'add' }, diff: '<img src=x onerror=alert(1)>\n' }
+  ] };
+  renderItem(summaryPatch, false, summaryTurn);
+  check(!$('messages').querySelector('.changed-files'), 'An unfinished patch was presented as applied');
+  renderItem({ ...summaryPatch, status: 'completed' }, false, summaryTurn);
+  renderItem({ ...summaryPatch, status: 'completed' }, false, summaryTurn);
+  renderItem({ id: 'changed-files-answer', type: 'agentMessage', text: 'Updated the files.' }, false, summaryTurn);
+  const summaryCard = $('messages').querySelector('.changed-files');
+  check(summaryCard.querySelector('summary').textContent === '2 files changed+3−1' && summaryCard.querySelectorAll('.changed-file').length === 2 && $('messages').lastElementChild === summaryCard, 'Changed files were duplicated, counts included headers, or the summary was buried inside activity');
+  const toggleFile = async entry => {
+    const toggled = new Promise(resolve => entry.addEventListener('toggle', resolve, { once: true }));
+    entry.querySelector('.changed-file').click(); await toggled;
+  };
+  const firstFile = summaryCard.querySelector('.changed-file-entry');
+  check(!summaryCard.querySelector('pre'), 'Collapsed files eagerly rendered their diffs');
+  await toggleFile(firstFile);
+  const inlineDiff = firstFile.querySelector('.changed-file-diff');
+  check(firstFile.open && inlineDiff.textContent.includes('+++literal added line') && inlineDiff.querySelector('.diff-added') && !inlineDiff.querySelector('img') && !document.querySelector('dialog[open]'), 'The inline diff lost patch text, colors, safe HTML, or opened a dialog');
+  const summaryOpenLink = api.openLink; const summaryLinks = []; api.openLink = async (href, context) => summaryLinks.push({ href, context });
+  await firstFile.querySelector('.open-changed-file').onclick();
+  check(summaryLinks[0].href === '/work/project/src/example.ts' && summaryLinks[0].context.cwd === '/work/project' && summaryLinks[0].context.machine === accessKey(), 'The diff opened a file on the wrong machine or in the wrong folder');
+  await toggleFile(firstFile);
+  check(!firstFile.open && !inlineDiff.checkVisibility(), 'Clicking a file again did not collapse its diff');
+  await toggleFile(firstFile);
+  const secondFile = summaryCard.querySelectorAll('.changed-file-entry')[1];
+  await toggleFile(secondFile);
+  check(firstFile.open && secondFile.open && secondFile.textContent.includes('<img src=x onerror=alert(1)>') && !secondFile.querySelector('img'), 'Multiple inline files cannot stay open or added code was rendered as HTML');
+  await toggleFile(secondFile); summaryCard.open = false;
+  renderItem({ id: 'changed-files-second-patch', type: 'fileChange', status: 'completed', changes: [{ path: '/work/project/src/example.ts', kind: { type: 'update' }, diff: '@@ -2 +2 @@\n-new\n+newer' }] }, false, summaryTurn);
+  check(summaryCard.querySelector('summary').textContent === '2 files changed+4−2' && !summaryCard.open && $('messages').querySelectorAll('.activity-log').length === 2, 'Another patch reset expansion, double-counted files, or was attached to the wrong activity group');
+  check(summaryCard.querySelector('.changed-file-entry').open && summaryCard.querySelector('.changed-file-diff').textContent.includes('+newer') && !summaryCard.querySelectorAll('.changed-file-entry')[1].open, 'More edits reset file expansion or left the inline diff stale');
+  renderItem({ id: 'changed-files-declined', type: 'fileChange', status: 'declined', changes: [{ path: '/work/project/declined.ts', diff: '+ignored' }] }, false, summaryTurn);
+  check(summaryCard.querySelectorAll('.changed-file').length === 2, 'Declined edits appeared in changed files');
+  renderItem({ id: 'earlier-file-change', type: 'fileChange', status: 'completed', changes: [{ path: '/work/project/deleted.ts', kind: { type: 'delete' }, diff: 'deleted\n' }] }, true, 'earlier-files-turn');
+  const earlierCard = $('messages').querySelector('.changed-files[data-turn-id="earlier-files-turn"]');
+  check(earlierCard && earlierCard.compareDocumentPosition(summaryCard) & Node.DOCUMENT_POSITION_FOLLOWING, 'Paginated history placed an older file summary under a newer reply');
+  await toggleFile(earlierCard.querySelector('.changed-file-entry'));
+  check(earlierCard.querySelector('.open-changed-file').disabled && earlierCard.textContent.includes('−1') && earlierCard.querySelector('.changed-file-diff .diff-removed').textContent.includes('deleted'), 'A deleted file offered an editor action or lost its removed lines');
+  resetThread(); check(!$('messages').querySelector('.changed-files,.changed-file-diff'), 'File summaries or diffs leaked into a different chat');
+  if (summaryOpenLink) api.openLink = summaryOpenLink; else delete api.openLink;
+  results.push('changed-file summaries expand diffs inline on demand, support multiple files, preserve expansion and fresh code across edits, keep safe HTML and editor context, paginate, and clear on switching chats');
+  state.thread = { id: 'diff-reuse-chat', cwd: '/work/project' }; $('welcome').hidden = true;
+  const reuseTurn = 'diff-reuse-turn';
+  const appliedPatch = (id, path, diff, movePath) => ({ id, type: 'fileChange', status: 'completed', changes: [{ path, kind: { type: 'update', ...(movePath ? { move_path: movePath } : {}) }, diff }] });
+  const originalPatch = appliedPatch('reuse-original', '/work/project/original.ts', '@@ -1 +1 @@\n-old\n+new\n' + ' context'.repeat(100) + '\n' + ' context\n'.repeat(200));
+  renderItem(originalPatch, false, reuseTurn);
+  renderItem(appliedPatch('reuse-other', '/work/project/other.ts', '@@ -1 +1 @@\n-a\n+b'), false, reuseTurn);
+  const reusedCard = $('messages').querySelector('.changed-files');
+  const reusedEntry = reusedCard.querySelector('.changed-file-entry'); await toggleFile(reusedEntry);
+  const reusedPane = reusedEntry.querySelector('.changed-file-diff'); const originalPre = reusedPane.firstElementChild;
+  const editorButton = reusedEntry.querySelector('.open-changed-file');
+  reusedPane.focus({ preventScroll: true }); reusedPane.scrollTop = 120; reusedPane.scrollLeft = 90;
+  check(reusedPane.scrollTop === 120 && reusedPane.scrollLeft === 90, 'Diff scroll fixture did not overflow');
+  const selection = getSelection(); const range = document.createRange();
+  range.selectNodeContents(originalPre.children[1]); selection.removeAllRanges(); selection.addRange(range);
+  const selectedCode = selection.toString();
+  renderItem({ id: 'reuse-pending', type: 'fileChange', status: 'inProgress', changes: [] }, false, reuseTurn);
+  check(reusedCard.querySelector('.changed-file-diff') === reusedPane && reusedPane.firstElementChild === originalPre && document.activeElement === reusedPane && reusedPane.scrollTop === 120 && reusedPane.scrollLeft === 90 && selection.toString() === selectedCode, 'An unrelated pending patch reset the diff DOM, focus, scroll, or selected code');
+  editorButton.focus({ preventScroll: true });
+  renderItem(appliedPatch('reuse-pending', '/work/project/other.ts', '@@ -2 +2 @@\n-b\n+c'), false, reuseTurn);
+  check(document.activeElement === editorButton && selection.toString() === selectedCode && reusedPane.scrollTop === 120 && reusedPane.scrollLeft === 90, 'Updating another file reset its sibling pane');
+  renderItem({ id: 'reuse-late-reply', type: 'agentMessage', text: 'Still working.' }, false, reuseTurn);
+  check(document.activeElement === editorButton && selection.toString() === selectedCode && reusedPane.scrollTop === 120 && reusedPane.scrollLeft === 90, `Moving the summary below a reply reset its pane: ${JSON.stringify({ focus: document.activeElement.className, selected: selection.toString(), top: reusedPane.scrollTop, left: reusedPane.scrollLeft })}`);
+  renderItem(appliedPatch('reuse-next-edit', '/work/project/original.ts', '@@ -2 +2 @@\n-new\n+newer'), false, reuseTurn);
+  check(reusedPane.children.length === 2 && reusedPane.firstElementChild === originalPre && document.activeElement === editorButton && reusedPane.scrollTop === 120 && reusedPane.scrollLeft === 90, 'Another edit to the same file rebuilt existing patches or reset its pane');
+  renderItem(appliedPatch('reuse-rename', '/work/project/original.ts', '@@ -3 +3 @@\n-newer\n+renamed', '/work/project/middle.ts'), false, reuseTurn);
+  check(reusedCard.querySelectorAll('.changed-file-entry').length === 2 && reusedEntry.dataset.path === '/work/project/middle.ts' && reusedEntry.open && reusedEntry.querySelector('.changed-file-diff') === reusedPane && document.activeElement === editorButton && reusedPane.scrollTop === 120 && reusedPane.scrollLeft === 90, 'Renaming duplicated the row or discarded its open pane, focus, or scroll position');
+  renderItem(appliedPatch('reuse-rename-again', '/work/project/middle.ts', '@@ -4 +4 @@\n-renamed\n+final', '/work/project/final.ts'), false, reuseTurn);
+  renderItem(appliedPatch('reuse-final-edit', '/work/project/final.ts', '@@ -5 +5 @@\n-final\n+finished'), false, reuseTurn);
+  check(reusedCard.firstElementChild.textContent === '2 files changed+7−7' && reusedEntry.dataset.path === '/work/project/final.ts' && reusedEntry.querySelector('.change-counts').textContent === '+5−5' && reusedPane.children.length === 5 && reusedPane.firstElementChild === originalPre, 'Rename chains lost or duplicated previous patches and counts');
+  const reuseOpenLink = api.openLink; const openedRename = []; api.openLink = async (href, context) => openedRename.push({ href, context });
+  await editorButton.onclick(); api.openLink = reuseOpenLink;
+  check(openedRename[0].href === '/work/project/final.ts' && openedRename[0].context.cwd === '/work/project', 'The reused editor button still opened the source of a rename');
+  renderItem({ id: 'reuse-source-name', type: 'fileChange', status: 'completed', changes: [{ path: '/work/project/original.ts', kind: { type: 'add' }, diff: 'a different file\n' }] }, false, reuseTurn);
+  check(reusedCard.querySelectorAll('.changed-file-entry').length === 3 && reusedEntry.dataset.path === '/work/project/final.ts' && reusedCard.lastElementChild.lastElementChild !== reusedEntry, 'Creating a new file at the old path merged it with the renamed file');
+  renderItem({ ...appliedPatch('reuse-failed-rename', '/work/project/final.ts', '-finished\n+bad', '/work/project/failed.ts'), status: 'failed' }, false, reuseTurn);
+  check(reusedEntry.dataset.path === '/work/project/final.ts' && reusedCard.firstElementChild.textContent === '3 files changed+8−7', 'An unsuccessful rename changed the final path or counts');
+  selection.removeAllRanges(); resetThread();
+  results.push('diff updates reuse panes and existing patches, preserve focus/selection/scroll through replies and row moves, merge rename chains and counts, and open the final path without merging reused source names');
+  const diffCases = [
+    ['const pattern = /驗證碼|認証コード/;', 'const pattern = /驗證碼|確認碼|認証コード/;', [], ['確認碼|']],
+    ['const total = first + second;', 'const amount = first - second;', ['total', '+'], ['amount', '-']],
+    ['const face = "😀";', 'const face = "😃";', ['😀'], ['😃']],
+    ['const a = 1;', 'const  a = 1;', [' '], ['  ']],
+    ['completely removed', 'unrelated insertion', [], []],
+    ['const same = 1;', 'const same = 1;', [], []]
+  ];
+  for (const [before, after, removed, added] of diffCases) {
+    const patch = `--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-${before}\n+${after}`;
+    const pre = renderDiff(patch);
+    check(pre.textContent === patch + '\n', 'Inline highlights altered the original diff text');
+    for (const [kind, expected] of [['removed', removed], ['added', added]]) {
+      const actual = [...pre.querySelectorAll(`.diff-${kind} .diff-word-change`)].map(span => span.textContent);
+      check(JSON.stringify(actual) === JSON.stringify(expected), `Incorrect ${kind} highlights: ${JSON.stringify(actual)}`);
+    }
+    check(!pre.children[0].className && !pre.children[1].className, 'File headers were highlighted as code changes');
+  }
+  const unsafeDiff = renderDiff('-const text = "safe";\n+const text = "<img src=x onerror=alert(1)>";');
+  check(!unsafeDiff.querySelector('img') && unsafeDiff.textContent.includes('<img src=x onerror=alert(1)>'), 'Inline highlights rendered code as HTML');
+  const separateHunks = renderDiff('@@ -1 +1 @@\n-before value\n context\n+after value\n@@ -2 +2 @@\n+added only\n-removed only');
+  check(!separateHunks.querySelector('.diff-word-change'), 'Inline highlights paired lines across context or hunks');
+  for (const before of ['x'.repeat(2500), 'a '.repeat(200)]) check(!diffWordRanges(before, before + 'changed').some(ranges => ranges.length), 'Long lines exceeded inline highlighting limits');
+  const hugePatch = renderDiff(' context\n'.repeat(21000) + '-const old = 1;\n+const newer = 1;');
+  check(!hugePatch.querySelector('.diff-word-change') && hugePatch.querySelector('.diff-added'), 'Large diffs lost their fallback line colors');
+  results.push('inline diffs highlight only changed Unicode words and punctuation, preserve text and safe HTML, respect hunk boundaries, and bound work for large patches');
+  const soundRpc = api.rpc; const soundPreferenceWriter = api.savePreferences;
+  api.rpc = async () => ({ data: [], nextCursor: null }); state.active.clear(); state.queues.clear();
+  let soundPlays = 0; completionSound.audio.play = async () => { soundPlays++; };
+  delete preferences.completionSound; fillSettings(state.options);
+  check($('completion-sound').checked && !$('completion-sound').closest('form'), 'Completion sounds are not enabled by default or can submit connection settings');
+  const soundFinish = (id, status = 'completed', threadId = 'sound-background-chat') => handleNotification({ method: 'turn/completed', params: { threadId, turn: { id, status } } });
+  completionSound.lastAt = -Infinity;
+  soundFinish('sound-first'); soundFinish('sound-first'); soundFinish('sound-burst');
+  check(soundPlays === 1 && completionSound.audio.volume <= 0.35, 'Completion sounds repeated for duplicates, overlapping chats, or played too loudly');
+  completionSound.lastAt = -Infinity; soundFinish('sound-failed', 'failed'); soundFinish('sound-stopped', 'interrupted');
+  state.active.set('sound-background-chat', 'newer-sound-turn'); soundFinish('stale-sound-turn'); state.active.clear();
+  check(soundPlays === 1, 'Failure, cancellation, or a stale turn triggered a completion chime');
+  const soundQueue = { key: queueKey('sound-background-chat'), machine: accessKey(), thread: { id: 'sound-background-chat' }, messages: [{ text: 'Next task' }], paused: false, editing: true };
+  state.queues.set(soundQueue.key, soundQueue); soundFinish('sound-intermediate');
+  check(soundPlays === 1, 'An intermediate queued turn triggered a completion chime');
+  soundQueue.paused = true; soundFinish('sound-final');
+  check(soundPlays === 2, 'A finished background chat did not play its chime');
+  $('completion-sound').checked = false; await $('completion-sound').onchange();
+  Object.assign(preferences, await api.preferences()); fillSettings(state.options); completionSound.lastAt = -Infinity; soundFinish('sound-disabled');
+  check(!preferences.completionSound && !$('completion-sound').checked && soundPlays === 2, 'Disabling completion sounds did not persist or still played a chime');
+  await $('preview-completion-sound').onclick(); check(soundPlays === 3, 'The sound Preview button did not play on request');
+  api.savePreferences = async () => { throw new Error('Sound preference save failed'); };
+  $('completion-sound').checked = true; await $('completion-sound').onchange();
+  check(!$('completion-sound').checked && !preferences.completionSound && !$('completion-sound').disabled, 'Failed sound preference save did not restore the previous setting');
+  api.savePreferences = soundPreferenceWriter; api.rpc = soundRpc; state.queues.clear(); $('error').hidden = true;
+  completionSound.audio.play = async () => {};
+  results.push('completion chimes default on, stay soft, suppress duplicates and bursts, skip unfinished queue chains and stale/failed turns, persist disabling, and offer an explicit preview');
   api.rpc = originalRpc; state.threads = [branchSource]; await openThread(branchSource); connectionLabels(); status(connectedStatus());
   projects.data = [{ id: branchSource.projectId, name: 'Rapidcode', roots: [{ path: branchSource.cwd }] }];
   await expandProject(projects.data[0], false);
@@ -2247,7 +2497,11 @@ module.exports = async () => {
       renderItem({ id: 'preview-user', type: 'userMessage', content: [{ type: 'text', text: 'Check the project and run the tests.' }] });
       renderItem({ id: 'preview-thought', type: 'reasoning', summary: ['Checking project configuration and tests.'] }, false, 'preview-turn');
       for (const [index, command] of ['git status --short', 'cat package.json', 'npm test'].entries()) renderItem({ id: 'preview-tool-' + index, type: 'commandExecution', command, status: 'completed', exitCode: 0, aggregatedOutput: 'Completed successfully.' }, false, 'preview-turn');
-      renderItem({ id: 'preview-reply', type: 'agentMessage', text: 'All checks passed.' });
+      renderItem({ id: 'preview-patch', type: 'fileChange', status: 'completed', changes: [
+        { path: '/tmp/src/example.ts', kind: { type: 'update' }, diff: ['@@ -1 +1,2 @@', '-const pattern = /驗證碼|認証コード/;', '+const pattern = /驗證碼|確認碼|認証コード/;', '+const attempts = 3;'].join('\\n') },
+        { path: '/tmp/test/example.test.ts', kind: { type: 'add' }, diff: 'test the new behavior\\n' }
+      ] }, false, 'preview-turn');
+      renderItem({ id: 'preview-reply', type: 'agentMessage', text: 'All checks passed.' }, false, 'preview-turn');
       state.options = { mode: 'local' }; state.connected = true;
       state.thread = { id: 'preview-chat', name: 'Check project tests', cwd: '/tmp' }; state.threads = [state.thread];
       schedules.tasks = [{ id: 'preview-scheduled', threadId: state.thread.id, machine: 'access:local', prompt: 'Check the tests again tomorrow', runAt: new Date(Date.now() + 86400000).toISOString(), status: 'pending' }];
@@ -2281,6 +2535,17 @@ module.exports = async () => {
     testWindow.webContents.sendInputEvent({ type: 'mouseUp', x: 500, y: 10, button: 'left', clickCount: 1 });
     await new Promise(resolve => setTimeout(resolve, 100));
     if (await testWindow.webContents.executeJavaScript("document.getElementById('usage-panel').matches(':popover-open')")) throw new Error('Clicking outside did not dismiss the usage panel');
+    await testWindow.webContents.executeJavaScript("document.querySelectorAll('.activity-log').forEach(log => log.open = false); document.querySelector('.changed-files').scrollIntoView({block:'nearest'})");
+    await new Promise(resolve => setTimeout(resolve, 100));
+    fs.writeFileSync(path.join(artifacts, 'changed-files.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file').click()");
+    await new Promise(resolve => setTimeout(resolve, 100));
+    await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file-entry[open]').scrollIntoView({block:'nearest'}); document.getElementById('timeline').scrollTop = document.getElementById('timeline').scrollHeight");
+    await new Promise(resolve => setTimeout(resolve, 100));
+    fs.writeFileSync(path.join(artifacts, 'changed-file-diff.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file').click(); document.getElementById('open-settings').click()");
+    await new Promise(resolve => setTimeout(resolve, 100));
+    fs.writeFileSync(path.join(artifacts, 'completion-sound-settings.png'), (await testWindow.webContents.capturePage()).toPNG());
     return results;
   } finally { testWindow.destroy(); }
 };

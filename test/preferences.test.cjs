@@ -107,3 +107,27 @@ test('conversation cutoffs persist and late migration preserves manual ordering'
   assert.throws(() => store.update({ threadOrder: { ...target, ids: ['b', 'a'], cutoff: 500 } }));
   assert.deepEqual(new PreferencesStore(file).read(), before);
 });
+
+test('prompt shortcuts persist, validate inputs, and allow removing all defaults', t => {
+  const file = fixture(t); const store = new PreferencesStore(file);
+  const shortcut = { id: 'review', label: 'Review', prompt: '$cr ur changes' };
+  store.update({ shortcuts: [shortcut] });
+  assert.deepEqual(new PreferencesStore(file).read().shortcuts, [shortcut]);
+  for (const shortcuts of [null, {}, [shortcut, shortcut], [{ ...shortcut, label: ' ' }], [{ ...shortcut, label: 'a'.repeat(33) }], [{ ...shortcut, prompt: '' }], [{ ...shortcut, prompt: 'x'.repeat(20001) }]]) assert.throws(() => store.update({ shortcuts }));
+  assert.deepEqual(store.read().shortcuts, [shortcut]);
+  store.update({ shortcuts: [{ ...shortcut, mode: 'fill' }] });
+  assert.equal(new PreferencesStore(file).read().shortcuts[0].mode, 'fill');
+  assert.throws(() => store.update({ shortcuts: [{ ...shortcut, mode: 'invalid' }] }));
+  assert.equal(store.read().shortcuts[0].mode, 'fill');
+  store.update({ shortcuts: [] }); assert.deepEqual(new PreferencesStore(file).read().shortcuts, []);
+});
+
+test('completion sound accepts only booleans and survives restarting', t => {
+  const file = fixture(t); const store = new PreferencesStore(file);
+  assert.notEqual(store.read().completionSound, false);
+  store.update({ completionSound: false });
+  assert.equal(new PreferencesStore(file).read().completionSound, false);
+  for (const completionSound of [null, 0, 1, 'false', {}, []]) assert.throws(() => store.update({ completionSound }));
+  assert.equal(store.read().completionSound, false);
+  store.update({ completionSound: true }); assert.equal(new PreferencesStore(file).read().completionSound, true);
+});

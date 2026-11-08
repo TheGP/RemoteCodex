@@ -8,6 +8,7 @@ const validConversationState = data => data && Array.isArray(data.unread) && dat
 const validOrders = orders => orders && typeof orders === 'object' && !Array.isArray(orders) && Object.entries(orders).every(([projectId, ids]) => validId(projectId) && Array.isArray(ids) && ids.every(validId));
 const validCutoff = value => Number.isSafeInteger(value) && value >= 0;
 const validCutoffs = values => values && typeof values === 'object' && !Array.isArray(values) && Object.entries(values).every(([projectId, cutoff]) => validId(projectId) && validCutoff(cutoff));
+const validShortcuts = values => Array.isArray(values) && values.length <= 50 && new Set(values.map(value => value?.id)).size === values.length && values.every(value => validId(value?.id) && typeof value.label === 'string' && value.label.trim() && value.label.length <= 32 && typeof value.prompt === 'string' && value.prompt.trim() && value.prompt.length <= 20000 && (value.mode === undefined || ['send', 'fill'].includes(value.mode)));
 
 class PreferencesStore {
   constructor(file) { this.file = file; }
@@ -23,12 +24,22 @@ class PreferencesStore {
     if (data.threadOrders !== undefined && (!data.threadOrders || typeof data.threadOrders !== 'object' || Array.isArray(data.threadOrders) || Object.entries(data.threadOrders).some(([machine, value]) => !machine.startsWith('access:') || !validOrders(value)))) throw new Error('Invalid saved conversation order.');
     if (data.threadOrderCutoffs !== undefined && (!data.threadOrderCutoffs || typeof data.threadOrderCutoffs !== 'object' || Array.isArray(data.threadOrderCutoffs) || Object.entries(data.threadOrderCutoffs).some(([machine, value]) => !machine.startsWith('access:') || !validCutoffs(value)))) throw new Error('Invalid saved conversation cutoff.');
     if (data.fileOpener !== undefined && !fileOpeners.has(data.fileOpener)) throw new Error('Invalid saved file opener.');
+    if (data.shortcuts !== undefined && !validShortcuts(data.shortcuts)) throw new Error('Invalid saved prompt shortcuts.');
+    if (data.completionSound !== undefined && typeof data.completionSound !== 'boolean') throw new Error('Invalid completion sound preference.');
     return data;
   }
 
   update(patch) {
-    if (!patch || typeof patch !== 'object' || Array.isArray(patch) || !Object.keys(patch).length || Object.keys(patch).some(key => !['theme', 'startupProject', 'conversationState', 'threadOrder', 'fileOpener'].includes(key))) throw new Error('Invalid preferences change.');
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch) || !Object.keys(patch).length || Object.keys(patch).some(key => !['theme', 'startupProject', 'conversationState', 'threadOrder', 'fileOpener', 'shortcuts', 'completionSound'].includes(key))) throw new Error('Invalid preferences change.');
     const next = this.read();
+    if ('completionSound' in patch) {
+      if (typeof patch.completionSound !== 'boolean') throw new Error('Invalid completion sound preference.');
+      next.completionSound = patch.completionSound;
+    }
+    if ('shortcuts' in patch) {
+      if (!validShortcuts(patch.shortcuts)) throw new Error('Invalid prompt shortcuts.');
+      next.shortcuts = patch.shortcuts.map(({ id, label, prompt, mode }) => ({ id, label: label.trim(), prompt, ...(mode === undefined ? {} : { mode }) }));
+    }
     if ('fileOpener' in patch) {
       if (!fileOpeners.has(patch.fileOpener)) throw new Error('Unknown file opener.');
       next.fileOpener = patch.fileOpener;

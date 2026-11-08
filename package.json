@@ -9,9 +9,11 @@
     "start": "electron .",
     "test": "node --test test/*.test.cjs",
     "test:live": "node test/live.cjs",
-    "package:mac": "electron-packager . \"Remote Codex\" --icon=assets/icon.icns --platform=darwin --arch=x64 --out=dist --overwrite --asar --ignore=\"^/(dist|artifacts)(/|$)\"",
-    "package:win": "electron-packager . \"Remote Codex\" --icon=assets/icon.ico --platform=win32 --arch=x64 --out=dist --overwrite --asar --ignore=\"^/(dist|artifacts)(/|$)\"",
-    "test:renderer": "electron test/renderer-runner.cjs"
+    "package:mac": "electron-packager . \"Remote Codex\" --icon=assets/icon.icns --platform=darwin --arch=x64 --out=dist --overwrite --asar --ignore=\"^/(dist|artifacts|test|scripts)(/|$)|^/assets/icon-concepts(/|$)|^/(README[.]md|AGENTS[.]md)$\"",
+    "package:win": "electron-packager . \"Remote Codex\" --icon=assets/icon.ico --platform=win32 --arch=x64 --out=dist --overwrite --asar --ignore=\"^/(dist|artifacts|test|scripts)(/|$)|^/assets/icon-concepts(/|$)|^/(README[.]md|AGENTS[.]md)$\"",
+    "test:renderer": "electron test/renderer-runner.cjs",
+    "install:mac": "node scripts/install-mac.cjs",
+    "cleanup:mac": "node scripts/install-mac.cjs --cleanup"
   },
   "dependencies": {
     "dompurify": "3.4.17",

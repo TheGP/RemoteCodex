@@ -6,9 +6,10 @@ const projects = { data: [], selected: null, expanded: new Set(), cursors: new M
 const preferences = { theme: 'system', startupProjects: {}, conversationStates: {}, threadOrders: {}, threadOrderCutoffs: {} };
 const imageLoads = new Map();
 const linkContexts = new WeakMap();
+const completionSound = { audio: null, lastAt: -Infinity };
 const schedules = { tasks: [], generation: 0 };
 const drafts = { target: null, snapshot: null, images: [], suspended: false, restoring: false };
-for (let hours = 1; hours <= 24; hours++) $('send-time').add(new Option(`${hours} hour${hours === 1 ? '' : 's'}`, String(hours)));
+for (let hours = 1; hours < 24; hours++) $('send-time').add(new Option(`${hours} hour${hours === 1 ? '' : 's'}`, String(hours)));
 for (let days = 1; days <= 7; days++) $('send-time').add(new Option(`${days} day${days === 1 ? '' : 's'}`, String(days * 24)));
 const threadDrag = { source: null, pending: new Set(), orderPending: new Set(), type: 'application/x-remote-codex-thread' };
 const projectDrag = { source: null, pending: null, type: 'application/x-remote-codex-project' };
@@ -133,6 +134,23 @@ $('file-opener').onchange = async () => {
   catch (error) { control.value = previous; showError(error); }
   finally { control.disabled = false; }
 };
+function playCompletionSound(preview = false) {
+  if (!preview && (preferences.completionSound === false || performance.now() - completionSound.lastAt < 3000)) return;
+  try {
+    completionSound.audio ||= new Audio('assets/completion.wav');
+    const audio = completionSound.audio; audio.volume = 0.35; audio.pause(); audio.currentTime = 0;
+    completionSound.lastAt = performance.now();
+    return audio.play().catch(error => api.log?.('completion-sound.failed', { error: error.message }));
+  } catch (error) { api.log?.('completion-sound.failed', { error: error.message }); }
+}
+$('completion-sound').onchange = async () => {
+  const control = $('completion-sound'); const previous = preferences.completionSound !== false;
+  control.disabled = true;
+  try { await savePreferences({ completionSound: control.checked }); if (!control.checked) completionSound.audio?.pause(); }
+  catch (error) { control.checked = previous; showError(error); }
+  finally { control.disabled = false; }
+};
+$('preview-completion-sound').onclick = () => playCompletionSound(true);
 
 function connectionLabels() {
   const local = isLocal();
@@ -177,6 +195,7 @@ function updateSettingsActions() {
 }
 
 function fillSettings(options) {
+  $('completion-sound').checked = preferences.completionSound !== false;
   $('file-opener').value = preferences.fileOpener || 'vscode';
   $('file-opener').querySelector('[value="reveal"]').textContent = navigator.platform.includes('Mac') ? 'Show in Finder' : 'Show in file manager';
   $('connection-mode').value = options.mode || 'ssh';
@@ -234,6 +253,7 @@ async function stopTurn() {
   finally { if (state.interrupting === operation) state.interrupting = null; updateSendButton(); }
 }
 function updateBusy() {
+  for (const button of $('shortcut-buttons').children) button.disabled = shortcutUnavailable({ mode: button.dataset.mode });
   const busy = state.owned.has(state.thread?.id) && Boolean(state.active.get(state.thread?.id));
   $('writer-notice').hidden = !state.writerConflicts.has(queueKey(state.thread?.id));
   $('activity').hidden = !$('writer-notice').hidden && !busy && !state.sending && !state.loading;
@@ -651,8 +671,21 @@ async function togglePin(thread) {
 async function loadThreads(more = false, projectId = null) {
   if (!state.connected) return;
   const generation = more ? state.listGeneration : ++state.listGeneration;
+  const searchTerm = $('search').value.trim() || null;
+  const query = JSON.stringify([accessKey(), searchTerm, projects.data.map(project => project.id).sort()]);
+  const sameQuery = state.threadQuery === query;
   const filters = more ? [projectId] : [null, ...projects.data.map(project => project.id)];
-  const pages = await Promise.all(filters.map(id => rpc('thread/list', { limit: id && !projects.expanded.has(id) ? 5 : 50, sortKey: 'updated_at', modelProviders: [], searchTerm: $('search').value.trim() || null, cursor: more ? (id ? projects.cursors.get(id) : state.threadCursor) : null, ...(projects.data.length ? { projectId: id } : {}) })));
+  const pages = await Promise.all(filters.map(async id => {
+    const limit = id && !projects.expanded.has(id) ? 5 : 50;
+    const loaded = state.threadCoverage?.get(id) || 0;
+    const target = !more && sameQuery && limit === 50 ? loaded : 0;
+    const data = []; let cursor = more ? (id ? projects.cursors.get(id) : state.threadCursor) : null;
+    do {
+      const page = await rpc('thread/list', { limit, sortKey: 'updated_at', modelProviders: [], searchTerm, cursor, ...(projects.data.length ? { projectId: id } : {}) });
+      data.push(...page.data); cursor = page.nextCursor;
+    } while (cursor && data.length < target && generation === state.listGeneration);
+    return { data, nextCursor: cursor };
+  }));
   if (generation !== state.listGeneration) return;
   const machine = accessKey();
   for (const [index, id] of filters.entries()) {
@@ -666,7 +699,19 @@ async function loadThreads(more = false, projectId = null) {
     preferences.threadOrderCutoffs[machine] = { ...saved.threadOrderCutoffs[machine], ...preferences.threadOrderCutoffs[machine] };
   }
   const combined = [...(more ? state.threads : []), ...pages.flatMap(page => page.data)];
+  if (!searchTerm) {
+    const listed = new Set(combined.map(thread => thread.id));
+    for (const [index, thread] of [...state.threads, ...(state.thread ? [state.thread] : [])].entries()) {
+      if (listed.has(thread.id) || thread.id !== state.thread?.id && (!sameQuery || !state.active.has(thread.id))) continue;
+      if (projects.data.length && thread.projectId && !filters.includes(thread.projectId)) continue;
+      combined.splice(Math.min(index, combined.length), 0, thread); listed.add(thread.id);
+      trace('threads.refresh-retained', { threadId: thread.id, reason: 'open-or-running-chat-missing-from-page' });
+    }
+  }
   state.threads = [...new Map(combined.map(thread => [thread.id, thread])).values()];
+  if (!more || !sameQuery) state.threadCoverage = new Map();
+  filters.forEach((id, index) => state.threadCoverage.set(id, (more ? state.threadCoverage.get(id) || 0 : 0) + pages[index].data.length));
+  state.threadQuery = query;
   if (!more) projects.cursors.clear();
   filters.forEach((id, index) => { if (id) projects.cursors.set(id, pages[index].nextCursor); else state.threadCursor = pages[index].nextCursor; });
   for (const thread of state.threads) if (state.pinnedIds.has(thread.id)) state.pinnedThreads.set(thread.id, thread);
@@ -828,6 +873,166 @@ function markdown(element, text) {
     if (token) placeholder.replaceWith(messageImage(token.href, token.text || 'Image')); else placeholder.remove();
   }
 }
+function diffWordRanges(before, after) {
+  if (before === after || before.length > 2400 || after.length > 2400) return [[], []];
+  const words = text => [...text.matchAll(/\s+|[\p{L}\p{N}_$]+|[^\s\p{L}\p{N}_$]/gu)];
+  const a = words(before), b = words(after);
+  if (a.length > 180 || b.length > 180) return [[], []];
+  const scores = Array.from({ length: a.length + 1 }, () => new Uint16Array(b.length + 1));
+  for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--)
+    scores[i][j] = a[i][0] === b[j][0] ? scores[i + 1][j + 1] + 1 : Math.max(scores[i + 1][j], scores[i][j + 1]);
+  const removed = [], added = [];
+  const addRange = (ranges, word) => {
+    const end = word.index + word[0].length;
+    if (ranges.at(-1)?.end === word.index) ranges.at(-1).end = end;
+    else ranges.push({ start: word.index, end });
+  };
+  let i = 0, j = 0, common = 0;
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i][0] === b[j][0]) { common += a[i][0].trim().length; i++; j++; }
+    else if (j < b.length && (i === a.length || scores[i][j + 1] >= scores[i + 1][j])) addRange(added, b[j++]);
+    else addRange(removed, a[i++]);
+  }
+  const total = before.replace(/\s/g, '').length + after.replace(/\s/g, '').length;
+  return total && 2 * common / total < 0.4 ? [[], []] : [removed, added];
+}
+function renderDiff(patch) {
+  let inHunk = false;
+  const rows = patch.split('\n').map(line => {
+    if (line.startsWith('diff --git ')) inHunk = false;
+    if (line.startsWith('@@')) inHunk = true;
+    const kind = line.startsWith('@@') ? 'diff-hunk' : line.startsWith('+') && (inHunk || !line.startsWith('+++')) ? 'diff-added' : line.startsWith('-') && (inHunk || !line.startsWith('---')) ? 'diff-removed' : '';
+    return { line, kind, ranges: [] };
+  });
+  for (let index = 0; patch.length <= 180000 && index < rows.length;) {
+    if (rows[index].kind !== 'diff-removed') { index++; continue; }
+    const start = index;
+    while (rows[index]?.kind === 'diff-removed') index++;
+    const added = index;
+    while (rows[index]?.kind === 'diff-added') index++;
+    for (let pair = 0; pair < Math.min(added - start, index - added); pair++) {
+      const before = rows[start + pair], after = rows[added + pair];
+      [before.ranges, after.ranges] = diffWordRanges(before.line.slice(1), after.line.slice(1));
+    }
+  }
+  const pre = document.createElement('pre');
+  for (const { line, kind, ranges } of rows) {
+    const span = document.createElement('span'); span.className = kind;
+    let offset = 0;
+    for (const range of ranges) {
+      span.append(document.createTextNode(line.slice(offset, range.start + 1)));
+      const changed = document.createElement('span'); changed.className = 'diff-word-change'; changed.textContent = line.slice(range.start + 1, range.end + 1);
+      span.append(changed); offset = range.end + 1;
+    }
+    span.append(document.createTextNode(line.slice(offset) + '\n')); pre.append(span);
+  }
+  return pre;
+}
+function moveDiffElement(parent, element, before) {
+  // Native moves keep focus but collapse text selections.
+  const selection = getSelection();
+  const { anchorNode, anchorOffset, focusNode, focusOffset } = selection;
+  const selected = element.contains(anchorNode) || element.contains(focusNode);
+  parent.moveBefore(element, before);
+  if (selected && anchorNode?.isConnected && focusNode?.isConnected) selection.setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset);
+}
+function updateFileDiff(entry, context) {
+  const file = entry.file;
+  let body = entry.querySelector('.changed-file-content');
+  if (!body) {
+    body = document.createElement('div'); body.className = 'changed-file-content';
+    const diff = document.createElement('div'); diff.className = 'changed-file-diff'; diff.tabIndex = 0;
+    const open = document.createElement('button'); open.type = 'button'; open.className = 'subtle open-changed-file'; open.textContent = 'Open in editor';
+    open.onclick = async () => {
+      const href = entry.file.path.replace(/\\/g, '/').split('/').map(encodeURIComponent).join('/');
+      try { await api.openLink(href, context); } catch (error) { showError(error); }
+    };
+    body.append(diff, open); entry.append(body);
+  }
+  const diff = body.firstElementChild;
+  const top = diff.scrollTop, left = diff.scrollLeft;
+  const patches = file.diffs.length ? file.diffs : ['No textual diff reported.'];
+  for (const [index, patch] of patches.entries()) {
+    if (entry.renderedDiffs?.[index] === patch) continue;
+    const pre = renderDiff(patch);
+    if (diff.children[index]) diff.children[index].replaceWith(pre); else diff.append(pre);
+  }
+  while (diff.children.length > patches.length) diff.lastElementChild.remove();
+  entry.renderedDiffs = patches;
+  diff.setAttribute('aria-label', `Changes in ${file.path}`);
+  body.lastElementChild.disabled = file.kind === 'delete';
+  diff.scrollTop = top; diff.scrollLeft = left;
+}
+function renderFileSummary(turnId) {
+  if (!turnId) return;
+  let card = [...$('messages').querySelectorAll('.changed-files')].find(element => element.dataset.turnId === turnId);
+  const files = new Map();
+  const records = [...state.items.values()].filter(record => record.turnId === turnId && record.item.type === 'fileChange' && record.item.status === 'completed')
+    .sort((a, b) => a.element.compareDocumentPosition(b.element) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+  for (const record of records) {
+    for (const [index, change] of (record.item.changes || []).entries()) {
+      if (typeof change.path !== 'string') continue;
+      const path = change.kind?.move_path || change.path;
+      const file = files.get(change.path) || files.get(path) || { id: JSON.stringify([record.item.id, index]), added: 0, removed: 0, diffs: [], kind: change.kind?.type };
+      if (change.kind?.move_path) files.delete(change.path);
+      file.path = path;
+      if (change.kind?.type === 'delete' || change.kind?.type === 'add') file.kind = change.kind.type;
+      else if (change.kind?.move_path) file.kind = 'rename';
+      let diff = typeof change.diff === 'string' ? change.diff.replace(/\r\n/g, '\n') : '';
+      if (diff && ['add', 'delete'].includes(change.kind?.type)) {
+        const lines = diff.replace(/\n$/, '').split('\n'); const added = change.kind.type === 'add';
+        diff = `@@ ${added ? '-0,0 +1,' : '-1,'}${lines.length}${added ? '' : ' +0,0'} @@\n` + lines.map(line => (added ? '+' : '-') + line).join('\n');
+      }
+      let hunk = false;
+      for (const line of diff.split('\n')) {
+        if (line.startsWith('@@')) hunk = true;
+        if (line.startsWith('diff --git ')) hunk = false;
+        if (line.startsWith('+') && (hunk || !line.startsWith('+++'))) file.added++;
+        if (line.startsWith('-') && (hunk || !line.startsWith('---'))) file.removed++;
+      }
+      if (diff) file.diffs.push(diff);
+      files.set(path, file);
+    }
+  }
+  if (!files.size) { card?.remove(); return; }
+  if (!card) {
+    card = document.createElement('details'); card.className = 'changed-files'; card.dataset.turnId = turnId; card.open = true;
+    card.append(document.createElement('summary'), document.createElement('div')); $('messages').append(card);
+  }
+  const counts = (added, removed) => {
+    const span = document.createElement('span'); span.className = 'change-counts'; span.title = 'Lines added and removed by recorded edits';
+    const plus = document.createElement('span'); plus.className = 'diff-added'; plus.textContent = `+${added}`;
+    const minus = document.createElement('span'); minus.className = 'diff-removed'; minus.textContent = `−${removed}`;
+    span.append(plus, minus); return span;
+  };
+  card.firstElementChild.replaceChildren(document.createTextNode(`${files.size} file${files.size === 1 ? '' : 's'} changed`), counts([...files.values()].reduce((sum, file) => sum + file.added, 0), [...files.values()].reduce((sum, file) => sum + file.removed, 0)));
+  const rows = card.lastElementChild;
+  const entries = new Map([...rows.children].map(entry => [entry.dataset.fileId, entry]));
+  let next = rows.firstElementChild;
+  const context = { machine: accessKey(), cwd: state.thread?.cwd || $('workspace').value };
+  for (const file of files.values()) {
+    let entry = entries.get(file.id);
+    entries.delete(file.id);
+    if (!entry) {
+      entry = document.createElement('details'); entry.className = 'changed-file-entry'; entry.dataset.fileId = file.id;
+      const summary = document.createElement('summary'); summary.className = 'changed-file'; entry.append(summary);
+      entry.ontoggle = () => { if (entry.open) updateFileDiff(entry, context); };
+    }
+    entry.file = file; entry.dataset.path = file.path;
+    const fileSummary = entry.firstElementChild; fileSummary.title = file.path;
+    const name = document.createElement('span'); name.className = 'changed-file-name';
+    const prefix = (context.cwd || '').replace(/\\/g, '/').replace(/\/$/, '') + '/';
+    const path = file.path.replace(/\\/g, '/'); name.textContent = path.startsWith(prefix) ? path.slice(prefix.length) : path;
+    const kind = document.createElement('small'); kind.textContent = file.kind === 'add' ? 'Added' : file.kind === 'delete' ? 'Deleted' : file.kind === 'rename' ? 'Renamed' : 'Modified';
+    fileSummary.replaceChildren(name, kind, counts(file.added, file.removed));
+    if (entry !== next) {
+      if (entry.parentNode === rows) moveDiffElement(rows, entry, next); else rows.insertBefore(entry, next);
+    }
+    next = entry.nextElementSibling;
+    if (entry.open) updateFileDiff(entry, context);
+  }
+  for (const entry of entries.values()) entry.remove();
+}
 function renderItem(item, prepend = false, turnId = null) {
   if (!item?.id) return;
   let record = state.items.get(item.id);
@@ -846,7 +1051,8 @@ function renderItem(item, prepend = false, turnId = null) {
     if (isMessage) {
       if (prepend) $('messages').prepend(element); else $('messages').append(element);
     } else {
-      const neighbor = $('messages')[prepend ? 'firstElementChild' : 'lastElementChild'];
+      let neighbor = $('messages')[prepend ? 'firstElementChild' : 'lastElementChild'];
+      if (neighbor?.classList.contains('changed-files')) neighbor = neighbor[prepend ? 'nextElementSibling' : 'previousElementSibling'];
       let group = neighbor?.classList.contains('activity-log') && neighbor.dataset.turnId === (turnId || '') ? neighbor : null;
       if (!group) {
         group = document.createElement('details'); group.className = 'activity-log'; group.dataset.turnId = turnId || '';
@@ -860,7 +1066,7 @@ function renderItem(item, prepend = false, turnId = null) {
     }
   }
   record.item = { ...record.item, ...item };
-  if (turnId) record.turnId = turnId;
+  if (turnId) { record.turnId = turnId; record.element.dataset.turnId = turnId; }
   item = record.item;
   if (item.type === 'userMessage') {
     record.label.textContent = 'You';
@@ -911,6 +1117,10 @@ function renderItem(item, prepend = false, turnId = null) {
     }
   }
   if (record.group) record.group.firstElementChild.textContent = record.group.lastElementChild.lastElementChild.firstElementChild.textContent;
+  if (item.type === 'fileChange') renderFileSummary(record.turnId);
+  const card = [...$('messages').querySelectorAll('.changed-files')].find(element => element.dataset.turnId === record.turnId);
+  const last = [...$('messages').children].findLast(element => element !== card && element.dataset.turnId === record.turnId);
+  if (card && last && last.nextElementSibling !== card) moveDiffElement($('messages'), card, last.nextElementSibling);
   return record;
 }
 
@@ -1361,22 +1571,99 @@ async function flushQueue(threadId) {
   await sendQueued(queue, message);
   if (!queue.paused && queue.messages.length && !state.active.has(threadId)) await flushQueue(threadId);
 }
+function shortcutUnavailable(shortcut) {
+  if (shortcut?.mode === 'fill') return state.connecting || state.sending || state.loading || state.commandBusy || drafts.suspended;
+  return !state.connected || state.connecting || state.sending || state.loading || state.commandBusy || state.images.some(image => !image.url) || queueLocked(state.queues.get(queueKey(state.thread?.id)));
+}
+function promptSkillNames(text) { return [...new Set(text.split(/\s+/).filter(token => /^\$[a-zA-Z_][\w:.-]*$/.test(token)).map(token => token.slice(1)))]; }
+async function resolvePromptSkills(text, required = false) {
+  const names = promptSkillNames(text);
+  if (!names.length) return [];
+  const cwd = state.thread?.cwd || $('workspace').value.trim();
+  const result = await rpc('skills/list', { cwds: [cwd], forceReload: false });
+  const skills = (result.data || []).flatMap(entry => entry.skills || []).filter(skill => skill.enabled !== false && typeof skill.path === 'string');
+  if (required) for (const name of names) if (!skills.some(skill => skill.name === name)) throw new Error(`Skill $${name} is unavailable in this conversation.`);
+  return skills;
+}
+async function runShortcut(shortcut) {
+  if (shortcutUnavailable(shortcut)) return;
+  if (shortcut.mode === 'fill') {
+    const prompt = $('prompt');
+    prompt.value += (prompt.value && !/\s$/.test(prompt.value) ? '\n' : '') + shortcut.prompt;
+    prompt.dispatchEvent(new Event('input', { bubbles: true }));
+    prompt.focus(); prompt.setSelectionRange(prompt.value.length, prompt.value.length);
+    return;
+  }
+  const options = state.options; const selection = state.selection;
+  let skills = [];
+  state.sending = true; updateBusy();
+  try { skills = await resolvePromptSkills(shortcut.prompt, true); }
+  catch (error) { showError(error); return; }
+  finally { state.sending = false; updateBusy(); }
+  if (options === state.options && selection === state.selection && state.connected) await send(null, false, { shortcut: shortcut.prompt, skills });
+}
+const defaultShortcuts = [{ id: 'review', label: 'Review', prompt: '$cr ur changes' }];
+function promptShortcuts() { return preferences.shortcuts ?? defaultShortcuts; }
+function editShortcut(shortcut = null) {
+  state.shortcutEdit = shortcut;
+  $('shortcut-label').value = shortcut?.label || ''; $('shortcut-prompt').value = shortcut?.prompt || '';
+  $('shortcut-mode').value = shortcut?.mode || 'send';
+  $('delete-shortcut').hidden = !shortcut; $('shortcut-error').hidden = true;
+  $('shortcut-dialog').showModal(); $('shortcut-label').focus();
+}
+function renderShortcuts() {
+  $('shortcut-buttons').replaceChildren();
+  for (const shortcut of promptShortcuts()) {
+    const button = document.createElement('button'); button.type = 'button'; button.textContent = shortcut.label;
+    button.dataset.mode = shortcut.mode || 'send'; button.disabled = shortcutUnavailable(shortcut);
+    button.title = `${shortcut.prompt}\n${shortcut.mode === 'fill' ? 'Fill prompt only' : 'Send or queue immediately'} · Right-click to edit`;
+    button.onclick = () => runShortcut(shortcut);
+    button.oncontextmenu = event => { event.preventDefault(); editShortcut(shortcut); };
+    $('shortcut-buttons').append(button);
+  }
+}
+async function persistShortcuts(shortcuts) {
+  if (state.savingShortcut) return;
+  state.savingShortcut = true;
+  for (const button of $('shortcut-form').querySelectorAll('button')) button.disabled = true;
+  try { await savePreferences({ shortcuts }); renderShortcuts(); updateBusy(); $('shortcut-dialog').close(); }
+  catch (error) { $('shortcut-error').textContent = error.message; $('shortcut-error').hidden = false; }
+  finally { state.savingShortcut = false; for (const button of $('shortcut-form').querySelectorAll('button')) button.disabled = false; }
+}
+$('add-shortcut').onclick = () => editShortcut();
+$('cancel-shortcut').onclick = () => $('shortcut-dialog').close();
+$('shortcut-dialog').oncancel = event => { if (state.savingShortcut) event.preventDefault(); };
+$('shortcut-form').onsubmit = event => {
+  event.preventDefault();
+  const shortcut = { id: state.shortcutEdit?.id || crypto.randomUUID(), label: $('shortcut-label').value.trim(), prompt: $('shortcut-prompt').value, mode: $('shortcut-mode').value };
+  if (!shortcut.label || !shortcut.prompt.trim()) return;
+  return persistShortcuts(state.shortcutEdit ? promptShortcuts().map(item => item.id === shortcut.id ? shortcut : item) : [...promptShortcuts(), shortcut]);
+};
+$('delete-shortcut').onclick = () => persistShortcuts(promptShortcuts().filter(item => item.id !== state.shortcutEdit?.id));
+renderShortcuts();
 async function send(event, steer = false, action = null) {
   event?.preventDefault();
   if (state.connecting || queueLocked(state.queues.get(queueKey(state.thread?.id)))) return;
-  const rawText = $('prompt').value; const text = rawText.trim();
+  const shortcut = typeof action?.shortcut === 'string';
+  const rawText = shortcut ? action.shortcut : $('prompt').value; const text = rawText.trim();
   if (!action && !steer && /^\/[a-z-]*(?:\s|$)/i.test(text)) { await executeSlash(text); return; }
   if (state.commandBusy && !action) return;
-  if ((!text && !state.images.length) || state.images.some(image => !image.url) || !state.connected || state.sending || state.loading) return;
-  const images = [...state.images];
+  const images = shortcut ? [] : [...state.images];
+  if ((!text && !images.length) || images.some(image => !image.url) || !state.connected || state.sending || state.loading) return;
   saveComposerDraft(); const originalDraft = drafts.target;
   const delayHours = !steer && !action ? Number($('send-time').value) : 0;
-  const input = [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...images.map(image => ({ type: 'image', url: image.url })), ...skillInputs(text)];
+  const input = [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...images.map(image => ({ type: 'image', url: image.url })), ...skillInputs(text, action?.skills)];
   const access = policy();
   const message = { draftId: crypto.randomUUID(), text, images, input, access, review: Boolean(action?.review), mode: modes.plan ? 'plan' : 'default', model: $('model').value, effort: $('effort').value, machine: accessKey(), thread: state.thread };
+  const options = state.options; const selection = state.selection;
   trace('send.requested', { machine: message.machine, threadId: state.thread?.id, delayHours, working: state.active.has(state.thread?.id), status: state.thread?.status?.type, queueLength: state.queues.get(queueKey(state.thread?.id))?.messages.length || 0, paused: Boolean(state.queues.get(queueKey(state.thread?.id))?.paused) });
   state.sending = true; updateBusy();
   try {
+    if (!action?.skills && promptSkillNames(text).length) {
+      const skills = await resolvePromptSkills(text);
+      if (options !== state.options || selection !== state.selection || !state.connected) return;
+      message.input = [...input.filter(part => part.type !== 'skill'), ...skillInputs(text, skills)];
+    }
     if (!state.thread) {
       const result = await rpc('thread/start', { cwd: $('workspace').value.trim(), historyMode: 'paginated', ...access, ...(projects.selected ? { projectId: projects.selected } : {}), ...(message.model ? { model: message.model } : {}) });
       if (originalDraft && api.moveDraft) api.moveDraft(originalDraft, { machine: message.machine, kind: 'composer', threadId: result.thread.id, cwd: result.thread.cwd, projectId: result.thread.projectId || projects.selected || null });
@@ -1407,19 +1694,19 @@ async function send(event, steer = false, action = null) {
       queue.messages.push(message); state.queues.set(key, queue);
       try { await persistQueue(queue); } catch (error) { queue.messages = queue.messages.filter(entry => entry !== message); throw error; }
       trace('send.queued', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, paused: queue.paused });
-      $('prompt').value = ''; hideSlash(); state.images = []; renderImages();
+      if (!shortcut) { $('prompt').value = ''; hideSlash(); state.images = []; renderImages(); }
       return;
     }
-    $('prompt').value = ''; hideSlash(); state.images = []; renderImages();
+    if (!shortcut) { $('prompt').value = ''; hideSlash(); state.images = []; renderImages(); }
     await submitMessage(message, steer);
   } catch (error) {
     trace('send.failed', { machine: message.machine, threadId: message.thread?.id, error: error.message });
     if (delayHours) $('send-time').value = String(delayHours);
-    if (!$('prompt').value) $('prompt').value = rawText;
-    state.images = images; renderImages(); showError(error);
+    if (!shortcut && options === state.options && selection === state.selection) { if (!$('prompt').value) $('prompt').value = rawText; state.images = images; renderImages(); }
+    showError(error);
   } finally {
     state.sending = false; updateBusy();
-    if (originalDraft && drafts.target && JSON.stringify(originalDraft) !== JSON.stringify(drafts.target) && saveComposerDraft()) clearDraft(originalDraft);
+    if (options === state.options && selection === state.selection && originalDraft && drafts.target && JSON.stringify(originalDraft) !== JSON.stringify(drafts.target) && saveComposerDraft()) clearDraft(originalDraft);
     for (const queue of state.queues.values()) if (queue.machine === accessKey()) flushQueue(queue.thread.id).catch(showError);
   }
 }
@@ -1619,6 +1906,8 @@ async function connect(options) {
   state.pinnedThreads.clear();
   state.pinning.clear();
   state.threadCursor = null;
+  state.threadQuery = null;
+  state.threadCoverage = new Map();
   state.listGeneration++;
   state.folderGeneration++;
   $('folder-dialog').close();
@@ -1725,6 +2014,7 @@ function handleNotification(message) {
         else setCompletion(params.threadId, params.turn.status);
       }
       const queue = state.queues.get(queueKey(params.threadId));
+      if (state.connected && params.turn.status === 'completed' && (!queue?.messages.length || queue.paused)) playCompletionSound();
       if (queue && ['failed', 'interrupted'].includes(params.turn.status)) pauseQueue(queue, 'turn-' + params.turn.status).catch(showError);
     }
     state.finished.add(params.turn.id);
@@ -2294,7 +2584,7 @@ document.addEventListener('keydown', event => { if (event.key === 'Escape') { $(
 async function init() {
   if (!api) { showError('Open Remote Codex as a desktop app to connect to Codex.'); return; }
   api.onNotification(handleNotification);
-  Object.assign(preferences, await api.preferences()); applyTheme(preferences.theme);
+  Object.assign(preferences, await api.preferences()); applyTheme(preferences.theme); renderShortcuts();
   await restoreQueues();
   await refreshSchedules();
   const options = await api.settings();
