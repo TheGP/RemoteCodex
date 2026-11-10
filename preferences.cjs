@@ -7,6 +7,10 @@ const validId = id => typeof id === 'string' && id.length > 0 && id.length <= 20
 const validConversationState = data => data && Array.isArray(data.unread) && data.unread.every(validId) && data.completions && typeof data.completions === 'object' && !Array.isArray(data.completions) && Object.entries(data.completions).every(([id, status]) => validId(id) && ['completed', 'failed'].includes(status));
 const validOrders = orders => orders && typeof orders === 'object' && !Array.isArray(orders) && Object.entries(orders).every(([projectId, ids]) => validId(projectId) && Array.isArray(ids) && ids.every(validId));
 const validCutoff = value => Number.isSafeInteger(value) && value >= 0;
+const validVolume = value => Number.isInteger(value) && value >= 0 && value <= 100;
+const validPinId = id => validId(id) && !['__proto__', 'constructor', 'prototype'].includes(id);
+const validMessagePin = pin => pin && validPinId(pin.itemId) && validId(pin.turnId) && typeof pin.preview === 'string' && pin.preview.length > 0 && pin.preview.length <= 200;
+const validMessagePins = value => value && typeof value === 'object' && !Array.isArray(value) && Object.entries(value).every(([threadId, pins]) => validPinId(threadId) && Array.isArray(pins) && pins.length <= 50 && pins.every(validMessagePin) && new Set(pins.map(pin => pin.itemId)).size === pins.length);
 const validCutoffs = values => values && typeof values === 'object' && !Array.isArray(values) && Object.entries(values).every(([projectId, cutoff]) => validId(projectId) && validCutoff(cutoff));
 const validShortcuts = values => Array.isArray(values) && values.length <= 50 && new Set(values.map(value => value?.id)).size === values.length && values.every(value => validId(value?.id) && typeof value.label === 'string' && value.label.trim() && value.label.length <= 32 && typeof value.prompt === 'string' && value.prompt.trim() && value.prompt.length <= 20000 && (value.mode === undefined || ['send', 'fill'].includes(value.mode)));
 
@@ -26,15 +30,32 @@ class PreferencesStore {
     if (data.fileOpener !== undefined && !fileOpeners.has(data.fileOpener)) throw new Error('Invalid saved file opener.');
     if (data.shortcuts !== undefined && !validShortcuts(data.shortcuts)) throw new Error('Invalid saved prompt shortcuts.');
     if (data.completionSound !== undefined && typeof data.completionSound !== 'boolean') throw new Error('Invalid completion sound preference.');
+    if (data.completionVolume !== undefined && !validVolume(data.completionVolume)) throw new Error('Invalid completion volume.');
+    if (data.messagePins !== undefined && (!data.messagePins || typeof data.messagePins !== 'object' || Array.isArray(data.messagePins) || Object.entries(data.messagePins).some(([machine, value]) => !machine.startsWith('access:') || !validMessagePins(value)))) throw new Error('Invalid saved message pins.');
     return data;
   }
 
   update(patch) {
-    if (!patch || typeof patch !== 'object' || Array.isArray(patch) || !Object.keys(patch).length || Object.keys(patch).some(key => !['theme', 'startupProject', 'conversationState', 'threadOrder', 'fileOpener', 'shortcuts', 'completionSound'].includes(key))) throw new Error('Invalid preferences change.');
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch) || !Object.keys(patch).length || Object.keys(patch).some(key => !['theme', 'startupProject', 'conversationState', 'threadOrder', 'fileOpener', 'shortcuts', 'completionSound', 'completionVolume', 'messagePin'].includes(key))) throw new Error('Invalid preferences change.');
     const next = this.read();
+    if ('messagePin' in patch) {
+      const value = patch.messagePin;
+      if (typeof value?.machine !== 'string' || !value.machine.startsWith('access:') || value.machine.length > 300 || !validPinId(value.threadId) || !validPinId(value.itemId) || typeof value.pinned !== 'boolean' || value.pinned && !validMessagePin(value)) throw new Error('Invalid message pin.');
+      next.messagePins ||= {};
+      const threads = next.messagePins[value.machine] || {};
+      const pins = (threads[value.threadId] || []).filter(pin => pin.itemId !== value.itemId);
+      if (value.pinned) pins.push({ itemId: value.itemId, turnId: value.turnId, preview: value.preview });
+      if (pins.length > 50) throw new Error('Pin up to 50 messages per conversation.');
+      next.messagePins[value.machine] = { ...threads, [value.threadId]: pins };
+      if (!pins.length) delete next.messagePins[value.machine][value.threadId];
+    }
     if ('completionSound' in patch) {
       if (typeof patch.completionSound !== 'boolean') throw new Error('Invalid completion sound preference.');
       next.completionSound = patch.completionSound;
+    }
+    if ('completionVolume' in patch) {
+      if (!validVolume(patch.completionVolume)) throw new Error('Invalid completion volume.');
+      next.completionVolume = patch.completionVolume;
     }
     if ('shortcuts' in patch) {
       if (!validShortcuts(patch.shortcuts)) throw new Error('Invalid prompt shortcuts.');

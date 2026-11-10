@@ -9,6 +9,10 @@ async function checks() {
   api.editLock = async (_threadId, token) => token ? undefined : 'test-edit-lock';
   const diagnostics = [];
   api.log = (event, details) => diagnostics.push({ event, details: structuredClone(details) });
+  const connectedBeforeNetwork = state.connected;
+  globalThis.dispatchEvent(new Event('offline')); globalThis.dispatchEvent(new Event('online'));
+  check(diagnostics.some(entry => entry.event === 'network.offline') && diagnostics.some(entry => entry.event === 'network.online') && state.connected === connectedBeforeNetwork, 'Network diagnostics are missing or changed the connection');
+  results.push('online/offline events are logged without changing the connection');
   let savedPreferences = { theme: 'system', startupProjects: {}, conversationStates: {}, threadOrders: {}, threadOrderCutoffs: {} };
   api.saveConversationState = value => { savedPreferences.conversationStates[value.machine] = { unread: [...value.unread], completions: { ...value.completions } }; };
   api.preferences = async () => structuredClone(savedPreferences);
@@ -16,6 +20,14 @@ async function checks() {
     if (patch.theme) savedPreferences.theme = patch.theme;
     if (patch.fileOpener) savedPreferences.fileOpener = patch.fileOpener;
     if ('completionSound' in patch) savedPreferences.completionSound = patch.completionSound;
+    if ('completionVolume' in patch) savedPreferences.completionVolume = patch.completionVolume;
+    if (patch.messagePin) {
+      const { machine, threadId, itemId, turnId, preview, pinned } = patch.messagePin;
+      savedPreferences.messagePins ||= {}; savedPreferences.messagePins[machine] ||= {};
+      const pins = (savedPreferences.messagePins[machine][threadId] || []).filter(pin => pin.itemId !== itemId);
+      if (pinned) pins.push({ itemId, turnId, preview });
+      savedPreferences.messagePins[machine][threadId] = pins;
+    }
     if (patch.shortcuts) savedPreferences.shortcuts = structuredClone(patch.shortcuts);
     if (patch.startupProject) {
       const { machine, projectId } = patch.startupProject;
@@ -457,7 +469,7 @@ async function checks() {
   results.push('failed queued sends pause with their drafts intact and early completion cannot resurrect a turn');
 
   state.threads = [{ id: 'title-test', cwd: '/private/project', preview: 'PRIVATE PROMPT CONTENT', updatedAt: 1 }];
-  state.pinnedIds.clear(); state.names.clear(); state.titling.clear(); state.titleFailed = false;
+  state.pinnedIds.clear(); state.names.clear(); state.titling.clear(); state.titleRetries.clear();
   renderThreads();
   check($('threads').querySelector('.thread strong').textContent === 'PRIVATE PROMPT CONTENT' && !$('threads').querySelector('small,time'), 'Untitled chat did not use its prompt as a single title line');
   check(titleOf({ id: 'preview-whitespace', preview: ' \n First line\nsecond line ' }) === 'First line second line' && titleOf({ id: 'preview-length', preview: 'x'.repeat(200) }).length === 80, 'Prompt title was not normalized and bounded');
@@ -1175,7 +1187,7 @@ async function checks() {
   state.commandBusy = false; state.options = { mode: 'local' };
   results.push('older prompts retain edit boundaries; steered messages stay grouped; failed reverts preserve drafts and stale clones cannot cross connections');
 
-  resetThread(); state.active.clear(); state.queues.clear(); state.names.clear(); state.titling.clear(); state.titleFailed = false;
+  resetThread(); state.active.clear(); state.queues.clear(); state.names.clear(); state.titling.clear(); state.titleRetries.clear();
   const initialPromptText = 'Fix the project setup\nThen check the build and explain the changes. '.repeat(3).trim();
   const previewTitle = initialPromptText.replace(/\s+/g, ' ').slice(0, 80);
   let finishTitle; let finishFirstTurn;
@@ -1200,7 +1212,7 @@ async function checks() {
   delete api.title;
   results.push('new chat shows its prompt immediately and waits for first-turn acceptance before reading its rollout for a generated title');
 
-  resetThread(); state.threads = []; state.names.clear(); state.titling.clear(); state.newThreads.clear(); state.titleFailed = false;
+  resetThread(); state.threads = []; state.names.clear(); state.titling.clear(); state.newThreads.clear(); state.titleRetries.clear();
   let startupTitleCalls = 0;
   api.title = async () => { startupTitleCalls++; return null; };
   api.rpc = async method => {
@@ -1212,16 +1224,131 @@ async function checks() {
   check(!startupTitleCalls && state.newThreads.has('failed-first-turn-title') && $('prompt').value === 'Keep my prompt while startup fails', 'Failed first turn triggered a title read or lost its draft');
   api.rpc = async () => ({ turn: { id: 'retried-first-turn', status: 'completed' } });
   await send(); await state.titleTask;
-  check(startupTitleCalls === 1 && !state.titling.has('failed-first-turn-title') && !state.titleFailed, 'An unready rollout permanently disabled title generation');
+  check(startupTitleCalls === 1 && !state.titling.has('failed-first-turn-title') && !state.titleRetries.has('failed-first-turn-title'), 'An unready rollout permanently disabled title generation');
   const deferredTitleThread = state.thread;
   check(titleOf(deferredTitleThread) === 'Keep my prompt while startup fails', 'Unready title discarded the prompt preview');
   let laterTitleCalls = 0;
   api.title = async id => { laterTitleCalls++; return id === deferredTitleThread.id ? 'Recovered startup title' : 'Another conversation title'; };
   requestTitle({ id: 'another-title-after-startup', preview: 'A different prompt' }); await state.titleTask;
   requestTitle(deferredTitleThread); await state.titleTask;
-  check(laterTitleCalls === 2 && titleOf(deferredTitleThread) === 'Recovered startup title' && !state.titleFailed, 'An empty rollout blocked other titles or could not be retried');
+  check(laterTitleCalls === 2 && titleOf(deferredTitleThread) === 'Recovered startup title' && !state.titleRetries.has(deferredTitleThread.id), 'An empty rollout blocked other titles or could not be retried');
   $('error').hidden = true; delete api.title;
   results.push('failed first turns keep prompt drafts; unready rollout titles remain retryable without disabling titles in other chats');
+
+  {
+    resetThread(); state.threads = []; state.names.clear(); state.titling.clear(); state.connected = true;
+    const originalNow = Date.now, originalTimeout = globalThis.setTimeout, originalClearTimeout = globalThis.clearTimeout;
+    const retryTimers = new Map(); let retryClock = Date.now(), retryTimerId = -1;
+    Date.now = () => retryClock;
+    globalThis.setTimeout = (callback, delay, ...args) => {
+      if (delay !== 60000) return originalTimeout(callback, delay, ...args);
+      const id = retryTimerId--; retryTimers.set(id, callback); return id;
+    };
+    globalThis.clearTimeout = id => { if (!retryTimers.delete(id)) originalClearTimeout(id); };
+    const advanceRetry = async () => {
+      retryClock += 60000;
+      const timers = [...retryTimers];
+      for (const [id, callback] of timers) { retryTimers.delete(id); callback(); }
+      await state.titleTask; await settle();
+    };
+    try {
+      const titleCalls = []; const diagnosticStart = diagnostics.length;
+      const broken = { id: 'title-network-failure', preview: 'PRIVATE_TITLE_PROMPT' };
+      api.title = async id => {
+        titleCalls.push(id);
+        if (id === broken.id && titleCalls.filter(value => value === id).length === 1) throw new Error('Title service temporarily unavailable (HTTP 503).');
+        return id === broken.id ? 'Recovered title' : 'Healthy conversation title';
+      };
+      requestTitle(broken); requestTitle({ id: 'title-after-network-failure', preview: 'Another request' }); await state.titleTask;
+      check(titleCalls.length === 2 && state.names.get('title-after-network-failure') === 'Healthy conversation title' && !state.titling.has(broken.id) && retryTimers.size === 1, 'One title failure blocked the queued conversation or left its pending flag stuck');
+      check(titleOf(broken) === broken.preview, 'A failed title lost its original prompt preview');
+      requestTitle(broken); await state.titleTask;
+      check(titleCalls.length === 2, 'A sidebar refresh bypassed the failed title cooldown');
+      await advanceRetry();
+      check(state.names.get(broken.id) === 'Recovered title' && titleCalls.length === 3 && !state.titleRetries.has(broken.id) && !retryTimers.size, 'The failed title did not recover automatically without reconnecting');
+      check($('error').hidden && !state.titleError, 'A recovered title left its old failure banner visible');
+      const titleLogs = diagnostics.slice(diagnosticStart);
+      check(titleLogs.some(entry => entry.event === 'title.failed' && entry.details.threadId === broken.id) && titleLogs.some(entry => entry.event === 'title.completed' && entry.details.threadId === broken.id) && !JSON.stringify(titleLogs).includes(broken.preview), 'Title recovery diagnostics are missing or retain prompt text');
+
+      let permanentCalls = 0;
+      const permanent = { id: 'title-persistent-failure', preview: 'Keep this preview' };
+      api.title = async () => { permanentCalls++; throw new Error('Title service unavailable'); };
+      requestTitle(permanent); await state.titleTask; await advanceRetry(); await advanceRetry();
+      check(permanentCalls === 3 && !retryTimers.size && !state.titling.has(permanent.id), 'Persistent title errors caused an unlimited automatic retry loop');
+      retryClock += 60000; api.title = async () => 'Recovered after refresh';
+      requestTitle(permanent); await state.titleTask;
+      check(state.names.get(permanent.id) === 'Recovered after refresh', 'A later refresh could not retry a title after automatic retries were exhausted');
+
+      const renamed = { id: 'title-renamed-during-retry', preview: 'Rename before retry' };
+      let renamedCalls = 0;
+      api.title = async () => { renamedCalls++; throw new Error('Temporary title failure'); };
+      requestTitle(renamed); await state.titleTask;
+      applyName(renamed.id, 'My manual title'); await advanceRetry();
+      check(renamedCalls === 1 && state.names.get(renamed.id) === 'My manual title' && !state.titleRetries.has(renamed.id), 'A scheduled title retry survived a manual rename');
+      let rejectRenamedTitle;
+      api.title = () => new Promise((_resolve, reject) => { rejectRenamedTitle = reject; });
+      requestTitle({ id: 'title-renamed-in-flight', preview: 'Manual name wins' }); await settle();
+      applyName('title-renamed-in-flight', 'Keep this manual name');
+      rejectRenamedTitle(new Error('Late title failure')); await state.titleTask;
+      check(!retryTimers.size && !state.titleRetries.has('title-renamed-in-flight'), 'A late failed response scheduled a retry after a manual rename');
+
+      const newerErrorTitle = { id: 'title-preserve-newer-error', preview: 'Preserve another error' };
+      let newerErrorCalls = 0;
+      api.title = async () => { if (++newerErrorCalls === 1) throw new Error('Temporary title failure'); return 'Recovered with another error'; };
+      requestTitle(newerErrorTitle); await state.titleTask;
+      showError('Could not save queued messages'); await advanceRetry();
+      check(state.names.has(newerErrorTitle.id) && !$('error').hidden && $('error-text').textContent === 'Could not save queued messages', 'Title recovery erased a newer unrelated error');
+      api.title = async () => { throw new Error('Title service unavailable'); };
+      requestTitle({ id: 'title-error-first-chat', preview: 'First chat failure' }); await state.titleTask;
+      requestTitle({ id: 'title-error-second-chat', preview: 'Second chat failure' }); await state.titleTask;
+      applyName('title-error-first-chat', 'First chat recovered');
+      check(!$('error').hidden && state.titleError?.threadId === 'title-error-second-chat', 'Recovering one title erased another conversation’s identical error');
+      applyName('title-error-second-chat', 'Second chat recovered');
+      check($('error').hidden, 'A manual rename did not clear its matching title failure');
+
+      const retryArchiveRpc = api.rpc;
+      const archiveTarget = { id: 'title-archive-timer', preview: 'Archive before retry', cwd: '/tmp' };
+      let archiveTitleCalls = 0;
+      api.title = async () => { archiveTitleCalls++; throw new Error('Temporary title failure'); };
+      api.rpc = async () => ({ data: [], nextCursor: null });
+      requestTitle(archiveTarget); await state.titleTask;
+      check(retryTimers.size === 1 && !$('error').hidden, 'Archive retry fixture did not schedule a failed title');
+      await archiveConversation(archiveTarget); await advanceRetry();
+      check(archiveTitleCalls === 1 && !state.titleRetries.has(archiveTarget.id) && !state.titling.has(archiveTarget.id) && !retryTimers.size && $('error').hidden, 'Archiving left a retry timer or its old title error active');
+      let rejectArchivedTitle;
+      api.title = () => new Promise((_resolve, reject) => { rejectArchivedTitle = reject; });
+      const inFlightArchive = { id: 'title-archive-in-flight', preview: 'Archive during request', cwd: '/tmp' };
+      requestTitle(inFlightArchive); await settle();
+      await archiveConversation(inFlightArchive);
+      rejectArchivedTitle(new Error('Late archived title failure')); await state.titleTask;
+      check(!state.titleRetries.has(inFlightArchive.id) && !state.titling.has(inFlightArchive.id) && !retryTimers.size && $('error').hidden, 'An archived in-flight title recreated retries or showed a late error');
+      const queuedArchive = { id: 'title-archive-queued', preview: 'Archive while waiting', cwd: '/tmp' };
+      let finishBlockingTitle; const queuedTitleCalls = [];
+      api.title = async id => { queuedTitleCalls.push(id); if (id === 'title-archive-blocker') return new Promise(resolve => { finishBlockingTitle = resolve; }); return 'Should not be requested'; };
+      requestTitle({ id: 'title-archive-blocker', preview: 'Hold title queue' }); requestTitle(queuedArchive); await settle();
+      await archiveConversation(queuedArchive); finishBlockingTitle('Blocking conversation title'); await state.titleTask;
+      check(!queuedTitleCalls.includes(queuedArchive.id) && !state.titling.has(queuedArchive.id), 'A queued title still ran after its conversation was archived');
+      const failedArchive = { id: 'title-archive-fails', preview: 'Keep retry after archive fails', cwd: '/tmp' };
+      let failedArchiveCalls = 0;
+      api.title = async () => { if (++failedArchiveCalls === 1) throw new Error('Temporary title failure'); return 'Recovered after failed archive'; };
+      requestTitle(failedArchive); await state.titleTask;
+      api.rpc = async method => { if (method === 'thread/archive') throw new Error('Archive unavailable'); return { data: [], nextCursor: null }; };
+      await archiveConversation(failedArchive); await advanceRetry();
+      check(failedArchiveCalls === 2 && state.names.has(failedArchive.id) && !$('error').hidden && $('error-text').textContent === 'Archive unavailable', 'A failed archive canceled its title retry or title recovery hid the archive error');
+      api.rpc = retryArchiveRpc;
+
+      api.title = async () => { throw new Error('Temporary title failure'); };
+      requestTitle({ id: 'title-retry-disconnected', preview: 'Wait for connection' }); await state.titleTask;
+      let offlineCalls = 0; api.title = async () => { offlineCalls++; return 'Should not be requested'; };
+      state.connected = false; await advanceRetry();
+      check(!offlineCalls, 'A title retry called Codex after disconnection');
+    } finally {
+      for (const threadId of state.titleRetries.keys()) clearTitleRetry(threadId);
+      Date.now = originalNow; globalThis.setTimeout = originalTimeout; globalThis.clearTimeout = originalClearTimeout;
+      state.connected = true; state.names.clear(); state.titling.clear(); delete api.title; $('error').hidden = true;
+    }
+  }
+  results.push('title failures retry per conversation with cooldowns, clear only their matching errors, skip archived queued requests, ignore late results, cancel retry timers, preserve failed archives and manual names, and stop while disconnected');
 
   savedQueues.clear(); state.queues.clear(); resetThread(); state.active.clear(); state.owned.clear();
   state.options = { mode: 'local' }; state.connected = true; projects.data = []; projects.selected = null;
@@ -2405,6 +2532,75 @@ async function checks() {
   check(reusedEntry.dataset.path === '/work/project/final.ts' && reusedCard.firstElementChild.textContent === '3 files changed+8−7', 'An unsuccessful rename changed the final path or counts');
   selection.removeAllRanges(); resetThread();
   results.push('diff updates reuse panes and existing patches, preserve focus/selection/scroll through replies and row moves, merge rename chains and counts, and open the final path without merging reused source names');
+  state.thread = { id: 'anchored-diff-chat', cwd: '/work/project' }; state.connected = true; $('welcome').hidden = true;
+  const anchorTurn = 'anchored-diff-turn';
+  state.active.set(state.thread.id, anchorTurn);
+  const paintDiff = () => new Promise(resolve => setTimeout(resolve, 60));
+  const beforeDiff = { id: 'above-diff', type: 'agentMessage', text: 'Earlier explanation.\n\n'.repeat(30) };
+  renderItem(beforeDiff, false, anchorTurn);
+  renderItem(appliedPatch('anchor-patch', '/work/project/read.ts', originalPatch.changes[0].diff), false, anchorTurn);
+  const anchoredCard = $('messages').querySelector('.changed-files');
+  const anchoredEntry = anchoredCard.querySelector('.changed-file-entry'); await toggleFile(anchoredEntry);
+  const anchorPane = anchoredEntry.querySelector('.changed-file-diff'); const chatViewport = $('timeline');
+  chatViewport.scrollTop += anchoredEntry.getBoundingClientRect().top - chatViewport.getBoundingClientRect().top - 20;
+  anchorPane.focus({ preventScroll: true }); anchorPane.scrollTop = 120; anchorPane.scrollLeft = 90;
+  const initialAnchorTop = anchoredEntry.getBoundingClientRect().top;
+  const viewportHeight = chatViewport.clientHeight;
+  check(!timelineView.following && timelineView.reading === anchoredEntry && !$('jump-latest').hidden, 'Opening a diff did not pause following or offer Jump to latest');
+  handleNotification({ method: 'item/agentMessage/delta', params: { threadId: state.thread.id, itemId: beforeDiff.id, delta: 'More explanation above the diff.\n\n'.repeat(15) } });
+  await paintDiff();
+  check(Math.abs(anchoredEntry.getBoundingClientRect().top - initialAnchorTop) < 1 && anchorPane.scrollTop === 120 && anchorPane.scrollLeft === 90, 'Growing text above the diff moved the viewport or reset its inner scroll');
+  handleNotification({ method: 'item/started', params: { threadId: state.thread.id, turnId: anchorTurn, item: { id: 'below-diff', type: 'agentMessage', text: 'A new reply below the diff.' } } });
+  handleNotification({ method: 'item/agentMessage/delta', params: { threadId: state.thread.id, itemId: 'below-diff', delta: '\n\nNew streamed output.'.repeat(30) } });
+  handleNotification({ method: 'item/started', params: { threadId: state.thread.id, turnId: anchorTurn, item: { id: 'below-tool', type: 'commandExecution', command: 'npm test', status: 'inProgress' } } });
+  handleNotification({ method: 'item/completed', params: { threadId: state.thread.id, turnId: anchorTurn, item: appliedPatch('anchor-next-patch', '/work/project/read.ts', '@@ -2 +2 @@\n-new\n+newer') } });
+  await paintDiff();
+  check(anchoredCard.compareDocumentPosition(state.items.get('below-diff').element) & Node.DOCUMENT_POSITION_FOLLOWING, 'New output moved an expanded changes card below the reply');
+  check(Math.abs(anchoredEntry.getBoundingClientRect().top - initialAnchorTop) < 1 && document.activeElement === anchorPane && anchorPane.scrollTop === 120 && anchorPane.scrollLeft === 90 && !timelineView.following, 'Live replies, tool output, or another patch moved the diff while reading');
+  const jumpRect = $('jump-latest').getBoundingClientRect(); const viewportRect = chatViewport.getBoundingClientRect();
+  check(jumpRect.left >= viewportRect.left && jumpRect.right <= viewportRect.right && jumpRect.bottom <= viewportRect.bottom && jumpRect.top >= viewportRect.top, 'Jump to latest is outside the conversation viewport');
+  $('jump-latest').click();
+  check(timelineView.following && !timelineView.reading && $('jump-latest').hidden && timelineAtBottom() && chatViewport.clientHeight === viewportHeight, 'Jump to latest did not resume following or shifted the layout');
+  handleNotification({ method: 'item/agentMessage/delta', params: { threadId: state.thread.id, itemId: 'below-diff', delta: '\n\nMore output after resuming.'.repeat(50) } });
+  await paintDiff();
+  check(timelineView.following && timelineAtBottom(), 'Resumed following stopped when a large streamed update arrived');
+  anchorPane.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -30 }));
+  check(!timelineView.following && timelineView.reading === anchoredEntry, 'Reading an already-open diff did not pause following again');
+  chatViewport.scrollTop = chatViewport.scrollHeight;
+  const lateImage = messageImage(png, 'Late image'); $('messages').append(lateImage); await lateImage.imageReady;
+  await paintDiff();
+  check(!timelineView.following && !$('jump-latest').hidden, 'A late image forced following back on while a diff was being read');
+  chatViewport.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+  check(!timelineView.following && !timelineView.reading, 'Reading another part of the chat kept anchoring an old diff');
+  state.active.delete(state.thread.id); anchoredEntry.open = false; anchoredEntry.open = true; resetThread(); await paintDiff();
+  check(timelineView.following && !timelineView.reading && $('jump-latest').hidden, 'A new conversation inherited the paused diff view');
+  results.push('expanded diffs stay anchored through growing replies, tools, and patches; Jump to latest resumes large streaming updates without layout shifts, and later diff interaction or images respect the paused view');
+  state.thread = { id: 'queue-follow-chat', cwd: '/work/project' }; state.connected = true; $('welcome').hidden = true;
+  state.owned.add(state.thread.id); state.active.set(state.thread.id, 'queue-follow-turn');
+  renderItem({ id: 'queue-follow-reply', type: 'agentMessage', text: 'Live output.\n\n'.repeat(100) }, false, 'queue-follow-turn');
+  updateBusy(); scrollToBottom(true); await paintDiff();
+  const beforeQueueHeight = $('timeline').clientHeight;
+  $('prompt').value = 'First queued follow-up'; await send(); await paintDiff();
+  const followQueue = state.queues.get(queueKey(state.thread.id));
+  check(followQueue.messages.length === 1 && $('timeline').clientHeight < beforeQueueHeight, 'Queued message did not resize the composer fixture');
+  check(timelineView.following && timelineAtBottom() && $('jump-latest').hidden, 'Adding a queued message paused following during composer resize');
+  handleNotification({ method: 'item/agentMessage/delta', params: { threadId: state.thread.id, itemId: 'queue-follow-reply', delta: '\n\nOutput after queueing.'.repeat(30) } });
+  await paintDiff();
+  check(timelineView.following && timelineAtBottom(), 'Streaming stopped following after the queue resized the composer');
+  $('timeline').scrollTop = 0; $('timeline').dispatchEvent(new Event('scroll'));
+  const pausedQueueTop = $('timeline').scrollTop;
+  $('prompt').value = 'Second queued follow-up'; await send(); await paintDiff();
+  check(!timelineView.following && $('timeline').scrollTop === pausedQueueTop && !$('jump-latest').hidden, 'Queue resizing pulled a manually scrolled conversation to the bottom');
+  renderItem(appliedPatch('queue-follow-patch', '/work/project/queued.ts', originalPatch.changes[0].diff), false, 'queue-follow-turn');
+  const queueDiff = $('messages').querySelector('.changed-file-entry'); await toggleFile(queueDiff);
+  const queuePane = queueDiff.querySelector('.changed-file-diff'); queuePane.scrollTop = 120;
+  $('timeline').scrollTop += queueDiff.getBoundingClientRect().top - $('timeline').getBoundingClientRect().top - 20;
+  const queueDiffTop = queueDiff.getBoundingClientRect().top;
+  $('prompt').value = 'Third queued follow-up'; await send(); await paintDiff();
+  check(followQueue.messages.length === 3 && !timelineView.following && timelineView.reading === queueDiff && queuePane.scrollTop === 120 && Math.abs(queueDiff.getBoundingClientRect().top - queueDiffTop) < 1, 'Queue resizing resumed following or moved the diff being read');
+  followQueue.messages = []; await persistQueue(followQueue); state.queues.delete(followQueue.key);
+  state.active.delete(state.thread.id); state.owned.delete(state.thread.id); resetThread();
+  results.push('queued follow-ups keep the latest output visible through composer resizes, continue streaming, and preserve manual scrolling and anchored diffs');
   const diffCases = [
     ['const pattern = /驗證碼|認証コード/;', 'const pattern = /驗證碼|確認碼|認証コード/;', [], ['確認碼|']],
     ['const total = first + second;', 'const amount = first - second;', ['total', '+'], ['amount', '-']],
@@ -2421,8 +2617,18 @@ async function checks() {
       const actual = [...pre.querySelectorAll(`.diff-${kind} .diff-word-change`)].map(span => span.textContent);
       check(JSON.stringify(actual) === JSON.stringify(expected), `Incorrect ${kind} highlights: ${JSON.stringify(actual)}`);
     }
-    check(!pre.children[0].className && !pre.children[1].className, 'File headers were highlighted as code changes');
+    check(pre.children[0].classList.contains('diff-metadata') && pre.children[1].classList.contains('diff-metadata'), 'File headers were highlighted as code changes');
   }
+  const numberedPatch = 'diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -10,2 +20,3 @@\n same\n-before\n+after\n+another\n\\ No newline at end of file\n@@ -30 +40 @@\n-last\n+next';
+  const numberedDiff = renderDiff(numberedPatch);
+  const numberedRows = [...numberedDiff.children];
+  check(JSON.stringify(numberedRows.slice(4, 8).map(row => [row.dataset.oldLine, row.dataset.newLine])) === JSON.stringify([['10', '20'], ['11', ''], ['', '21'], ['', '22']]) && numberedRows[8].dataset.oldLine === '' && numberedRows[10].dataset.oldLine === '30' && numberedRows[11].dataset.newLine === '40', 'Diff gutters misnumbered context, edits, no-newline markers, or later hunks');
+  const diffStyleFixture = document.createElement('div'); diffStyleFixture.className = 'changed-file-diff'; diffStyleFixture.append(numberedDiff); $('messages').append(diffStyleFixture);
+  check(getComputedStyle(numberedRows[0]).display === 'none' && numberedRows[3].getBoundingClientRect().height === 8 && numberedRows[4].getBoundingClientRect().height === 20, 'GitFerry-style metadata, hunk spacing, or line height was lost');
+  check(getComputedStyle(numberedRows[5]).backgroundColor !== 'rgba(0, 0, 0, 0)' && getComputedStyle(numberedRows[6]).backgroundColor !== 'rgba(0, 0, 0, 0)', 'Added and removed rows have no full-width background');
+  const diffCopySelection = getSelection(); const diffCopyRange = document.createRange(); diffCopyRange.selectNodeContents(numberedRows[5]); diffCopySelection.removeAllRanges(); diffCopySelection.addRange(diffCopyRange);
+  check(diffCopySelection.toString().trim() === '-before' && numberedDiff.textContent === numberedPatch + '\n', 'Line numbers changed copied code or the original patch text');
+  diffCopySelection.removeAllRanges(); diffStyleFixture.remove();
   const unsafeDiff = renderDiff('-const text = "safe";\n+const text = "<img src=x onerror=alert(1)>";');
   check(!unsafeDiff.querySelector('img') && unsafeDiff.textContent.includes('<img src=x onerror=alert(1)>'), 'Inline highlights rendered code as HTML');
   const separateHunks = renderDiff('@@ -1 +1 @@\n-before value\n context\n+after value\n@@ -2 +2 @@\n+added only\n-removed only');
@@ -2439,7 +2645,7 @@ async function checks() {
   const soundFinish = (id, status = 'completed', threadId = 'sound-background-chat') => handleNotification({ method: 'turn/completed', params: { threadId, turn: { id, status } } });
   completionSound.lastAt = -Infinity;
   soundFinish('sound-first'); soundFinish('sound-first'); soundFinish('sound-burst');
-  check(soundPlays === 1 && completionSound.audio.volume <= 0.35, 'Completion sounds repeated for duplicates, overlapping chats, or played too loudly');
+  check(soundPlays === 1 && completionSound.audio.volume === 0.5 && $('completion-volume-value').value === '50%', 'Completion sounds repeated for duplicates, overlapping chats, or ignored the default volume');
   completionSound.lastAt = -Infinity; soundFinish('sound-failed', 'failed'); soundFinish('sound-stopped', 'interrupted');
   state.active.set('sound-background-chat', 'newer-sound-turn'); soundFinish('stale-sound-turn'); state.active.clear();
   check(soundPlays === 1, 'Failure, cancellation, or a stale turn triggered a completion chime');
@@ -2455,9 +2661,107 @@ async function checks() {
   api.savePreferences = async () => { throw new Error('Sound preference save failed'); };
   $('completion-sound').checked = true; await $('completion-sound').onchange();
   check(!$('completion-sound').checked && !preferences.completionSound && !$('completion-sound').disabled, 'Failed sound preference save did not restore the previous setting');
+  api.savePreferences = soundPreferenceWriter;
+  $('completion-volume').value = '80'; $('completion-volume').oninput();
+  check($('completion-volume-value').value === '80%' && completionSound.audio.volume === 0.8 && !$('completion-volume').closest('form'), 'The volume slider did not update the playing audio or can reconnect chats');
+  await $('completion-volume').onchange(); Object.assign(preferences, await api.preferences()); fillSettings(state.options);
+  check($('completion-volume').value === '80' && preferences.completionVolume === 80, 'The completion volume did not survive preference reload');
+  await playCompletionSound(true);
+  check(soundPlays === 4 && completionSound.audio.volume === 0.8 && diagnostics.some(entry => entry.event === 'completion-sound.started' && entry.details.status === '80%'), 'Preview did not use the selected volume or log successful playback');
+  $('completion-sound').checked = true; await $('completion-sound').onchange();
+  $('completion-volume').value = '0'; $('completion-volume').oninput(); await $('completion-volume').onchange();
+  completionSound.lastAt = -Infinity; soundFinish('sound-volume-muted'); await playCompletionSound(true);
+  check(soundPlays === 4 && preferences.completionVolume === 0 && $('completion-volume-value').value === '0%', 'Zero volume did not mute completion and preview playback');
+  api.savePreferences = async () => { throw new Error('Volume save failed'); };
+  $('completion-volume').value = '60'; $('completion-volume').oninput(); await $('completion-volume').onchange();
+  check($('completion-volume').value === '0' && $('completion-volume-value').value === '0%' && completionSound.audio.volume === 0 && !$('completion-volume').disabled, 'A failed volume save did not restore its previous level');
+  $('completion-volume').value = '50'; $('completion-volume').oninput();
+  completionSound.audio.play = async () => { throw new Error('Audio output unavailable'); };
+  await playCompletionSound(true);
+  check($('error-text').textContent.includes('Audio output unavailable') && diagnostics.some(entry => entry.event === 'completion-sound.failed' && entry.details.phase === 'preview'), 'A silent Preview playback failure was not shown and logged');
+  setCompletionVolume(preferences.completionVolume ?? 50);
   api.savePreferences = soundPreferenceWriter; api.rpc = soundRpc; state.queues.clear(); $('error').hidden = true;
   completionSound.audio.play = async () => {};
-  results.push('completion chimes default on, stay soft, suppress duplicates and bursts, skip unfinished queue chains and stale/failed turns, persist disabling, and offer an explicit preview');
+  results.push('completion chimes preserve cooldowns and queue behavior, persist live volume and muting, restore failed saves, and preview at the selected level with playback diagnostics');
+
+  {
+  const paint = () => new Promise(resolve => setTimeout(resolve, 40));
+  resetThread(); state.active.clear(); state.queues.clear(); state.connected = true;
+  const pinOptions = state.options; state.options = { mode: 'local' };
+  const pinThread = { id: 'pin-chat', cwd: '/tmp', name: 'Message pins' };
+  setThread(pinThread);
+  const pinnedQuestion = { id: 'pin-question', type: 'userMessage', content: [{ type: 'text', text: 'Keep this question <img src=x onerror=alert(1)>' }] };
+  const pinnedReply = { id: 'pin-reply', type: 'agentMessage', text: '**Useful answer** with a [link](https://example.com).' };
+  const questionRecord = renderItem(pinnedQuestion, false, 'pin-turn');
+  const pinRecord = renderItem(pinnedReply, false, 'pin-turn');
+  const followingPin = renderItem({ id: 'pin-following', type: 'agentMessage', text: 'Newer messages.\n\n'.repeat(120) }, false, 'pin-latest-turn');
+  state.active.set(pinThread.id, 'pin-latest-turn'); state.owned.add(pinThread.id); updateBusy();
+  check(!questionRecord.pinButton.disabled && questionRecord.label.querySelector('.edit-message').disabled, 'Pinning was blocked during a running turn');
+  await questionRecord.pinButton.onclick(); await pinRecord.pinButton.onclick();
+  check(currentMessagePins().length === 2 && !$('pinned-messages').hidden && $('pinned-messages').children.length === 2 && $('pinned-messages').getBoundingClientRect().height <= 42, 'Message pins were not saved as a compact row: ' + JSON.stringify({ pins: currentMessagePins().length, hidden: $('pinned-messages').hidden, chips: $('pinned-messages').children.length, height: $('pinned-messages').getBoundingClientRect().height, error: $('error-text').textContent }));
+  check(!$('pinned-messages').querySelector('img,a') && $('pinned-messages').textContent.includes('<img src=x'), 'Pinned text was interpreted as HTML');
+  check(pinRecord.pinButton.getAttribute('aria-pressed') === 'true', 'The message pin button did not reflect its saved state');
+  check(pinRecord.element.classList.contains('message-pinned') && questionRecord.element.classList.contains('message-pinned') && getComputedStyle(pinRecord.element).backgroundColor !== 'rgba(0, 0, 0, 0)', 'Pinned messages did not receive their persistent yellow highlight');
+  const pinBarTop = $('pinned-messages').getBoundingClientRect().top;
+  await $('pinned-messages').querySelectorAll('.jump-pinned-message')[1].onclick();
+  await paint();
+  const pinnedTop = pinRecord.element.getBoundingClientRect().top;
+  check(Math.abs(pinnedTop - $('timeline').getBoundingClientRect().top - 12) <= 1 && !timelineView.following && timelineView.reading === pinRecord.element && document.activeElement === pinRecord.element, 'Clicking a pin did not scroll to and anchor the message');
+  renderItem({ ...pinnedQuestion, content: [{ type: 'text', text: 'Older text grows.\n'.repeat(60) }] }, false, 'pin-turn');
+  renderItem({ ...followingPin.item, text: followingPin.item.text + '\nMore streaming output.' }, false, 'pin-latest-turn');
+  scrollToBottom(); await paint();
+  check(Math.abs(pinRecord.element.getBoundingClientRect().top - pinnedTop) <= 1 && $('pinned-messages').getBoundingClientRect().top === pinBarTop, 'Streaming output moved the pinned message or its fixed strip');
+  const stablePinButton = pinRecord.pinButton;
+  stablePinButton.focus({ preventScroll: true });
+  renderItem({ ...pinnedReply, text: pinnedReply.text + '\nStreaming addition.' }, false, 'pin-turn');
+  check(pinRecord.pinButton === stablePinButton && document.activeElement === stablePinButton, 'Streaming recreated or unfocused the message pin button');
+  const pinWriter = api.savePreferences;
+  const stalePreferences = await api.preferences(); let releasePinTheme;
+  api.savePreferences = patch => patch.theme ? new Promise(resolve => { releasePinTheme = () => resolve({ ...stalePreferences, theme: patch.theme }); }) : pinWriter(patch);
+  const slowTheme = savePreferences({ theme: 'purple' });
+  await saveMessagePin({ itemId: 'extra-pin', turnId: 'missing-turn', preview: 'Codex: Other saved message' }, true);
+  releasePinTheme(); await slowTheme;
+  check(currentMessagePins().length === 3, 'A delayed theme response overwrote newly saved pins');
+  api.savePreferences = async () => { throw new Error('Pin save failed'); };
+  await $('pinned-messages').querySelector('.unpin-message').onclick();
+  check(currentMessagePins().length === 3 && $('error-text').textContent.includes('Pin save failed') && !pinRecord.pinButton.disabled, 'A failed pin save removed the existing pin or left controls disabled');
+  api.savePreferences = pinWriter; $('error').hidden = true;
+  delete preferences.messagePins; Object.assign(preferences, await api.preferences());
+  check(currentMessagePins().length === 3, 'Message pins did not survive preference reload');
+  state.active.clear();
+  const pinCalls = [];
+  api.rpc = async (method, params) => {
+    pinCalls.push({ method, params });
+    if (method === 'thread/read') return { thread: pinThread };
+    if (!params.cursor) return { data: [{ id: 'pin-latest-turn', items: [followingPin.item] }], nextCursor: 'pin-page-one' };
+    if (params.cursor === 'pin-page-one') return { data: [{ id: 'pin-middle-turn', items: [{ id: 'pin-middle', type: 'agentMessage', text: 'Middle history.' }] }], nextCursor: 'pin-page-two' };
+    return { data: [{ id: 'pin-turn', items: [pinnedQuestion, pinnedReply] }], nextCursor: null };
+  };
+  await openThread(pinThread);
+  check(!$('pinned-messages').hidden && pinCalls.length === 2 && !state.items.has(pinnedReply.id), 'Reopening lost pins or eagerly loaded older history');
+  await $('pinned-messages').querySelectorAll('.jump-pinned-message')[1].onclick();
+  check(pinCalls.filter(call => call.params.cursor).length === 2 && timelineView.reading === state.items.get(pinnedReply.id).element && pinCalls.every(call => ['thread/read', 'thread/turns/list'].includes(call.method)), 'An old pin did not load missing history or used a write operation');
+  await $('pinned-messages').querySelectorAll('.jump-pinned-message')[2].onclick();
+  check($('error-text').textContent.includes('no longer in the conversation') && currentMessagePins().length === 3, 'A deleted pinned message failed silently or removed its pin');
+  await $('pinned-messages').querySelectorAll('.unpin-message')[2].onclick();
+  check(currentMessagePins().length === 2, 'A missing pinned message could not be unpinned');
+  state.options = { mode: 'ssh', host: 'pin-host', port: 22 }; renderMessagePins();
+  check($('pinned-messages').hidden, 'Local message pins leaked onto another machine');
+  state.options = { mode: 'local' }; resetThread(); setThread({ id: 'another-pin-chat', cwd: '/tmp' });
+  check($('pinned-messages').hidden, 'Message pins leaked into a different conversation');
+  await openThread(pinThread);
+  let releasePinPage; let pinPageRequests = 0;
+  api.rpc = async () => { pinPageRequests++; return new Promise(resolve => { releasePinPage = resolve; }); };
+  const oldPinJump = jumpToMessagePin(currentMessagePins()[1]);
+  const sharedPinPage = loadOlderTurns();
+  check(pinPageRequests === 1, 'Pin navigation and manual history loading requested the same page twice');
+  resetThread(); setThread({ id: 'changed-pin-chat', cwd: '/tmp' });
+  releasePinPage({ data: [{ id: 'pin-turn', items: [pinnedReply] }], nextCursor: null });
+  await Promise.all([oldPinJump, sharedPinPage]);
+  check(state.thread.id === 'changed-pin-chat' && !state.items.has(pinnedReply.id) && $('pinned-messages').hidden && !$('older-turns').disabled, 'A stale pin jump changed another chat or left history controls locked');
+  state.options = pinOptions; $('error').hidden = true; resetThread();
+  results.push('message pins persist per conversation and machine in a compact fixed row, navigate older history on demand, stay anchored during streaming, preserve focus, and handle failed saves, missing messages, and navigation races');
+  }
   api.rpc = originalRpc; state.threads = [branchSource]; await openThread(branchSource); connectionLabels(); status(connectedStatus());
   projects.data = [{ id: branchSource.projectId, name: 'Rapidcode', roots: [{ path: branchSource.cwd }] }];
   await expandProject(projects.data[0], false);
@@ -2504,6 +2808,8 @@ module.exports = async () => {
       renderItem({ id: 'preview-reply', type: 'agentMessage', text: 'All checks passed.' }, false, 'preview-turn');
       state.options = { mode: 'local' }; state.connected = true;
       state.thread = { id: 'preview-chat', name: 'Check project tests', cwd: '/tmp' }; state.threads = [state.thread];
+      preferences.messagePins = { 'access:local': { 'preview-chat': [{ itemId: 'preview-reply', turnId: 'preview-turn', preview: 'Codex: All checks passed.' }] } };
+      renderMessagePins();
       schedules.tasks = [{ id: 'preview-scheduled', threadId: state.thread.id, machine: 'access:local', prompt: 'Check the tests again tomorrow', runAt: new Date(Date.now() + 86400000).toISOString(), status: 'pending' }];
       renderThreads(); renderSchedules();
       $('send-time').value = '24';
@@ -2517,6 +2823,7 @@ module.exports = async () => {
     })()`);
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'activity-collapsed.png'), (await testWindow.webContents.capturePage()).toPNG());
+    fs.writeFileSync(path.join(artifacts, 'pinned-messages.png'), (await testWindow.webContents.capturePage()).toPNG());
     await testWindow.webContents.executeJavaScript("document.querySelector('.activity-log > summary').click()");
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'activity-expanded.png'), (await testWindow.webContents.capturePage()).toPNG());
@@ -2540,9 +2847,14 @@ module.exports = async () => {
     fs.writeFileSync(path.join(artifacts, 'changed-files.png'), (await testWindow.webContents.capturePage()).toPNG());
     await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file').click()");
     await new Promise(resolve => setTimeout(resolve, 100));
-    await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file-entry[open]').scrollIntoView({block:'nearest'}); document.getElementById('timeline').scrollTop = document.getElementById('timeline').scrollHeight");
+    await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file-entry[open]').scrollIntoView({block:'start'})");
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'changed-file-diff.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript("document.documentElement.dataset.theme = 'light'");
+    await new Promise(resolve => setTimeout(resolve, 100));
+    fs.writeFileSync(path.join(artifacts, 'changed-file-diff-light.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript("document.documentElement.dataset.theme = 'system'");
+    await new Promise(resolve => setTimeout(resolve, 100));
     await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file').click(); document.getElementById('open-settings').click()");
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'completion-sound-settings.png'), (await testWindow.webContents.capturePage()).toPNG());

@@ -131,3 +131,53 @@ test('completion sound accepts only booleans and survives restarting', t => {
   assert.equal(store.read().completionSound, false);
   store.update({ completionSound: true }); assert.equal(new PreferencesStore(file).read().completionSound, true);
 });
+
+test('completion volume persists and rejects values outside the percentage range', t => {
+  const file = fixture(t); const store = new PreferencesStore(file);
+  for (const completionVolume of [0, 50, 100]) {
+    store.update({ completionVolume });
+    assert.equal(new PreferencesStore(file).read().completionVolume, completionVolume);
+  }
+  for (const completionVolume of [-1, 101, 0.5, null, undefined, NaN, Infinity, '50', {}]) assert.throws(() => store.update({ completionVolume }));
+  assert.equal(store.read().completionVolume, 100);
+  fs.writeFileSync(file, JSON.stringify({ theme: 'system', startupProjects: {}, completionVolume: 101 }));
+  assert.throws(() => store.read(), /Invalid completion volume/);
+});
+
+test('message pins survive restart, remain separate per chat and machine, and preserve other preferences', t => {
+  const file = fixture(t); const store = new PreferencesStore(file);
+  store.update({ theme: 'purple' });
+  const pin = { machine: 'access:local', threadId: 'chat', itemId: 'reply', turnId: 'turn', preview: 'Codex: Saved reply', pinned: true };
+  store.update({ messagePin: pin });
+  store.update({ messagePin: { ...pin, itemId: 'question', preview: 'You: Saved question' } });
+  store.update({ messagePin: { ...pin, machine: 'access:host:22', preview: 'Remote reply' } });
+  store.update({ messagePin: { ...pin, threadId: 'another-chat', preview: 'Other chat' } });
+  const saved = new PreferencesStore(file).read();
+  assert.deepEqual(saved.messagePins['access:local'].chat.map(value => value.itemId), ['reply', 'question']);
+  assert.equal(saved.messagePins['access:host:22'].chat[0].preview, 'Remote reply');
+  assert.equal(saved.messagePins['access:local']['another-chat'][0].preview, 'Other chat');
+  assert.equal(saved.theme, 'purple');
+  store.update({ messagePin: { ...pin, preview: 'Updated reply' } });
+  assert.equal(store.read().messagePins['access:local'].chat.length, 2);
+  store.update({ messagePin: { machine: pin.machine, threadId: pin.threadId, itemId: pin.itemId, pinned: false } });
+  assert.deepEqual(store.read().messagePins['access:local'].chat.map(value => value.itemId), ['question']);
+  store.update({ messagePin: { ...pin, itemId: 'question', pinned: false } });
+  assert.equal(new PreferencesStore(file).read().messagePins['access:local'].chat, undefined);
+});
+
+test('invalid pins, excess pins, and failed writes preserve saved message pins', t => {
+  const file = fixture(t); const store = new PreferencesStore(file);
+  const pin = { machine: 'access:local', threadId: 'chat', itemId: 'reply', turnId: 'turn', preview: 'Saved reply', pinned: true };
+  store.update({ messagePin: pin });
+  const saved = store.read();
+  for (const value of [null, { ...pin, machine: '__proto__' }, { ...pin, threadId: '__proto__' }, { ...pin, itemId: '' }, { ...pin, turnId: '' }, { ...pin, pinned: 'true' }, { ...pin, preview: 'x'.repeat(201) }]) assert.throws(() => store.update({ messagePin: value }));
+  assert.deepEqual(store.read(), saved);
+  for (let index = 1; index < 50; index++) store.update({ messagePin: { ...pin, itemId: 'reply-' + index } });
+  assert.throws(() => store.update({ messagePin: { ...pin, itemId: 'extra' } }), /50 messages/);
+  assert.equal(store.read().messagePins['access:local'].chat.length, 50);
+  fs.mkdirSync(file + '.tmp');
+  assert.throws(() => store.update({ messagePin: { ...pin, pinned: false } }));
+  assert.equal(new PreferencesStore(file).read().messagePins['access:local'].chat.length, 50);
+  fs.writeFileSync(file, JSON.stringify({ ...saved, messagePins: { 'access:local': { chat: [{ itemId: 'bad' }] } } }));
+  assert.throws(() => store.read(), /Invalid saved message pins/);
+});

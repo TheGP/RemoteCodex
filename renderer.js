@@ -9,13 +9,16 @@ const linkContexts = new WeakMap();
 const completionSound = { audio: null, lastAt: -Infinity };
 const schedules = { tasks: [], generation: 0 };
 const drafts = { target: null, snapshot: null, images: [], suspended: false, restoring: false };
+const timelineView = { following: true, reading: null };
+const pinnedMessages = { saving: false, jumping: null };
+const pinIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 9V3H8v6l-3 3v2h14v-2l-3-3M12 14v7"/></svg>';
 for (let hours = 1; hours < 24; hours++) $('send-time').add(new Option(`${hours} hour${hours === 1 ? '' : 's'}`, String(hours)));
 for (let days = 1; days <= 7; days++) $('send-time').add(new Option(`${days} day${days === 1 ? '' : 's'}`, String(days * 24)));
 const threadDrag = { source: null, pending: new Set(), orderPending: new Set(), type: 'application/x-remote-codex-thread' };
 const projectDrag = { source: null, pending: null, type: 'application/x-remote-codex-project' };
 const queueDrag = { source: null, type: 'application/x-remote-codex-queue' };
 const usage = { threads: new Map(), account: null, reading: null, generation: 0, updatedAt: 0, error: null, timer: null };
-const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), queues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Set(), newThreads: new Set(), titleTask: Promise.resolve(), titleFailed: false, images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
+const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), queues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Map(), newThreads: new Set(), titleTask: Promise.resolve(), titleRetries: new Map(), images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
 const slash = { index: 0, matches: [], dismissed: null, skills: [], cwd: null, loading: false, generation: 0, skillOnly: false };
 const modes = { plan: false, catalog: [], threads: new Map() };
 const slashCommands = [
@@ -116,10 +119,13 @@ async function savePreferences(patch) {
   const markers = preferences.conversationStates;
   const orders = preferences.threadOrders;
   const cutoffs = preferences.threadOrderCutoffs;
-  Object.assign(preferences, await api.savePreferences(patch));
+  const saved = await api.savePreferences(patch);
+  const messagePins = preferences.messagePins;
+  Object.assign(preferences, saved);
   preferences.conversationStates = markers;
   preferences.threadOrders = orders;
   preferences.threadOrderCutoffs = cutoffs;
+  preferences.messagePins = messagePins;
 }
 $('theme-select').onchange = async () => {
   const theme = $('theme-select').value; const previous = document.documentElement.dataset.theme || 'system';
@@ -136,13 +142,34 @@ $('file-opener').onchange = async () => {
 };
 function playCompletionSound(preview = false) {
   if (!preview && (preferences.completionSound === false || performance.now() - completionSound.lastAt < 3000)) return;
+  const volume = Number($('completion-volume').value) / 100;
+  if (!volume) return;
+  const failed = error => {
+    trace('completion-sound.failed', { phase: preview ? 'preview' : 'completion', error: error.message });
+    if (preview) showError(`Could not play sound: ${error.message}`);
+  };
   try {
-    completionSound.audio ||= new Audio('assets/completion.wav');
-    const audio = completionSound.audio; audio.volume = 0.35; audio.pause(); audio.currentTime = 0;
+    if (!completionSound.audio) {
+      completionSound.audio = new Audio('assets/completion.wav');
+      completionSound.audio.onended = () => trace('completion-sound.ended');
+    }
+    const audio = completionSound.audio; audio.volume = volume; audio.pause(); audio.currentTime = 0;
     completionSound.lastAt = performance.now();
-    return audio.play().catch(error => api.log?.('completion-sound.failed', { error: error.message }));
-  } catch (error) { api.log?.('completion-sound.failed', { error: error.message }); }
+    return audio.play().then(() => trace('completion-sound.started', { phase: preview ? 'preview' : 'completion', status: `${Math.round(volume * 100)}%` }), failed);
+  } catch (error) { failed(error); }
 }
+function setCompletionVolume(value) {
+  $('completion-volume').value = String(value); $('completion-volume-value').value = `${value}%`;
+  if (completionSound.audio) completionSound.audio.volume = value / 100;
+}
+$('completion-volume').oninput = () => setCompletionVolume(Number($('completion-volume').value));
+$('completion-volume').onchange = async () => {
+  const control = $('completion-volume'); const previous = preferences.completionVolume ?? 50;
+  control.disabled = true;
+  try { await savePreferences({ completionVolume: Number(control.value) }); setCompletionVolume(preferences.completionVolume ?? 50); }
+  catch (error) { setCompletionVolume(previous); showError(error); }
+  finally { control.disabled = false; }
+};
 $('completion-sound').onchange = async () => {
   const control = $('completion-sound'); const previous = preferences.completionSound !== false;
   control.disabled = true;
@@ -196,6 +223,7 @@ function updateSettingsActions() {
 
 function fillSettings(options) {
   $('completion-sound').checked = preferences.completionSound !== false;
+  setCompletionVolume(preferences.completionVolume ?? 50);
   $('file-opener').value = preferences.fileOpener || 'vscode';
   $('file-opener').querySelector('[value="reveal"]').textContent = navigator.platform.includes('Mac') ? 'Show in Finder' : 'Show in file manager';
   $('connection-mode').value = options.mode || 'ssh';
@@ -211,6 +239,7 @@ function fillSettings(options) {
 function isWriterConflict(error) { return /already has an active writer/i.test(error.message || String(error)); }
 function showError(error) {
   state.retryError = null;
+  state.titleError = null;
   let message = (error.message || String(error)).replace(/^Error invoking remote method '[^']+':\s*/, '').replace(/^Error:\s*/, '');
   if (isWriterConflict(error)) {
     if (state.writerConflicts.has(queueKey(state.thread?.id))) { $('error').hidden = true; updateBusy(); return; }
@@ -280,6 +309,7 @@ function updateBusy() {
   renderSchedules();
   renderThreadIndicators();
   renderUsage();
+  renderMessagePins();
   const turns = new Set();
   for (const button of $('messages').querySelectorAll('.edit-message')) {
     const turnId = button.dataset.turnId;
@@ -398,9 +428,82 @@ $('usage-meter').onclick = () => {
 $('usage-panel').addEventListener('toggle', event => $('usage-meter').setAttribute('aria-expanded', String(event.newState === 'open')));
 $('close-usage').onclick = () => $('usage-panel').hidePopover();
 addEventListener('resize', positionUsagePanel);
+function setTimelineFollowing(following, reading = null) {
+  timelineView.following = following; timelineView.reading = reading;
+  $('jump-latest').hidden = following;
+}
+function timelineAtBottom() {
+  const timeline = $('timeline');
+  return timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 24;
+}
 function scrollToBottom(force = false) {
-  const el = $('timeline');
-  if (force || el.scrollHeight - el.scrollTop - el.clientHeight < 180) el.scrollTop = el.scrollHeight;
+  if (force) setTimelineFollowing(true);
+  if (timelineView.following) $('timeline').scrollTop = $('timeline').scrollHeight;
+}
+$('jump-latest').onclick = () => { scrollToBottom(true); acknowledgeVisibleThread(); };
+function currentMessagePins() { return preferences.messagePins?.[accessKey()]?.[state.thread?.id] || []; }
+function updateMessagePinButton(record) {
+  if (!record.pinButton) return;
+  const pinned = currentMessagePins().some(pin => pin.itemId === record.item.id);
+  record.pinButton.title = pinned ? 'Unpin message' : 'Pin message';
+  record.pinButton.setAttribute('aria-label', record.pinButton.title);
+  record.pinButton.setAttribute('aria-pressed', String(pinned));
+  record.element.classList.toggle('message-pinned', pinned);
+  record.pinButton.disabled = pinnedMessages.saving || state.loading;
+}
+function renderMessagePins() {
+  const bar = $('pinned-messages'); const pins = currentMessagePins();
+  const key = JSON.stringify([accessKey(), state.thread?.id, pins]);
+  bar.hidden = !pins.length;
+  if (bar.dataset.key !== key) {
+    bar.dataset.key = key; bar.replaceChildren();
+    for (const pin of pins) {
+      const chip = document.createElement('span'); chip.className = 'pinned-message';
+      const jump = document.createElement('button'); jump.type = 'button'; jump.className = 'jump-pinned-message';
+      jump.innerHTML = pinIcon;
+      const preview = document.createElement('span'); preview.textContent = pin.preview; jump.append(preview);
+      jump.title = `Go to pinned message: ${pin.preview}`;
+      jump.onclick = () => jumpToMessagePin(pin).catch(showError);
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'unpin-message'; remove.textContent = '×';
+      remove.title = 'Unpin message'; remove.setAttribute('aria-label', `Unpin message: ${pin.preview}`);
+      remove.onclick = () => saveMessagePin(pin, false).catch(showError);
+      chip.append(jump, remove); bar.append(chip);
+    }
+  }
+  for (const button of bar.querySelectorAll('button')) button.disabled = pinnedMessages.saving || state.loading || Boolean(pinnedMessages.jumping);
+  for (const record of state.items.values()) updateMessagePinButton(record);
+}
+async function saveMessagePin(pin, pinned) {
+  if (!state.thread || pinnedMessages.saving) return;
+  const machine = accessKey(), threadId = state.thread.id;
+  pinnedMessages.saving = true; renderMessagePins();
+  try {
+    const saved = await api.savePreferences({ messagePin: { machine, threadId, ...pin, pinned } });
+    preferences.messagePins = saved.messagePins || {};
+  } finally { pinnedMessages.saving = false; renderMessagePins(); scrollToBottom(); }
+}
+async function jumpToMessagePin(pin) {
+  if (!state.thread || state.loading || pinnedMessages.jumping) return;
+  const operation = { selection: state.selection };
+  pinnedMessages.jumping = operation; setTimelineFollowing(false); renderMessagePins();
+  const current = () => pinnedMessages.jumping === operation && state.selection === operation.selection;
+  const find = () => { const record = state.items.get(pin.itemId); return record?.turnId === pin.turnId ? record : null; };
+  try {
+    const seen = new Set();
+    while (!find() && state.turnCursor && !seen.has(state.turnCursor)) {
+      if (!state.connected) throw new Error('Connect to load the pinned message.');
+      seen.add(state.turnCursor); await loadOlderTurns();
+      if (!current()) return;
+    }
+    const record = find();
+    if (!record) throw new Error('This pinned message is no longer in the conversation. You can unpin it.');
+    record.element.tabIndex = -1; record.element.focus({ preventScroll: true });
+    setTimelineFollowing(false, record.element);
+    $('timeline').scrollTop += record.element.getBoundingClientRect().top - $('timeline').getBoundingClientRect().top - 12;
+    record.element.classList.add('pinned-target');
+    setTimeout(() => record.element.classList.remove('pinned-target'), 1800);
+  } catch (error) { if (current()) throw error; }
+  finally { if (pinnedMessages.jumping === operation) { pinnedMessages.jumping = null; renderMessagePins(); } }
 }
 function renderThreads() {
   const focusedThread = $('threads').contains(document.activeElement) ? document.activeElement.closest('.thread')?.dataset.threadId : null;
@@ -445,7 +548,7 @@ function renderThreads() {
     pin.setAttribute('aria-label', `${pin.title}: ${titleOf(thread)}`);
     pin.setAttribute('aria-pressed', String(isPinned));
     pin.disabled = !state.connected || state.pinning.has(thread.id) || state.archiving?.threadId === thread.id;
-    pin.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 9V3H8v6l-3 3v2h14v-2l-3-3M12 14v7"/></svg>';
+    pin.innerHTML = pinIcon;
     pin.onclick = () => togglePin(thread).catch(showError);
     container.append(button, pin);
     target.append(container);
@@ -723,6 +826,8 @@ async function loadThreads(more = false, projectId = null) {
   updateSettingsActions();
 }
 function resetThread(folder) {
+  setTimelineFollowing(true);
+  pinnedMessages.jumping = null; state.olderHistory = null; $('older-turns').disabled = false;
   saveComposerDraft(); drafts.target = null;
   clearQueueDrag();
   imageLoads.clear(); $('image-preview-dialog').close();
@@ -771,6 +876,8 @@ function setThread(thread) {
 }
 async function openThread(thread, allowBusy = false) {
   if (!state.connected || state.sending || state.commandBusy && !allowBusy) return;
+  setTimelineFollowing(true);
+  pinnedMessages.jumping = null; state.olderHistory = null; $('older-turns').disabled = false;
   if (state.thread?.id !== thread.id) { saveComposerDraft(); drafts.target = null; }
   const selection = ++state.selection;
   imageLoads.clear(); $('image-preview-dialog').close();
@@ -845,7 +952,7 @@ function messageImage(source, alt = 'Image') {
     image.onclick = event => { event.preventDefault(); $('image-preview').src = url; $('image-preview').alt = alt; $('image-preview-title').textContent = alt; $('image-preview-dialog').showModal(); };
     image.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); image.click(); } };
     figure.replaceChildren(image);
-    if (atBottom && figure.isConnected) scrollToBottom(true);
+    if (atBottom && figure.isConnected) scrollToBottom();
   })().catch(error => { if (options === state.options) { caption.textContent = `Could not load image: ${error.message}`; figure.replaceChildren(caption); } });
   figure.imageReady = ready;
   return figure;
@@ -898,11 +1005,22 @@ function diffWordRanges(before, after) {
 }
 function renderDiff(patch) {
   let inHunk = false;
+  let oldLine = 0, newLine = 0;
   const rows = patch.split('\n').map(line => {
     if (line.startsWith('diff --git ')) inHunk = false;
-    if (line.startsWith('@@')) inHunk = true;
+    const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (line.startsWith('@@')) {
+      inHunk = Boolean(header);
+      if (header) { oldLine = Number(header[1]); newLine = Number(header[2]); }
+    }
     const kind = line.startsWith('@@') ? 'diff-hunk' : line.startsWith('+') && (inHunk || !line.startsWith('+++')) ? 'diff-added' : line.startsWith('-') && (inHunk || !line.startsWith('---')) ? 'diff-removed' : '';
-    return { line, kind, ranges: [] };
+    let oldNumber = '', newNumber = '';
+    if (inHunk && !header) {
+      if (line.startsWith(' ')) { oldNumber = oldLine++; newNumber = newLine++; }
+      else if (kind === 'diff-removed') oldNumber = oldLine++;
+      else if (kind === 'diff-added') newNumber = newLine++;
+    }
+    return { line, kind, oldNumber, newNumber, metadata: !inHunk && !kind, ranges: [] };
   });
   for (let index = 0; patch.length <= 180000 && index < rows.length;) {
     if (rows[index].kind !== 'diff-removed') { index++; continue; }
@@ -916,8 +1034,11 @@ function renderDiff(patch) {
     }
   }
   const pre = document.createElement('pre');
-  for (const { line, kind, ranges } of rows) {
-    const span = document.createElement('span'); span.className = kind;
+  pre.classList.toggle('has-hunks', rows.some(row => row.kind === 'diff-hunk'));
+  for (const { line, kind, ranges, oldNumber, newNumber, metadata } of rows) {
+    const span = document.createElement('span'); span.className = 'diff-line' + (kind ? ' ' + kind : '') + (metadata ? ' diff-metadata' : '');
+    span.dataset.oldLine = String(oldNumber); span.dataset.newLine = String(newNumber);
+    if (kind === 'diff-hunk') { span.title = line; span.setAttribute('aria-label', line); }
     let offset = 0;
     for (const range of ranges) {
       span.append(document.createTextNode(line.slice(offset, range.start + 1)));
@@ -1016,7 +1137,11 @@ function renderFileSummary(turnId) {
     if (!entry) {
       entry = document.createElement('details'); entry.className = 'changed-file-entry'; entry.dataset.fileId = file.id;
       const summary = document.createElement('summary'); summary.className = 'changed-file'; entry.append(summary);
-      entry.ontoggle = () => { if (entry.open) updateFileDiff(entry, context); };
+      entry.ontoggle = () => {
+        if (!entry.isConnected) return;
+        if (entry.open) { setTimelineFollowing(false, entry); updateFileDiff(entry, context); }
+        else if (timelineView.reading === entry) timelineView.reading = null;
+      };
     }
     entry.file = file; entry.dataset.path = file.path;
     const fileSummary = entry.firstElementChild; fileSummary.title = file.path;
@@ -1035,6 +1160,8 @@ function renderFileSummary(turnId) {
 }
 function renderItem(item, prepend = false, turnId = null) {
   if (!item?.id) return;
+  const anchor = timelineView.reading;
+  const anchorTop = anchor?.isConnected && anchor.checkVisibility() ? anchor.getBoundingClientRect().top : null;
   let record = state.items.get(item.id);
   const isMessage = ['userMessage', 'agentMessage', 'plan', 'exitedReviewMode', 'imageView', 'imageGeneration'].includes(item.type);
   if (!isMessage && !['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'reasoning', 'webSearch', 'collabAgentToolCall', 'functionCallOutput'].includes(item.type)) return;
@@ -1069,8 +1196,8 @@ function renderItem(item, prepend = false, turnId = null) {
   if (turnId) { record.turnId = turnId; record.element.dataset.turnId = turnId; }
   item = record.item;
   if (item.type === 'userMessage') {
-    record.label.textContent = 'You';
-    if (record.turnId) {
+    if (record.label.dataset.type !== item.type) { record.label.textContent = 'You'; record.label.dataset.type = item.type; }
+    if (record.turnId && !record.label.querySelector('.edit-message')) {
       const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'edit-message'; edit.textContent = 'Edit & resend';
       edit.dataset.turnId = record.turnId;
       edit.onclick = () => openMessageEdit(record);
@@ -1082,10 +1209,12 @@ function renderItem(item, prepend = false, turnId = null) {
       else if (part.type === 'image' || part.type === 'localImage') record.body.append(messageImage(part.url || part.path, 'Attached image'));
     }
   } else if (isMessage) {
-    record.label.replaceChildren();
-    const mark = document.createElement('span');
-    mark.className = 'mini-mark'; mark.textContent = '›_';
-    record.label.append(mark, document.createTextNode(item.type === 'plan' ? 'Plan' : 'Codex'));
+    if (record.label.dataset.type !== item.type) {
+      record.label.replaceChildren(); record.label.dataset.type = item.type;
+      const mark = document.createElement('span');
+      mark.className = 'mini-mark'; mark.textContent = '›_';
+      record.label.append(mark, document.createTextNode(item.type === 'plan' ? 'Plan' : 'Codex'));
+    }
     if (item.type === 'imageView' || item.type === 'imageGeneration') {
       record.body.replaceChildren();
       const source = item.path || item.savedPath || (item.result ? `data:image/png;base64,${item.result}` : null);
@@ -1116,11 +1245,25 @@ function renderItem(item, prepend = false, turnId = null) {
       record.hasImages = true;
     }
   }
+  if (isMessage && record.turnId) {
+    if (!record.pinButton) {
+      record.pinButton = document.createElement('button'); record.pinButton.type = 'button'; record.pinButton.className = 'message-pin'; record.pinButton.innerHTML = pinIcon;
+      record.pinButton.onclick = () => {
+        if (state.items.get(record.item.id) !== record) return;
+        const preview = `${record.item.type === 'userMessage' ? 'You' : 'Codex'}: ${record.body.textContent.trim().replace(/\s+/g, ' ') || 'Image'}`.slice(0, 200);
+        return saveMessagePin({ itemId: record.item.id, turnId: record.turnId, preview }, !currentMessagePins().some(pin => pin.itemId === record.item.id)).catch(showError);
+      };
+    }
+    if (record.pinButton.parentNode !== record.label) record.label.append(record.pinButton);
+    updateMessagePinButton(record);
+  }
   if (record.group) record.group.firstElementChild.textContent = record.group.lastElementChild.lastElementChild.firstElementChild.textContent;
   if (item.type === 'fileChange') renderFileSummary(record.turnId);
   const card = [...$('messages').querySelectorAll('.changed-files')].find(element => element.dataset.turnId === record.turnId);
   const last = [...$('messages').children].findLast(element => element !== card && element.dataset.turnId === record.turnId);
-  if (card && last && last.nextElementSibling !== card) moveDiffElement($('messages'), card, last.nextElementSibling);
+  const expanded = card?.open && card.querySelector('.changed-file-entry[open]');
+  if (card && last && last.nextElementSibling !== card && !expanded) moveDiffElement($('messages'), card, last.nextElementSibling);
+  if (anchorTop !== null && anchor.isConnected && anchor.checkVisibility()) $('timeline').scrollTop += anchor.getBoundingClientRect().top - anchorTop;
   return record;
 }
 
@@ -1438,6 +1581,7 @@ function renderQueue() {
     row.lastChild.setAttribute('aria-label', 'Remove queued message');
     $('queued-messages').append(row);
   }
+  if (state.thread && !state.loading) scrollToBottom();
 }
 function queueLocked(queue) { return Boolean(queue?.dragging || queue?.reordering); }
 function clearQueueDrag(resume = true) {
@@ -1526,7 +1670,7 @@ async function submitMessage(message, steer = false) {
   trace('message.dispatch', { machine: message.machine, threadId: message.thread.id, turnId, steer, owned: state.owned.has(message.thread.id) });
   const visible = () => accessKey() === message.machine && state.thread?.id === message.thread.id;
   const temporary = 'pending-' + crypto.randomUUID();
-  if (visible()) { renderItem({ type: 'userMessage', id: temporary, content: message.input }); scrollToBottom(true); }
+  if (visible()) { renderItem({ type: 'userMessage', id: temporary, content: message.input }); scrollToBottom(); }
   try {
     if (!state.owned.has(message.thread.id)) await ensureWritable(message.thread.id);
     if (steer) await rpc('turn/steer', { threadId: message.thread.id, input: message.input, expectedTurnId: turnId });
@@ -1712,26 +1856,46 @@ async function send(event, steer = false, action = null) {
 }
 function applyName(threadId, name) {
   if (typeof name !== 'string' || !name.trim()) return;
+  clearTitleRetry(threadId);
   state.names.set(threadId, name);
   for (const thread of [...state.threads, ...state.pinnedThreads.values(), ...(state.thread ? [state.thread] : [])]) if (thread.id === threadId) thread.name = name;
   if (state.thread?.id === threadId) $('thread-title').textContent = name;
   renderThreads();
 }
+function clearTitleRetry(threadId) {
+  clearTimeout(state.titleRetries.get(threadId)?.timer);
+  state.titleRetries.delete(threadId);
+  if (state.titleError?.threadId === threadId && state.titleError.options === state.options) {
+    state.titleError = null; $('error').hidden = true;
+  }
+}
 function requestTitle(thread) {
-  if (!api.title || !thread.preview?.trim() || thread.name || state.names.has(thread.id) || state.titling.has(thread.id) || state.newThreads.has(thread.id) || state.titleFailed) return;
+  if (!api.title || !state.connected || !thread.preview?.trim() || thread.name || state.names.has(thread.id) || state.titling.has(thread.id) || state.newThreads.has(thread.id) || state.archiving?.threadId === thread.id || Date.now() < (state.titleRetries.get(thread.id)?.after || 0)) return;
   const options = state.options;
-  state.titling.add(thread.id);
+  const operation = {};
+  state.titling.set(thread.id, operation);
+  const current = () => state.options === options && state.titling.get(thread.id) === operation;
   state.titleTask = state.titleTask.catch(() => {}).then(async () => {
-    if (state.options !== options || state.titleFailed) return;
     try {
+      if (!current() || !state.connected) return;
       const name = await api.title(thread.id, thread.preview.slice(0, 4000));
-      if (state.options === options) {
-        if (name && !state.names.has(thread.id)) applyName(thread.id, name);
-        else if (!name) state.titling.delete(thread.id);
+      if (current() && name && !state.names.has(thread.id)) {
+        applyName(thread.id, name);
+        trace('title.completed', { threadId: thread.id });
       }
     } catch (error) {
-      if (state.options === options) { state.titleFailed = true; showError(error); }
-    }
+      if (current() && state.connected && !state.names.has(thread.id)) {
+        const count = (state.titleRetries.get(thread.id)?.count || 0) + 1;
+        const retry = { count, after: Date.now() + 60000 };
+        clearTitleRetry(thread.id); state.titleRetries.set(thread.id, retry);
+        if (count <= 2) retry.timer = setTimeout(() => {
+          if (state.options === options && state.titleRetries.get(thread.id) === retry) requestTitle(thread);
+        }, 60000);
+        trace('title.failed', { threadId: thread.id, error: error.message, count });
+        showError(error);
+        state.titleError = { threadId: thread.id, options };
+      }
+    } finally { if (current()) state.titling.delete(thread.id); }
   });
 }
 function showThreadMenu(thread, x, y) {
@@ -1759,6 +1923,7 @@ async function archiveConversation(thread) {
   try {
     await rpc('thread/archive', { threadId: thread.id });
     if (state.archiving !== operation || state.options !== operation.options) return;
+    state.titling.delete(thread.id); clearTitleRetry(thread.id);
     state.listGeneration++;
     state.threads = state.threads.filter(entry => entry.id !== thread.id);
     state.pinnedIds.delete(thread.id); state.pinnedThreads.delete(thread.id);
@@ -1895,7 +2060,8 @@ async function connect(options) {
   try { const saved = JSON.parse(localStorage.getItem(accessKey() + ':collapsed-projects') || '[]'); if (Array.isArray(saved)) projects.collapsed = new Set(saved.filter(id => typeof id === 'string')); } catch {}
   $('project-dialog').close(); state.projectDraft = null; $('move-project-dialog').close(); $('project-view-dialog').close();
   state.owned.clear(); state.resuming.clear();
-  state.names.clear(); state.titling.clear(); state.newThreads.clear(); state.titleFailed = false;
+  for (const threadId of state.titleRetries.keys()) clearTitleRetry(threadId);
+  state.names.clear(); state.titling.clear(); state.newThreads.clear();
   slash.generation++; slash.skills = []; slash.cwd = null; slash.loading = false; modes.catalog = []; modes.threads.clear();
   $('edit-queue-dialog').close();
   $('thread-menu').hidden = true; $('rename-dialog').close(); $('edit-message-dialog').close();
@@ -1955,6 +2121,7 @@ async function connect(options) {
 function handleNotification(message) {
   if (message.method === 'scheduler/updated') { refreshSchedules().catch(showError); return; }
   const { method, params = {}, id } = message;
+  if (timelineView.following && state.thread && params.threadId === state.thread.id && !state.loading && !timelineAtBottom()) setTimelineFollowing(false);
   const retry = state.retryError;
   const progress = ['turn/completed', 'item/agentMessage/delta', 'item/plan/delta', 'item/reasoning/summaryTextDelta', 'item/reasoning/summaryPartAdded', 'item/reasoning/textDelta'].includes(method)
     || method === 'item/started' && params.item?.type && params.item.type !== 'userMessage'
@@ -2531,19 +2698,24 @@ $('more-threads').onclick = async () => {
 let searchTimer;
 $('search').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => loadThreads().catch(showError), 250); };
 $('send').onclick = event => { if (canStopTurn()) { event.preventDefault(); return stopTurn(); } };
-$('older-turns').onclick = async () => {
+function loadOlderTurns() {
+  if (!state.thread || !state.turnCursor || state.loading) return Promise.resolve();
   const selection = state.selection;
-  const height = $('timeline').scrollHeight;
+  if (state.olderHistory?.selection === selection) return state.olderHistory.promise;
+  const operation = { selection }; state.olderHistory = operation;
   $('older-turns').disabled = true;
-  try {
+  operation.promise = (async () => { try {
     const result = await rpc('thread/turns/list', { threadId: state.thread.id, cursor: state.turnCursor, limit: 25, sortDirection: 'desc', itemsView: 'full' });
     if (selection !== state.selection) return;
+    const height = $('timeline').scrollHeight, top = $('timeline').scrollTop;
     for (const turn of result.data) for (const item of [...(turn.items || [])].reverse()) renderItem(item, true, turn.id);
     state.turnCursor = result.nextCursor;
     $('older-turns').hidden = !result.nextCursor;
-    $('timeline').scrollTop += $('timeline').scrollHeight - height;
-  } catch (error) { showError(error); } finally { $('older-turns').disabled = false; updateBusy(); }
-};
+    $('timeline').scrollTop = top + $('timeline').scrollHeight - height;
+  } finally { if (state.olderHistory === operation) { state.olderHistory = null; $('older-turns').disabled = false; updateBusy(); } } })();
+  return operation.promise;
+}
+$('older-turns').onclick = () => loadOlderTurns().catch(showError);
 document.querySelectorAll('[data-prompt]').forEach(button => { button.onclick = () => { $('prompt').value = button.dataset.prompt; $('prompt').focus(); }; });
 document.addEventListener('keydown', event => { if ((event.metaKey || event.ctrlKey) && event.key === 'n') { event.preventDefault(); if (!state.connecting && !state.sending && !state.commandBusy) resetThread(); } });
 document.addEventListener('keydown', unreadShortcut);
@@ -2559,9 +2731,25 @@ document.addEventListener('keydown', event => {
 globalThis.addEventListener('focus', acknowledgeVisibleThread);
 globalThis.addEventListener('focus', () => { if (usage.timer && state.connected && Date.now() - usage.updatedAt > 60000) refreshUsage(); });
 document.addEventListener('visibilitychange', acknowledgeVisibleThread);
+for (const event of ['online', 'offline']) globalThis.addEventListener(event, () => trace('network.' + event, { connected: state.connected }));
 document.addEventListener('close', acknowledgeVisibleThread, true);
 $('timeline').addEventListener('scroll', acknowledgeVisibleThread);
 $('timeline').addEventListener('pointerdown', acknowledgeVisibleThread);
+function readTimelineDiff(event) {
+  const entry = event.target.closest?.('.changed-file-entry[open]');
+  if (entry) setTimelineFollowing(false, entry);
+  else if (timelineView.reading) setTimelineFollowing(false);
+}
+$('timeline').addEventListener('pointerdown', readTimelineDiff);
+$('timeline').addEventListener('focusin', readTimelineDiff);
+$('timeline').addEventListener('wheel', event => {
+  readTimelineDiff(event);
+  if (event.deltaY < 0 && !timelineView.reading) setTimelineFollowing(false);
+}, { passive: true });
+$('timeline').addEventListener('scroll', () => {
+  if (timelineView.reading || state.loading) return;
+  setTimelineFollowing(timelineAtBottom());
+});
 document.addEventListener('click', event => { if (!event.target.closest('#composer')) hideSlash(); $('thread-menu').hidden = true; $('project-menu').hidden = true; });
 async function openMessageLink(event) {
   const link = event.target.closest('a[href]');
