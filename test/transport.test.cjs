@@ -231,3 +231,73 @@ test('real RPC and notification routing keeps the app awake through parallel tur
   await assert.rejects(f.connection.call('turn/start', { threadId: 'offline' }), /Connect to Codex/);
   assert.deepEqual(stops, [1, 2, 3, 4]); assert.equal(lock.id, null);
 });
+
+test('stderr warnings survive split UTF-8 lines, omit raw text, and have a bounded event rate', async () => {
+  const f = fixture(); const entries = [];
+  f.connection.on('diagnostic', entry => entries.push(entry));
+  await f.connection.connect();
+  const warning = Buffer.from('\x1b[33mWARN\x1b[0m codex_core::responses_retry: timed out PRIVATE_MESSAGE 界\n');
+  f.child.stderr.write(warning.subarray(0, 5));
+  f.child.stderr.write(warning.subarray(5, warning.length - 2));
+  f.child.stderr.write(warning.subarray(warning.length - 2));
+  assert.equal(entries.filter(entry => entry.event === 'process.stderr').length, 1);
+  assert.equal(entries.at(-1).details.reason, 'timeout');
+  f.child.stderr.write('INFO codex_core::client: PRIVATE_MESSAGE\n');
+  assert.equal(entries.filter(entry => entry.event === 'process.stderr').length, 1);
+  f.child.stderr.write(('ERROR codex_core::client: connection reset PRIVATE_TOKEN\n').repeat(30));
+  assert.equal(entries.filter(entry => entry.event === 'process.stderr').length, 20);
+  f.child.stderr.write('x'.repeat(100000));
+  f.child.stderr.end('\nERROR codex_core::client: final warning');
+  await new Promise(resolve => setImmediate(resolve));
+  f.child.emit('close', 1, 'SIGTERM');
+  const exit = entries.find(entry => entry.event === 'process.exited');
+  assert.equal(exit.details.exitCode, 1); assert.equal(exit.details.signal, 'SIGTERM'); assert.equal(exit.details.count, 12);
+  assert.ok(!JSON.stringify(entries).includes('PRIVATE_'));
+  f.child.stderr.emit('data', Buffer.from('ERROR old process: timed out\n'));
+  assert.equal(entries.filter(entry => entry.event === 'process.stderr').length, 20);
+});
+
+test('unterminated stderr warning is classified on EOF', async () => {
+  const f = fixture(); const entries = [];
+  f.connection.on('diagnostic', entry => entries.push(entry));
+  await f.connection.connect();
+  f.child.stderr.end('ERROR codex_core::client: status 429 PRIVATE_MESSAGE');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(entries.at(-1).details.reason, 'rate-limit');
+  assert.ok(!JSON.stringify(entries).includes('PRIVATE_'));
+  f.connection.disconnect();
+});
+
+test('real transport notifications produce quiet and resumed diagnostics without sending recovery commands', async () => {
+  const { TurnDiagnostics, DiagnosticLog } = require('../diagnostics.cjs');
+  const f = fixture(); const entries = [];
+  f.connection.on('diagnostic', entry => entries.push(entry));
+  let now = 0;
+  const turns = new TurnDiagnostics(f.connection, () => now);
+  await f.connection.connect();
+  const pending = f.connection.call('turn/start', { threadId: 'chat', input: [{ type: 'text', text: 'PRIVATE_MESSAGE' }] });
+  const id = f.writes.at(-1).id;
+  f.child.stdout.write(JSON.stringify({ id, result: { turn: { id: 'turn', status: 'inProgress' } } }) + '\n');
+  await pending;
+  const writes = f.writes.length;
+  now = 60000; turns.check();
+  assert.equal(entries.at(-1).event, 'turn.quiet');
+  assert.equal(entries.at(-1).details.phase, 'waiting-for-output');
+  assert.equal(f.writes.length, writes);
+  f.child.stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'chat', turnId: 'turn', delta: 'PRIVATE_REPLY' } }) + '\n');
+  assert.equal(entries.at(-1).event, 'turn.first-output');
+  assert.equal(entries.at(-1).details.firstOutputMs, 60000);
+  f.child.stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'chat', turn: { id: 'turn', status: 'completed' } } }) + '\n');
+  assert.equal(entries.at(-1).event, 'turn.summary');
+  assert.equal(entries.at(-1).details.reason, 'completed');
+  assert.equal(f.writes.length, writes);
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-turn-log-'));
+  try {
+    const log = new DiagnosticLog(directory);
+    for (const entry of entries) log.write(entry.event, entry.details);
+    const text = fs.readFileSync(log.file, 'utf8');
+    assert.ok(!text.includes('PRIVATE_'));
+    assert.match(text, /"firstOutputMs":60000/);
+    assert.match(text, /"idleMs":60000/);
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); f.connection.disconnect(); }
+});

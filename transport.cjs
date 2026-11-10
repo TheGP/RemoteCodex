@@ -5,6 +5,7 @@ const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
 const { version } = require('./package.json');
+const { stderrDiagnostic } = require('./diagnostics.cjs');
 
 function connectionOptions(value = {}) {
   const mode = value.mode ?? 'ssh';
@@ -88,8 +89,31 @@ class CodexConnection extends EventEmitter {
     }
     const child = this.spawnProcess(command, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], ...(env ? { env, cwd } : {}) });
     this.child = child;
+    this.emit('diagnostic', { event: 'process.started', details: { source: options.mode, pid: child.pid } });
     let stderr = '';
-    child.stderr.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-6000); });
+    const stderrDecoder = new StringDecoder('utf8');
+    let stderrLine = '', warningWindow = Date.now(), warningCount = 0, droppedWarnings = 0;
+    const warning = line => {
+      if (this.child !== child) return;
+      const details = stderrDiagnostic(line);
+      if (!details) return;
+      if (Date.now() - warningWindow >= 30000) {
+        if (droppedWarnings) this.emit('diagnostic', { event: 'process.stderr.suppressed', details: { count: droppedWarnings } });
+        warningWindow = Date.now(); warningCount = 0; droppedWarnings = 0;
+      }
+      if (++warningCount <= 20) this.emit('diagnostic', { event: 'process.stderr', details });
+      else droppedWarnings++;
+    };
+    child.stderr.on('data', chunk => {
+      const text = stderrDecoder.write(chunk);
+      stderr = (stderr + text).slice(-6000);
+      const lines = text.split('\n');
+      for (let index = 0; index < lines.length; index++) {
+        stderrLine = (stderrLine + lines[index]).slice(0, 8192);
+        if (index < lines.length - 1) { warning(stderrLine); stderrLine = ''; }
+      }
+    });
+    child.stderr.on('end', () => { warning(stderrLine + stderrDecoder.end()); stderrLine = ''; });
     const fail = error => {
       if (this.child !== child) return;
       this.disconnect();
@@ -97,7 +121,10 @@ class CodexConnection extends EventEmitter {
     };
     child.on('error', fail);
     child.stdin.on('error', fail);
-    child.on('close', code => fail(new Error(stderr.trim() || `${options.mode === 'local' ? 'Local Codex' : 'SSH connection'} closed (${code}).`)));
+    child.on('close', (code, signal) => {
+      if (this.child === child) this.emit('diagnostic', { event: 'process.exited', details: { exitCode: code, signal, count: droppedWarnings } });
+      fail(new Error(stderr.trim() || `${options.mode === 'local' ? 'Local Codex' : 'SSH connection'} closed (${code}).`));
+    });
     const receive = line => {
       if (this.child !== child || !line.trim()) return;
       let message;

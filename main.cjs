@@ -11,7 +11,7 @@ const { readImage } = require('./images.cjs');
 const { openWebLink, openFileLink, parseFileLink } = require('./links.cjs');
 const { generateTitle, titleKey, readThreadForTitle } = require('./titles.cjs');
 const { ScheduleStore, Scheduler } = require('./scheduler.cjs');
-const { DiagnosticLog } = require('./diagnostics.cjs');
+const { DiagnosticLog, TurnDiagnostics } = require('./diagnostics.cjs');
 const { DraftStore, registerDraftIpc } = require('./drafts.cjs');
 const { AgentWakeLock } = require('./wake-lock.cjs');
 
@@ -38,6 +38,10 @@ app.whenReady().then(async () => {
   const diagnostic = new DiagnosticLog(path.join(app.getPath('userData'), 'logs'));
   diagnostic.write('app.started', { version: app.getVersion() });
   connection.on('diagnostic', entry => diagnostic.write(entry.event, entry.details));
+  const turnDiagnostics = new TurnDiagnostics(connection);
+  const diagnosticTimer = setInterval(() => turnDiagnostics.check(), 15000); diagnosticTimer.unref();
+  app.on('before-quit', () => clearInterval(diagnosticTimer));
+  for (const event of ['suspend', 'resume']) powerMonitor.on(event, () => diagnostic.write('power.' + event));
   ipcMain.on('diagnostic', (event, name, details) => {
     try { checkSender(event); diagnostic.write('renderer.' + name, details); }
     catch (error) { diagnostic.write('renderer.log.rejected', { error: error.message }); }
@@ -208,7 +212,7 @@ app.whenReady().then(async () => {
     if (message.method === 'connection/closed') editLocks.clear();
     if (['turn/started', 'turn/completed', 'thread/status/changed', 'error', 'connection/closed'].includes(message.method)) {
       const params = message.params || {};
-      diagnostic.write('native.' + message.method, { threadId: params.threadId, turnId: params.turn?.id, status: params.turn?.status || params.status?.type, willRetry: params.willRetry, error: params.turn?.error?.message || params.error?.message || params.message });
+      diagnostic.write('native.' + message.method, { threadId: params.threadId, turnId: params.turn?.id || params.turnId, status: params.turn?.status || params.status?.type, willRetry: params.willRetry, error: params.turn?.error?.message || params.error?.message || params.message });
     }
     if (message.id !== undefined && !['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput', 'item/permissions/requestApproval', 'mcpServer/elicitation/request'].includes(message.method)) {
       connection.rejectRequest(message.id);
