@@ -7,6 +7,7 @@ const preferences = { theme: 'system', startupProjects: {}, conversationStates: 
 const imageLoads = new Map();
 const linkContexts = new WeakMap();
 const completionSound = { audio: null, lastAt: -Infinity };
+const messageDateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
 const schedules = { tasks: [], generation: 0 };
 const drafts = { target: null, snapshot: null, images: [], suspended: false, restoring: false };
 const timelineView = { following: true, reading: null };
@@ -284,6 +285,7 @@ async function stopTurn() {
 function updateBusy() {
   for (const button of $('shortcut-buttons').children) button.disabled = shortcutUnavailable({ mode: button.dataset.mode });
   const busy = state.owned.has(state.thread?.id) && Boolean(state.active.get(state.thread?.id));
+  const waiting = interactionStatus(state.thread?.id);
   $('writer-notice').hidden = !state.writerConflicts.has(queueKey(state.thread?.id));
   $('activity').hidden = !$('writer-notice').hidden && !busy && !state.sending && !state.loading;
   $('retry-writer').disabled = state.sending || state.loading || !state.connected;
@@ -293,8 +295,9 @@ function updateBusy() {
   $('prompt').disabled = state.loading || state.connecting || drafts.suspended;
   $('prompt').readOnly = state.sending || Boolean(state.commandBusy);
   $('timeline').classList.toggle('loading', state.loading);
-  $('activity').classList.toggle('busy', busy);
-  $('activity').textContent = state.sending ? 'Sending…' : state.loading ? 'Loading conversation…' : busy ? (isLocal() ? 'Codex is working locally…' : 'Codex is working on the server…') : '';
+  $('activity').classList.toggle('busy', busy && !waiting);
+  $('activity').classList.toggle('waiting', Boolean(waiting));
+  $('activity').textContent = state.sending ? 'Sending…' : state.loading ? 'Loading conversation…' : waiting || (busy ? (isLocal() ? 'Codex is working locally…' : 'Codex is working on the server…') : '');
   $('model').disabled = state.loading || busy;
   $('effort').disabled = state.loading || busy;
   $('permissions').disabled = state.loading || busy;
@@ -649,16 +652,22 @@ function startProject(project) {
   projects.collapsed.delete(project.id);
   resetThread();
 }
+function interactionStatus(threadId) {
+  if (!state.connected || !threadId) return null;
+  const request = [...state.requests.values()].find(request => !request.params.threadId || request.params.threadId === threadId);
+  return request ? ['item/tool/requestUserInput', 'mcpServer/elicitation/request'].includes(request.method) ? 'Waiting for your answer' : 'Waiting for your approval' : null;
+}
 function renderThreadIndicators() {
   const threads = new Map([...state.threads, ...state.pinnedThreads.values()].map(thread => [thread.id, thread]));
   for (const button of $('threads').querySelectorAll('.thread')) {
     const threadId = button.dataset.threadId;
     const thread = threads.get(threadId);
-    const working = state.connected && (state.active.has(threadId) || state.dispatching.has(queueKey(threadId)) || thread?.status?.type === 'active');
+    const waiting = interactionStatus(threadId);
+    const working = !waiting && state.connected && (state.active.has(threadId) || state.dispatching.has(queueKey(threadId)) || thread?.status?.type === 'active');
     const completion = state.completions.get(queueKey(threadId));
     const unread = state.unread.has(queueKey(threadId));
     button.classList.toggle('unread', unread);
-    const label = working ? 'Working…' : unread ? 'Unread' : completion === 'completed' ? 'Finished' : completion === 'failed' ? 'Failed' : '';
+    const label = waiting || (working ? 'Working…' : unread ? 'Unread' : completion === 'completed' ? 'Finished' : completion === 'failed' ? 'Failed' : '');
     const scheduled = scheduledFor(threadId);
     let clock = button.querySelector('.thread-schedule');
     const scheduledLabel = scheduled.length ? `${scheduled.length} scheduled message(s); next ${new Date(scheduled[0].runAt).toLocaleString()}` : '';
@@ -679,7 +688,7 @@ function renderThreadIndicators() {
     if (!label) { indicator?.remove(); continue; }
     if (!indicator) { indicator = document.createElement('span'); indicator.setAttribute('role', 'img'); }
     button.prepend(indicator);
-    indicator.className = 'thread-state ' + (working ? 'working' : unread ? 'unread' : completion);
+    indicator.className = 'thread-state ' + (waiting ? 'waiting' : working ? 'working' : unread ? 'unread' : completion);
     indicator.setAttribute('aria-label', label); indicator.title = label;
   }
 }
@@ -751,6 +760,19 @@ function unreadShortcut(event) {
   const plain = !event.metaKey && !event.ctrlKey && !typing && focused?.dataset.threadId === state.thread?.id;
   if (!(modified || plain) || event.altKey || event.isComposing || event.key?.toLowerCase() !== 'u' || document.querySelector('dialog[open]') || !state.thread || state.loading) return;
   event.preventDefault(); markUnread(state.thread);
+}
+function conversationArrow(event) {
+  if (event.defaultPrevented || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || !['ArrowUp', 'ArrowDown'].includes(event.key) || document.querySelector('dialog[open]')) return;
+  const focused = event.target.closest?.('.thread');
+  if (!focused || !state.connected || state.connecting || state.sending || state.commandBusy) return;
+  const rows = [...$('threads').querySelectorAll('.thread')].filter(button => !button.disabled && button.checkVisibility());
+  const index = rows.indexOf(focused);
+  if (index < 0) return;
+  event.preventDefault();
+  const next = rows[index + (event.key === 'ArrowDown' ? 1 : -1)];
+  if (!next) return;
+  next.scrollIntoView({ block: 'nearest' });
+  return next.onclick();
 }
 function setThreadRuntimeStatus(threadId, status) {
   for (const thread of [...state.threads, ...state.pinnedThreads.values(), ...(state.thread ? [state.thread] : [])]) if (thread.id === threadId) thread.status = status;
@@ -1131,16 +1153,32 @@ function renderFileSummary(turnId) {
   const entries = new Map([...rows.children].map(entry => [entry.dataset.fileId, entry]));
   let next = rows.firstElementChild;
   const context = { machine: accessKey(), cwd: state.thread?.cwd || $('workspace').value };
+  const updateToggleTitle = () => { card.firstElementChild.title = card.querySelector('.changed-file-entry:not([open])') ? 'Expand all file diffs' : 'Collapse all file diffs'; };
+  card.firstElementChild.onclick = event => {
+    event.preventDefault();
+    const entries = [...rows.children];
+    const expand = !card.open || entries.some(entry => !entry.open);
+    card.open = true; card.expandAll = expand;
+    for (const entry of entries) {
+      entry.open = expand;
+      if (expand) updateFileDiff(entry, context);
+    }
+    setTimelineFollowing(false, expand ? card : null);
+    updateToggleTitle();
+  };
   for (const file of files.values()) {
     let entry = entries.get(file.id);
     entries.delete(file.id);
     if (!entry) {
       entry = document.createElement('details'); entry.className = 'changed-file-entry'; entry.dataset.fileId = file.id;
       const summary = document.createElement('summary'); summary.className = 'changed-file'; entry.append(summary);
+      summary.onclick = () => { card.expandAll = false; };
+      entry.open = Boolean(card.expandAll);
       entry.ontoggle = () => {
         if (!entry.isConnected) return;
-        if (entry.open) { setTimelineFollowing(false, entry); updateFileDiff(entry, context); }
+        if (entry.open) { setTimelineFollowing(false, card.expandAll ? card : entry); updateFileDiff(entry, context); }
         else if (timelineView.reading === entry) timelineView.reading = null;
+        updateToggleTitle();
       };
     }
     entry.file = file; entry.dataset.path = file.path;
@@ -1157,6 +1195,7 @@ function renderFileSummary(turnId) {
     if (entry.open) updateFileDiff(entry, context);
   }
   for (const entry of entries.values()) entry.remove();
+  updateToggleTitle();
 }
 function renderItem(item, prepend = false, turnId = null) {
   if (!item?.id) return;
@@ -1244,6 +1283,18 @@ function renderItem(item, prepend = false, turnId = null) {
       record.group.open = true;
       record.hasImages = true;
     }
+  }
+  if (isMessage) {
+    record.startedAtMs = item.startedAtMs ?? record.startedAtMs;
+    record.completedAtMs = item.completedAtMs ?? record.completedAtMs;
+    const timestamp = record.startedAtMs ?? record.completedAtMs;
+    const date = typeof timestamp === 'number' && timestamp > 0 ? new Date(timestamp) : null;
+    if (!record.time) { record.time = document.createElement('time'); record.time.className = 'message-time'; }
+    if (date && Number.isFinite(date.getTime())) {
+      record.time.dateTime = date.toISOString(); record.time.textContent = messageDateFormat.format(date);
+    } else { record.time.removeAttribute('datetime'); record.time.textContent = 'Time unavailable'; }
+    record.element.removeAttribute('title');
+    if (record.time.parentNode !== record.label) record.label.insertBefore(record.time, record.label.querySelector('.edit-message,.message-pin'));
   }
   if (isMessage && record.turnId) {
     if (!record.pinButton) {
@@ -2157,7 +2208,11 @@ function handleNotification(message) {
   }
   if (id !== undefined) {
     const supported = ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput', 'item/permissions/requestApproval', 'mcpServer/elicitation/request'];
-    if (supported.includes(method)) { state.requests.set(id, message); renderRequests(); }
+    if (supported.includes(method)) {
+      const fresh = !state.requests.has(id);
+      state.requests.set(id, message); renderRequests();
+      if (fresh && state.connected) playCompletionSound();
+    }
     else { api.respond(id, {}).catch(showError); showError(`Codex requested an unsupported interaction: ${method}`); }
     return;
   }
@@ -2206,7 +2261,7 @@ function handleNotification(message) {
     if (params.item.type === 'userMessage') {
       for (const [key, record] of state.items) if (key.startsWith('pending-')) { record.element.remove(); state.items.delete(key); }
     }
-    renderItem(params.item, false, params.turnId);
+    renderItem({ ...params.item, startedAtMs: params.item.startedAtMs ?? params.startedAtMs, completedAtMs: params.item.completedAtMs ?? params.completedAtMs }, false, params.turnId);
     updateBusy();
   }
   if (method === 'item/agentMessage/delta' || method === 'item/plan/delta') {
@@ -2292,6 +2347,7 @@ function renderRequests() {
     state.requestCards.set(id, card);
   }
   $('requests').hidden = ![...state.requestCards.values()].some(card => !card.hidden);
+  updateBusy();
 }
 async function browseFolders(path) {
   const generation = ++state.folderGeneration;
@@ -2719,6 +2775,7 @@ $('older-turns').onclick = () => loadOlderTurns().catch(showError);
 document.querySelectorAll('[data-prompt]').forEach(button => { button.onclick = () => { $('prompt').value = button.dataset.prompt; $('prompt').focus(); }; });
 document.addEventListener('keydown', event => { if ((event.metaKey || event.ctrlKey) && event.key === 'n') { event.preventDefault(); if (!state.connecting && !state.sending && !state.commandBusy) resetThread(); } });
 document.addEventListener('keydown', unreadShortcut);
+$('threads').addEventListener('keydown', conversationArrow);
 document.addEventListener('keydown', event => {
   if (event.key !== 'Enter' || event.shiftKey || event.altKey || event.isComposing || event.keyCode === 229) return;
   const editor = event.target?.closest?.('dialog[open] textarea');

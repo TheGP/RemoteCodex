@@ -191,6 +191,56 @@ async function checks() {
   check($('requests').hidden && !state.requestCards.size, 'Resolved requests remain visible');
   results.push('approval inputs and focus survive new requests and chat switches');
 
+  {
+    const previousAudio = completionSound.audio, previousLastAt = completionSound.lastAt, previousPreference = preferences.completionSound;
+    const previousRespond = api.respond, previousThreads = state.threads, previousVolume = $('completion-volume').value;
+    const owned = state.owned.has(thread.id);
+    let chimes = 0;
+    completionSound.audio = { pause() {}, currentTime: 0, play: async () => { chimes++; } };
+    preferences.completionSound = true; $('completion-volume').value = '50'; completionSound.lastAt = -Infinity;
+    state.threads = [thread, { id: 'waiting-background', cwd: '/tmp', name: 'Background question' }]; renderThreads();
+    state.owned.add(thread.id); state.active.set(thread.id, 'waiting-turn'); updateBusy();
+    const question = { id: 'waiting-question', method: 'item/tool/requestUserInput', params: { threadId: thread.id, turnId: 'waiting-turn', questions: [{ id: 'answer', question: 'Where should it go?' }] } };
+    const indicator = id => [...$('threads').querySelectorAll('.thread')].find(row => row.dataset.threadId === id)?.querySelector('.thread-state');
+    handleNotification(question);
+    check(chimes === 1 && $('activity').textContent === 'Waiting for your answer' && !$('activity').classList.contains('busy') && indicator(thread.id)?.classList.contains('waiting') && getComputedStyle(indicator(thread.id)).animationName === 'none', 'A question did not chime or replace the running indicators with a waiting state');
+    check(state.active.get(thread.id) === 'waiting-turn' && !state.finished.has('waiting-turn') && $('send').textContent === '■', 'Waiting for an answer finished the turn or removed the Stop control');
+    const queued = { key: queueKey(thread.id), machine: accessKey(), thread, messages: [{ text: 'Follow-up' }], paused: false };
+    state.queues.set(queued.key, queued); await flushQueue(thread.id);
+    check(queued.messages.length === 1 && !queued.paused, 'A question dispatched or unnecessarily paused the following message');
+    completionSound.lastAt = -Infinity; handleNotification(question);
+    check(chimes === 1, 'A duplicate question replayed its sound');
+    const backgroundQuestion = { ...question, id: 'waiting-background-question', params: { ...question.params, threadId: 'waiting-background' } };
+    handleNotification(backgroundQuestion);
+    check(chimes === 2 && indicator('waiting-background')?.classList.contains('waiting') && state.requestCards.size === 1, 'A background question did not notify without opening another chat');
+    setThread(state.threads[1]);
+    check($('activity').textContent === 'Waiting for your answer' && !state.requestCards.get(backgroundQuestion.id).hidden && chimes === 2, 'Opening a background question hid its waiting state or repeated the chime');
+    setThread(thread);
+
+    handleNotification({ method: 'serverRequest/resolved', params: { requestId: backgroundQuestion.id } });
+    check(!indicator('waiting-background') && indicator(thread.id)?.classList.contains('waiting'), 'Resolving another chat changed this question or left a waiting marker');
+    const answerCard = state.requestCards.get(question.id); answerCard.querySelector('input').value = 'Inside settings';
+    api.respond = async () => { throw new Error('Answer delivery failed'); };
+    await answerCard.querySelector('button').onclick();
+    check(state.requests.has(question.id) && $('activity').textContent === 'Waiting for your answer' && !answerCard.querySelector('button').disabled, 'A failed answer lost the waiting state or could not be retried');
+    api.respond = async () => {};
+    await answerCard.querySelector('button').onclick();
+    check(!state.requests.has(question.id) && $('activity').classList.contains('busy') && indicator(thread.id)?.classList.contains('working') && chimes === 2 && queued.messages.length === 1, 'Answering failed to resume the running indicators, replayed sound, or sent queued work early');
+    completionSound.lastAt = -Infinity;
+    handleNotification({ id: 'waiting-approval', method: 'item/commandExecution/requestApproval', params: { threadId: thread.id, command: 'pwd' } });
+    check(chimes === 3 && $('activity').textContent === 'Waiting for your approval' && indicator(thread.id)?.classList.contains('waiting'), 'Approval requests still looked busy or did not notify');
+    handleNotification({ method: 'serverRequest/resolved', params: { requestId: 'waiting-approval' } });
+    preferences.completionSound = false; completionSound.lastAt = -Infinity;
+    handleNotification({ ...question, id: 'waiting-muted' });
+    check(chimes === 3 && indicator(thread.id)?.classList.contains('waiting'), 'Muted questions played sound or failed to show their waiting marker');
+    handleNotification({ method: 'serverRequest/resolved', params: { requestId: 'waiting-muted' } });
+    state.active.delete(thread.id); if (!owned) state.owned.delete(thread.id); state.queues.delete(queued.key);
+    state.threads = previousThreads; api.respond = previousRespond; $('error').hidden = true;
+    completionSound.audio = previousAudio; completionSound.lastAt = previousLastAt; preferences.completionSound = previousPreference; $('completion-volume').value = previousVolume;
+    renderThreads(); updateBusy();
+  }
+  results.push('questions and approvals chime once, show waiting indicators across chats, preserve Stop and queued turns, recover failed answers, respect muting, and resume after responses');
+
   resetThread();
   $('workspace').value = '/root';
   const calls = [];
@@ -2494,6 +2544,43 @@ async function checks() {
   resetThread(); check(!$('messages').querySelector('.changed-files,.changed-file-diff'), 'File summaries or diffs leaked into a different chat');
   if (summaryOpenLink) api.openLink = summaryOpenLink; else delete api.openLink;
   results.push('changed-file summaries expand diffs inline on demand, support multiple files, preserve expansion and fresh code across edits, keep safe HTML and editor context, paginate, and clear on switching chats');
+  {
+    state.thread = { id: 'bulk-diff-chat', cwd: '/work/project' }; $('welcome').hidden = true;
+    const bulkTurn = 'bulk-diff-turn';
+    const patch = (id, path) => ({ id, type: 'fileChange', status: 'completed', changes: [{ path: '/work/project/' + path, kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-old\n+new' }] });
+    for (const [index, file] of ['first.ts', 'second.ts', 'third.ts'].entries()) renderItem(patch('bulk-' + index, file), false, bulkTurn);
+    const card = $('messages').querySelector('.changed-files'); const header = card.firstElementChild;
+    const toggleAll = async () => {
+      const expand = !card.open || [...card.lastElementChild.children].some(entry => !entry.open);
+      const toggled = [...card.lastElementChild.children].filter(entry => entry.open !== expand).map(entry => new Promise(resolve => entry.addEventListener('toggle', resolve, { once: true })));
+      header.click(); await Promise.all(toggled);
+    };
+    const entries = [...card.querySelectorAll('.changed-file-entry')];
+    header.focus({ preventScroll: true });
+    await toggleAll();
+    const panes = entries.map(entry => entry.querySelector('.changed-file-diff'));
+    check(card.open && entries.every(entry => entry.open && entry.querySelector('.changed-file-diff').checkVisibility()) && document.activeElement === header && timelineView.reading === card, 'The file-count header did not open all three diffs while keeping focus and a stable reading anchor');
+    await toggleAll();
+    check(card.open && entries.every(entry => !entry.open && entry.firstElementChild.checkVisibility()) && !card.querySelector('.changed-file-entry[open]'), 'The second header click did not close every diff while keeping filenames visible');
+    await toggleAll();
+    check(entries.every((entry, index) => entry.querySelector('.changed-file-diff') === panes[index]), 'Bulk toggling rebuilt existing diff panes');
+    await toggleFile(entries[0]); await toggleAll();
+    check(entries.every(entry => entry.open), 'A header click in a mixed state failed to expand every file');
+    renderItem(patch('bulk-live-fourth', 'fourth.ts'), false, bulkTurn);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    check(card.querySelectorAll('.changed-file-entry[open]').length === 4 && entries.every((entry, index) => entry.querySelector('.changed-file-diff') === panes[index]) && timelineView.reading === card, 'An incoming file broke expand-all mode, rebuilt panes, or moved the reading anchor');
+    await toggleFile(entries[0]);
+    renderItem(patch('bulk-live-fifth', 'fifth.ts'), false, bulkTurn);
+    check(!card.lastElementChild.lastElementChild.open && !entries[0].open && entries[1].open, 'New file updates overrode individually chosen expansion after leaving expand-all mode');
+    renderItem(patch('bulk-other-turn', 'other.ts'), false, 'separate-bulk-turn');
+    const otherCard = $('messages').querySelector('.changed-files[data-turn-id="separate-bulk-turn"]');
+    await toggleAll();
+    check(card.querySelectorAll('.changed-file-entry[open]').length === 5 && !otherCard.querySelector('.changed-file-entry').open, 'Bulk expansion affected another turn’s files');
+    await toggleAll();
+    check(!card.querySelector('.changed-file-entry[open]') && header.title === 'Expand all file diffs', 'Bulk collapse left a file open or a stale action tooltip');
+    resetThread();
+  }
+  results.push('the file-count header expands/collapses every diff together, handles mixed states and incoming files, preserves panes/focus/scroll anchoring, and keeps other turns independent');
   state.thread = { id: 'diff-reuse-chat', cwd: '/work/project' }; $('welcome').hidden = true;
   const reuseTurn = 'diff-reuse-turn';
   const appliedPatch = (id, path, diff, movePath) => ({ id, type: 'fileChange', status: 'completed', changes: [{ path, kind: { type: 'update', ...(movePath ? { move_path: movePath } : {}) }, diff }] });
@@ -2762,6 +2849,112 @@ async function checks() {
   state.options = pinOptions; $('error').hidden = true; resetThread();
   results.push('message pins persist per conversation and machine in a compact fixed row, navigate older history on demand, stay anchored during streaming, preserve focus, and handle failed saves, missing messages, and navigation races');
   }
+  {
+    const previousRpc = api.rpc, previousOptions = state.options;
+    resetThread(); state.connected = true; state.options = { mode: 'local' }; state.active.clear(); state.queues.clear();
+    const a = { id: 'arrow-pinned', name: 'Pinned conversation', cwd: '/tmp', projectId: 'arrow-project' };
+    const b = { id: 'arrow-next', name: 'Next conversation', cwd: '/tmp', projectId: 'arrow-project' };
+    const hidden = { id: 'arrow-hidden', name: 'Collapsed conversation', cwd: '/tmp', projectId: 'arrow-collapsed' };
+    const other = { id: 'arrow-other', name: 'Other conversation', cwd: '/tmp' };
+    const tail = Array.from({ length: 20 }, (_, index) => ({ id: 'arrow-tail-' + index, name: 'Tail ' + index, cwd: '/tmp' }));
+    const all = [a, b, hidden, other, ...tail];
+    state.threads = all; state.pinnedIds = new Set([a.id]); state.pinnedThreads = new Map([[a.id, a]]);
+    projects.data = [{ id: 'arrow-project', name: 'Visible project', roots: [{ path: '/tmp' }] }, { id: 'arrow-collapsed', name: 'Collapsed project', roots: [{ path: '/tmp' }] }];
+    projects.collapsed.clear(); projects.collapsed.add('arrow-collapsed');
+    const calls = [];
+    const read = async (method, params) => {
+      calls.push({ method, params });
+      if (method === 'thread/read') return { thread: all.find(thread => thread.id === params.threadId) };
+      return { data: [{ id: 'arrow-history-' + params.threadId, status: 'completed', items: [{ id: 'arrow-message-' + params.threadId, type: 'agentMessage', text: params.threadId }] }], nextCursor: null };
+    };
+    api.rpc = read;
+    const row = thread => $('threads').querySelector(`[data-thread-id="${thread.id}"]`);
+    const key = async (name, modifiers = {}, target = document.activeElement) => {
+      const event = new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...modifiers });
+      target.dispatchEvent(event); await settle(); return event;
+    };
+    renderThreads(); await row(a).onclick();
+    const firstCalls = calls.length;
+    check((await key('ArrowUp')).defaultPrevented && state.thread.id === a.id && calls.length === firstCalls, 'ArrowUp wrapped or reloaded the first conversation');
+    check((await key('ArrowDown')).defaultPrevented && state.thread.id === b.id && document.activeElement === row(b), 'ArrowDown did not open and focus the next visible chat');
+    await key('ArrowUp'); check(state.thread.id === a.id, 'ArrowUp did not navigate back through pinned conversations');
+    await key('ArrowDown'); await key('ArrowDown');
+    check(state.thread.id === other.id && document.activeElement === row(other) && !row(hidden).checkVisibility(), 'Arrow navigation entered a collapsed project or stopped at a project heading');
+    renderThreads(); await key('ArrowUp');
+    check(state.thread.id === b.id && (await key('u')).defaultPrevented && state.unread.has(queueKey(b.id)), 'Refreshing or arrow navigation broke sidebar focus or the unread shortcut');
+    setUnread(b.id, false);
+    for (const input of [$('prompt'), $('search'), $('model')]) {
+      input.focus();
+      check(!(await key('ArrowDown')).defaultPrevented && state.thread.id === b.id, 'Sidebar arrows intercepted prompt, search, or select keys');
+    }
+    row(b).focus();
+    for (const modifiers of [{ metaKey: true }, { ctrlKey: true }, { altKey: true }, { shiftKey: true }, { isComposing: true }]) check(!(await key('ArrowDown', modifiers)).defaultPrevented && state.thread.id === b.id, 'Sidebar navigation intercepted a modified or composition key');
+    $('rename-dialog').showModal();
+    check(!(await key('ArrowDown', {}, row(b))).defaultPrevented && state.thread.id === b.id, 'Arrow navigation ran behind an open dialog');
+    $('rename-dialog').close(); await settle(); row(b).focus();
+    state.sending = true; await key('ArrowDown'); state.sending = false;
+    check(state.thread.id === b.id && document.activeElement === row(b), 'Arrow navigation changed chats during message submission');
+    let finishOlderSelection;
+    api.rpc = (method, params) => method === 'thread/read' && params.threadId === other.id ? new Promise(resolve => { finishOlderSelection = () => resolve({ thread: other }); }) : read(method, params);
+    state.active.set('arrow-background-task', 'keep-running');
+    await key('ArrowDown');
+    check(state.loading && document.activeElement === row(other), 'Arrow navigation did not focus a loading chat');
+    await key('ArrowDown'); finishOlderSelection(); await settle();
+    check(state.thread.id === tail[0].id && document.activeElement === row(tail[0]) && state.items.has('arrow-message-' + tail[0].id) && !state.items.has('arrow-message-' + other.id), 'A late history response overwrote a newer arrow selection');
+    api.rpc = read;
+    await row(tail[18]).onclick(); $('conversation-list').scrollTop = 0;
+    await key('ArrowDown');
+    const lastRect = row(tail[19]).getBoundingClientRect(), listRect = $('conversation-list').getBoundingClientRect();
+    check(state.thread.id === tail[19].id && lastRect.top >= listRect.top && lastRect.bottom <= listRect.bottom + 1, 'Arrow navigation did not scroll an offscreen selection into view');
+    const lastCalls = calls.length; await key('ArrowDown');
+    check(calls.length === lastCalls && state.thread.id === tail[19].id && state.active.get('arrow-background-task') === 'keep-running' && calls.every(call => ['thread/read', 'thread/turns/list'].includes(call.method)), 'Arrow navigation wrapped, reloaded the last row, or interrupted background work');
+    state.active.delete('arrow-background-task'); state.pinnedIds.clear(); state.pinnedThreads.clear(); projects.data = []; projects.collapsed.clear();
+    api.rpc = previousRpc; state.options = previousOptions; resetThread();
+  }
+  results.push('sidebar arrows open visible conversations in displayed order, skip collapsed projects, preserve U and typing keys, scroll into view, and ignore stale history without interrupting tasks');
+  {
+    const previousRpc = api.rpc, previousOptions = state.options;
+    resetThread(); state.connected = true; state.options = { mode: 'local' };
+    const datedThread = { id: 'dated-message-chat', cwd: '/tmp', name: 'Message timestamps' };
+    const sentAt = Date.UTC(2026, 10, 11, 3, 4, 5);
+    const expectedDate = ms => new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'medium' }).format(new Date(ms));
+    api.rpc = async (method, params) => {
+      if (method === 'thread/read') return { thread: datedThread };
+      if (params.cursor) return { data: [{ id: 'dated-older-turn', items: [{ id: 'dated-older', type: 'userMessage', content: [{ type: 'text', text: 'Older message' }], startedAtMs: sentAt - 86400000 }] }], nextCursor: null };
+      return { data: [{ id: 'dated-turn', items: [
+        { id: 'dated-user', type: 'userMessage', content: [{ type: 'text', text: 'Saved prompt' }], startedAtMs: sentAt, completedAtMs: sentAt },
+        { id: 'dated-assistant', type: 'agentMessage', text: 'Saved reply', startedAtMs: sentAt + 60000, completedAtMs: sentAt + 61000 }
+      ] }], nextCursor: 'older-dated-messages' };
+    };
+    await openThread(datedThread);
+    check(state.items.get('dated-user').time.textContent === expectedDate(sentAt) && state.items.get('dated-assistant').time.textContent === expectedDate(sentAt + 60000), 'Saved messages lost their individual millisecond timestamps or local formatting');
+    const userDate = state.items.get('dated-user'), assistantDate = state.items.get('dated-assistant');
+    check(userDate.time.dateTime === new Date(sentAt).toISOString() && userDate.time.nextElementSibling.classList.contains('edit-message') && assistantDate.time.nextElementSibling === assistantDate.pinButton && !userDate.element.hasAttribute('title') && !assistantDate.element.hasAttribute('title'), 'Inline dates lost their recorded time, header placement, or still use native tooltips');
+    $('prompt').focus();
+    check(getComputedStyle(userDate.time).opacity === '0' && getComputedStyle(assistantDate.time).opacity === '0', 'Message dates are always visible instead of hover-only');
+    const headerHeight = userDate.label.getBoundingClientRect().height;
+    userDate.pinButton.focus();
+    check(getComputedStyle(userDate.time).opacity === '1' && userDate.label.getBoundingClientRect().height === headerHeight, 'Focusing message controls did not reveal the inline date without moving the header');
+    $('prompt').focus();
+    await loadOlderTurns();
+    check(state.items.get('dated-older').time.textContent === expectedDate(sentAt - 86400000), 'Loading older messages lost their hover timestamps');
+    const liveAt = sentAt + 120000;
+    handleNotification({ method: 'item/started', params: { threadId: datedThread.id, turnId: 'live-dated-turn', startedAtMs: liveAt, item: { id: 'dated-live', type: 'agentMessage', text: '' } } });
+    handleNotification({ method: 'item/agentMessage/delta', params: { threadId: datedThread.id, turnId: 'live-dated-turn', itemId: 'dated-live', delta: 'Streaming reply' } });
+    check(state.items.get('dated-live').time.textContent === expectedDate(liveAt), 'Streaming output dropped its recorded start timestamp');
+    handleNotification({ method: 'item/completed', params: { threadId: datedThread.id, turnId: 'live-dated-turn', completedAtMs: liveAt + 5000, item: { id: 'dated-live', type: 'agentMessage', text: 'Streaming reply', startedAtMs: null, completedAtMs: null } } });
+    check(state.items.get('dated-live').time.textContent === expectedDate(liveAt), 'Completion replaced the message start time with its finish time');
+    handleNotification({ method: 'item/completed', params: { threadId: datedThread.id, turnId: 'live-dated-turn', completedAtMs: liveAt + 10000, item: { id: 'dated-completed-only', type: 'agentMessage', text: 'Completed reply' } } });
+    check(state.items.get('dated-completed-only').time.textContent === expectedDate(liveAt + 10000), 'Completion-only timestamps were not available on hover');
+    for (const [index, timestamp] of [undefined, null, 0, -1, NaN, Infinity, 1e100, '2026-11-11'].entries()) {
+      const record = renderItem({ id: 'invalid-date-' + index, type: 'agentMessage', text: 'Legacy reply', startedAtMs: timestamp });
+      check(record.time.textContent === 'Time unavailable' && !record.time.hasAttribute('datetime') && !record.element.hasAttribute('title'), 'Missing or invalid history timestamps were replaced with a fabricated date');
+    }
+    await openThread(datedThread);
+    check(state.items.get('dated-user').time.textContent === expectedDate(sentAt), 'Reopening a conversation changed its message dates');
+    api.rpc = previousRpc; state.options = previousOptions; resetThread();
+  }
+  results.push('message date/time stays hover-only, uses recorded local timestamps in history and live events, survives streaming and pagination, and never invents missing dates');
   api.rpc = originalRpc; state.threads = [branchSource]; await openThread(branchSource); connectionLabels(); status(connectedStatus());
   projects.data = [{ id: branchSource.projectId, name: 'Rapidcode', roots: [{ path: branchSource.cwd }] }];
   await expandProject(projects.data[0], false);
@@ -2771,11 +2964,13 @@ async function checks() {
 
 module.exports = async () => {
   const testWindow = new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, partition: 'renderer-tests' } });
+  testWindow.webContents.on('console-message', event => { if (event.level === 'error') console.error(event.message); });
   try {
     testWindow.webContents.session.webRequest.onBeforeRequest({ urls: ['file://*/*renderer.js'] }, (_details, callback) => callback({ cancel: true }));
     await testWindow.loadFile(path.join(__dirname, '..', 'index.html'));
     const source = fs.readFileSync(path.join(__dirname, '..', 'renderer.js'), 'utf8').replace('init().catch(showError);', '');
-    const results = await testWindow.webContents.executeJavaScript(`(async () => { const window = { codex: {} }; ${source}\nreturn (${checks.toString()})(); })()`);
+    const results = await testWindow.webContents.executeJavaScript(`(async () => { const window = { codex: {} }; ${source}\nreturn (${checks.toString()})().catch(error => ({ error: error.stack })); })()`);
+    if (results.error) throw new Error(results.error);
     const artifacts = path.join(__dirname, '..', 'artifacts', 'branches-ui');
     fs.mkdirSync(artifacts, { recursive: true });
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -2798,14 +2993,14 @@ module.exports = async () => {
     await testWindow.loadFile(path.join(__dirname, '..', 'index.html'));
     await testWindow.webContents.executeJavaScript(`(() => { const window = { codex: {} }; ${source}
       $('welcome').hidden = true;
-      renderItem({ id: 'preview-user', type: 'userMessage', content: [{ type: 'text', text: 'Check the project and run the tests.' }] });
+      renderItem({ id: 'preview-user', type: 'userMessage', startedAtMs: Date.UTC(2026, 10, 11, 3, 4, 5), content: [{ type: 'text', text: 'Check the project and run the tests.' }] });
       renderItem({ id: 'preview-thought', type: 'reasoning', summary: ['Checking project configuration and tests.'] }, false, 'preview-turn');
       for (const [index, command] of ['git status --short', 'cat package.json', 'npm test'].entries()) renderItem({ id: 'preview-tool-' + index, type: 'commandExecution', command, status: 'completed', exitCode: 0, aggregatedOutput: 'Completed successfully.' }, false, 'preview-turn');
       renderItem({ id: 'preview-patch', type: 'fileChange', status: 'completed', changes: [
         { path: '/tmp/src/example.ts', kind: { type: 'update' }, diff: ['@@ -1 +1,2 @@', '-const pattern = /驗證碼|認証コード/;', '+const pattern = /驗證碼|確認碼|認証コード/;', '+const attempts = 3;'].join('\\n') },
         { path: '/tmp/test/example.test.ts', kind: { type: 'add' }, diff: 'test the new behavior\\n' }
       ] }, false, 'preview-turn');
-      renderItem({ id: 'preview-reply', type: 'agentMessage', text: 'All checks passed.' }, false, 'preview-turn');
+      renderItem({ id: 'preview-reply', type: 'agentMessage', startedAtMs: Date.UTC(2026, 10, 11, 3, 5, 5), text: 'All checks passed.' }, false, 'preview-turn');
       state.options = { mode: 'local' }; state.connected = true;
       state.thread = { id: 'preview-chat', name: 'Check project tests', cwd: '/tmp' }; state.threads = [state.thread];
       preferences.messagePins = { 'access:local': { 'preview-chat': [{ itemId: 'preview-reply', turnId: 'preview-turn', preview: 'Codex: All checks passed.' }] } };
@@ -2820,10 +3015,33 @@ module.exports = async () => {
       usage.threads.set(state.thread.id, { modelContextWindow: 100000, last: { totalTokens: 26000 } });
       api.rpc = async () => structuredClone(usage.account);
       state.owned.add(state.thread.id); state.active.set(state.thread.id, 'preview-running'); updateBusy();
+      globalThis.previewQuestion = () => {
+        preferences.completionSound = false;
+        handleNotification({ id: 'preview-question', method: 'item/tool/requestUserInput', params: { threadId: state.thread.id, turnId: 'preview-running', questions: [{ id: 'location', question: 'Where should the Linux/Windows fingerprint choice be available?', options: [{ label: 'Project settings', description: 'Configure it for each project' }] }] } });
+      };
     })()`);
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'activity-collapsed.png'), (await testWindow.webContents.capturePage()).toPNG());
     fs.writeFileSync(path.join(artifacts, 'pinned-messages.png'), (await testWindow.webContents.capturePage()).toPNG());
+    const dateTarget = await testWindow.webContents.executeJavaScript(`(() => {
+      const message = document.querySelector('.message.agentMessage');
+      message.scrollIntoView({ block: 'center' });
+      const date = message.querySelector('.message-time');
+      if (getComputedStyle(date).opacity !== '0') throw new Error('Date visible before hover');
+      const rect = message.getBoundingClientRect();
+      return { x: Math.round(rect.left + 30), y: Math.round(rect.top + 10), height: rect.height };
+    })()`);
+    testWindow.webContents.sendInputEvent({ type: 'mouseMove', x: dateTarget.x, y: dateTarget.y });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await testWindow.webContents.executeJavaScript(`(() => {
+      const message = document.querySelector('.message.agentMessage');
+      const date = message.querySelector('.message-time');
+      if (getComputedStyle(date).opacity !== '1' || message.title || message.getBoundingClientRect().height !== ${dateTarget.height}) throw new Error('Hover did not immediately reveal inline date without shifting the message');
+    })()`);
+    fs.writeFileSync(path.join(artifacts, 'message-hover-date.png'), (await testWindow.webContents.capturePage()).toPNG());
+    testWindow.webContents.sendInputEvent({ type: 'mouseMove', x: 5, y: 5 });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await testWindow.webContents.executeJavaScript("if (getComputedStyle(document.querySelector('.message.agentMessage .message-time')).opacity !== '0') throw new Error('Date stayed visible after leaving message')");
     await testWindow.webContents.executeJavaScript("document.querySelector('.activity-log > summary').click()");
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'activity-expanded.png'), (await testWindow.webContents.capturePage()).toPNG());
@@ -2845,6 +3063,18 @@ module.exports = async () => {
     await testWindow.webContents.executeJavaScript("document.querySelectorAll('.activity-log').forEach(log => log.open = false); document.querySelector('.changed-files').scrollIntoView({block:'nearest'})");
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'changed-files.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript("document.querySelector('.changed-files > summary').focus({preventScroll:true})");
+    testWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+    testWindow.webContents.sendInputEvent({ type: 'char', keyCode: '\r' });
+    testWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (!await testWindow.webContents.executeJavaScript("[...document.querySelectorAll('.changed-file-entry')].every(entry => entry.open)")) throw new Error('Enter on the file-count header did not expand all diffs');
+    fs.writeFileSync(path.join(artifacts, 'changed-files-all-open.png'), (await testWindow.webContents.capturePage()).toPNG());
+    testWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Space' });
+    testWindow.webContents.sendInputEvent({ type: 'char', keyCode: ' ' });
+    testWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Space' });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (!await testWindow.webContents.executeJavaScript("document.querySelector('.changed-files').open && [...document.querySelectorAll('.changed-file-entry')].every(entry => !entry.open)")) throw new Error('Space on the file-count header did not collapse all diffs');
     await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file').click()");
     await new Promise(resolve => setTimeout(resolve, 100));
     await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file-entry[open]').scrollIntoView({block:'start'})");
@@ -2858,6 +3088,9 @@ module.exports = async () => {
     await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file').click(); document.getElementById('open-settings').click()");
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'completion-sound-settings.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript("document.getElementById('settings-dialog').close(); previewQuestion()");
+    await new Promise(resolve => setTimeout(resolve, 100));
+    fs.writeFileSync(path.join(artifacts, 'waiting-question.png'), (await testWindow.webContents.capturePage()).toPNG());
     return results;
   } finally { testWindow.destroy(); }
 };
