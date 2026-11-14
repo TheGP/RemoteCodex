@@ -39,3 +39,16 @@ test('a failed pin save preserves the previous file', t => {
   assert.throws(() => pins.set(local, 'unsaved', true));
   assert.deepEqual(new PinStore(file).get(local), ['saved']);
 });
+
+test('adding a provider preserves old Codex pins and separates identical conversation IDs', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-provider-pins-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'pins.json'), store = new PinStore(file);
+  store.set({ mode: 'local' }, 'same-chat', true);
+  assert.deepEqual(store.get({ mode: 'local', provider: 'codex' }), ['same-chat']);
+  assert.deepEqual(store.get({ mode: 'local', provider: 'sample' }), []);
+  store.set({ mode: 'local', provider: 'sample' }, 'same-chat', true);
+  store.set({ mode: 'local', provider: 'codex' }, 'same-chat', false);
+  assert.deepEqual(new PinStore(file).get({ mode: 'local', provider: 'sample' }), ['same-chat']);
+  assert.deepEqual(store.get({ mode: 'ssh', provider: 'sample', host: 'host', port: 22 }), []);
+});

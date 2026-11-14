@@ -4,9 +4,10 @@ function draftRequest(operation, target, patch) {
   if (result.error) throw new Error(result.error);
   return result.value;
 }
-contextBridge.exposeInMainWorld('codex', {
+contextBridge.exposeInMainWorld('agent', {
   settings: () => ipcRenderer.invoke('settings'),
-  readImage: file => ipcRenderer.invoke('read-image', file),
+  providers: () => ipcRenderer.invoke('providers'),
+  readImage: (file, context) => ipcRenderer.invoke('read-image', file, context),
   openLink: (href, context) => ipcRenderer.invoke('open-link', href, context),
   linkMenu: (href, context) => ipcRenderer.invoke('link-menu', href, context),
   preferences: () => ipcRenderer.invoke('preferences'),
@@ -18,6 +19,7 @@ contextBridge.exposeInMainWorld('codex', {
   queues: () => ipcRenderer.invoke('queues'),
   saveQueue: queue => ipcRenderer.invoke('save-queue', queue),
   draft: target => draftRequest('read-draft', target),
+  hasDraft: target => draftRequest('has-draft', target),
   saveDraft: (target, patch) => draftRequest('save-draft', target, patch),
   clearDraft: target => draftRequest('clear-draft', target),
   moveDraft: (source, target) => draftRequest('move-draft', source, target),
@@ -31,7 +33,7 @@ contextBridge.exposeInMainWorld('codex', {
   setPin: (threadId, pinned) => ipcRenderer.invoke('set-pin', threadId, pinned),
   connect: options => ipcRenderer.invoke('connect', options),
   chooseKey: () => ipcRenderer.invoke('choose-key'),
-  rpc: (method, params) => ipcRenderer.invoke('rpc', method, params),
+  rpc: (method, params, context) => ipcRenderer.invoke('rpc', method, params, context),
   log: (event, details) => ipcRenderer.send('diagnostic', event, details),
   respond: (id, result) => ipcRenderer.invoke('respond', id, result),
   onNotification: callback => {

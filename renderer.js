@@ -1,7 +1,8 @@
 /* global marked, DOMPurify */
 const controls = new Map([...document.querySelectorAll('[id]')].map(element => [element.id, element]));
 const $ = id => controls.get(id);
-const api = window.codex;
+const api = window.agent;
+const agents = { available: [] };
 const projects = { data: [], selected: null, expanded: new Set(), cursors: new Map(), collapsed: new Set(), generation: 0 };
 const preferences = { theme: 'system', startupProjects: {}, conversationStates: {}, threadOrders: {}, threadOrderCutoffs: {} };
 const imageLoads = new Map();
@@ -9,7 +10,7 @@ const linkContexts = new WeakMap();
 const completionSound = { audio: null, lastAt: -Infinity };
 const messageDateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
 const schedules = { tasks: [], generation: 0 };
-const drafts = { target: null, snapshot: null, images: [], suspended: false, restoring: false };
+const drafts = { target: null, snapshot: null, images: [], suspended: false, restoring: false, pending: new Map() };
 const timelineView = { following: true, reading: null };
 const pinnedMessages = { saving: false, jumping: null };
 const pinIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 9V3H8v6l-3 3v2h14v-2l-3-3M12 14v7"/></svg>';
@@ -19,9 +20,10 @@ const threadDrag = { source: null, pending: new Set(), orderPending: new Set(), 
 const projectDrag = { source: null, pending: null, type: 'application/x-remote-codex-project' };
 const queueDrag = { source: null, type: 'application/x-remote-codex-queue' };
 const usage = { threads: new Map(), account: null, reading: null, generation: 0, updatedAt: 0, error: null, timer: null };
-const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), queues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Map(), newThreads: new Set(), titleTask: Promise.resolve(), titleRetries: new Map(), images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
+const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), queues: new Map(), nativeQueues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Map(), newThreads: new Set(), titleTask: Promise.resolve(), titleRetries: new Map(), images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
 const slash = { index: 0, matches: [], dismissed: null, skills: [], cwd: null, loading: false, generation: 0, skillOnly: false };
 const modes = { plan: false, catalog: [], threads: new Map() };
+const compacting = new Map();
 const slashCommands = [
   { name: 'new', description: 'Start a new conversation' },
   { name: 'model', description: 'Choose a model' },
@@ -38,7 +40,83 @@ const slashCommands = [
   { name: 'mcp', description: 'Show MCP servers and tools' }
 ];
 
-const rpc = (method, params = {}) => api.rpc(method, params);
+const identityProvider = value => /^agent:([a-z][a-z0-9-]*):/.exec(value || '')?.[1] || 'codex';
+const threadProvider = thread => thread?.provider || identityProvider(thread?.id);
+const selectedProvider = () => state.thread ? threadProvider(state.thread) : identityProvider($('model').value);
+const agentMetadata = provider => state.options?.agents?.find(agent => agent.id === provider) || agents.available.find(agent => agent.id === provider) || (state.options?.agent?.id === provider ? state.options.agent : null);
+const agentName = (provider = selectedProvider()) => agentMetadata(provider)?.name || (provider === 'codex' ? 'Codex' : provider);
+function modelUnavailable(model = $('model').value, provider = selectedProvider()) {
+  const option = [...$('model').options].find(option => option.value === model);
+  const agent = agentMetadata(provider);
+  return !option || option.dataset.unavailable === 'true' || Boolean(model && identityProvider(model) !== provider) || agent?.connected === false || agent?.enabled === false || agent?.available === false;
+}
+const supports = (method, provider = selectedProvider()) => !agentMetadata(provider)?.methods || agentMetadata(provider).methods.includes(method);
+const supportsAny = method => (state.options?.agents || agents.available).some(agent => supports(method, agent.id)) || (!(state.options?.agents || agents.available).length && supports(method));
+const catalogMethods = new Set(['model/list', 'collaborationMode/list', 'thread/list', 'project/list']);
+function rpc(method, params = {}) {
+  const aggregate = catalogMethods.has(method) && !params.provider && !params.projectId && !params.threadId;
+  const provider = params.provider || (params.threadId ? identityProvider(params.threadId) : params.model ? identityProvider(params.model) : params.projectId ? identityProvider(params.projectId) : selectedProvider());
+  if (!aggregate && !supports(method, provider)) return Promise.reject(new Error(`${agentName(provider)} does not support ${method}.`));
+  return api.rpc(method, params, aggregate ? undefined : { provider });
+}
+function reportProviderErrors(errors = []) {
+  if (!errors.length) return;
+  const message = [...new Set(errors.map(error => `${error.provider ? agentName(error.provider) + ': ' : ''}${error.message}`))].join('\n');
+  if (state.providerError === message) return;
+  showError(message); state.providerError = message;
+}
+async function refreshAgentCatalogs() {
+  const generation = agents.generation = (agents.generation || 0) + 1, options = state.options;
+  const results = await Promise.allSettled([rpc('model/list', { limit: 100 }), supportsAny('collaborationMode/list') ? rpc('collaborationMode/list') : Promise.resolve({ data: [] })]);
+  if (options !== state.options || generation !== agents.generation) return;
+  for (const [index, result] of results.entries()) {
+    if (result.status === 'rejected') { showError(result.reason); continue; }
+    const previous = index === 0 ? state.models : modes.catalog;
+    const failed = new Set([
+      ...(result.value.errors || []).map(error => error.provider),
+      ...(state.options?.agents || []).filter(agent => agent.connected === false).map(agent => agent.id)
+    ]);
+    const data = [...result.value.data, ...previous.filter(entry => failed.has(entry.provider || identityProvider(entry.model)))];
+    if (index === 0) state.models = data; else modes.catalog = data;
+    reportProviderErrors(result.value.errors);
+  }
+  renderModels();
+}
+function syncComposerAgent() {
+  const provider = selectedProvider();
+  for (const option of $('model').options) option.disabled = option.dataset.unavailable === 'true' || Boolean(state.thread && identityProvider(option.value) !== provider) || agentMetadata(identityProvider(option.value))?.connected === false;
+  if (state.thread && identityProvider($('model').value) !== provider) $('model').value = agentMetadata(provider)?.defaultModel ?? (provider === 'codex' ? '' : `agent:${provider}:model:`);
+  if (agents.current !== provider) {
+    agents.current = provider;
+    usage.generation++; usage.account = null; usage.reading = null; usage.error = null; usage.updatedAt = 0;
+    slash.generation++; slash.skills = []; slash.cwd = null; slash.loading = false; hideSlash();
+    if ($('usage-panel').matches(':popover-open')) $('usage-panel').hidePopover();
+    if (state.connected && !state.connecting) refreshUsage();
+  }
+  connectionLabels();
+}
+function renderModels() {
+  const previous = $('model').value;
+  const available = (state.options?.agents || agents.available).filter(agent => agent.available !== false && (agent.enabled !== false && agent.connected !== false || agent.id === selectedProvider()));
+  if (!available.length) available.push({ id: 'codex', name: 'Codex' });
+  $('model').replaceChildren();
+  for (const agent of available) {
+    const group = document.createElement('optgroup'); group.label = agent.name;
+    group.append(new Option(available.length > 1 ? `${agent.name} default` : isLocal() ? 'Local default model' : 'Server default model', agent.defaultModel ?? (agent.id === 'codex' ? '' : `agent:${agent.id}:model:`)));
+    for (const model of state.models.filter(model => (model.provider || identityProvider(model.model)) === agent.id)) group.append(new Option(model.displayName || model.nativeModel || model.model, model.model));
+    $('model').append(group);
+  }
+  if (previous || [...$('model').options].some(option => option.value === previous)) selectSavedModel(previous);
+  syncComposerAgent(); updateEfforts(); updateBusy();
+}
+function selectSavedModel(model) {
+  if (![...$('model').options].some(option => option.value === model)) {
+    const option = new Option(`${agentName(identityProvider(model))} · saved model unavailable`, model);
+    option.dataset.unavailable = 'true'; option.disabled = true;
+    $('model').append(option);
+  }
+  $('model').value = model;
+}
 function trace(event, details) { try { api.log?.(event, details); } catch {} }
 function composerTarget() { return { machine: accessKey(), kind: 'composer', threadId: state.thread?.id || null, cwd: state.thread?.cwd || $('workspace').value.trim(), projectId: state.thread?.projectId || projects.selected || null }; }
 function composerSnapshot() { return { text: $('prompt').value, hours: Number($('send-time').value), model: $('model').value, effort: $('effort').value, mode: modes.plan ? 'plan' : 'default', access: $('permissions').value }; }
@@ -50,12 +128,19 @@ function saveComposerDraft() {
   try {
     api.saveDraft(drafts.target, { ...snapshot, ...(changedImages ? { images } : {}) });
     drafts.snapshot = snapshot; drafts.images = images.map(image => ({ image, url: image.url }));
+    cacheDraftIndicator(drafts.target, Boolean(snapshot.text.trim() || images.length));
     return true;
   } catch (error) { trace('draft.save.failed', { threadId: drafts.target.threadId, error: error.message }); showError(`Could not save unsent draft: ${error.message}`); return false; }
 }
 function clearDraft(target) {
   if (!api.clearDraft || !target) return;
-  try { api.clearDraft(target); } catch (error) { showError(`Could not clear saved draft: ${error.message}`); }
+  try { api.clearDraft(target); cacheDraftIndicator(target, false); } catch (error) { showError(`Could not clear saved draft: ${error.message}`); }
+}
+function cacheDraftIndicator(target, pending) {
+  if (target?.kind !== 'composer' || !target.threadId) return;
+  const key = target.machine + ':' + target.threadId;
+  if (drafts.pending.get(key) === pending) return;
+  drafts.pending.set(key, pending); renderThreadIndicators();
 }
 function editorTarget(kind, thread, itemId) { return { machine: accessKey(), kind, threadId: thread.id, cwd: thread.cwd, projectId: thread.projectId || null, itemId }; }
 function editorText(target, text) {
@@ -73,7 +158,8 @@ function activateComposerDraft() {
     drafts.target = target;
     if (saved) {
       $('prompt').value = saved.text; state.images = saved.images; $('send-time').value = String(saved.hours ?? 0);
-      if ([...$('model').options].some(option => option.value === saved.model)) $('model').value = saved.model;
+      if (typeof saved.model === 'string') selectSavedModel(saved.model);
+      syncComposerAgent();
       updateEfforts(saved.effort);
       if (['read-only', 'workspace-write', 'danger-full-access'].includes(saved.access)) $('permissions').value = saved.access;
       modes.plan = saved.mode === 'plan'; if (state.thread) modes.threads.set(state.thread.id, modes.plan);
@@ -141,6 +227,13 @@ $('file-opener').onchange = async () => {
   catch (error) { control.value = previous; showError(error); }
   finally { control.disabled = false; }
 };
+$('skip-test-diffs').onchange = async () => {
+  const control = $('skip-test-diffs'); const previous = preferences.skipTestDiffs !== false;
+  control.disabled = true;
+  try { await savePreferences({ skipTestDiffs: control.checked }); }
+  catch (error) { control.checked = previous; showError(error); }
+  finally { control.disabled = false; }
+};
 function playCompletionSound(preview = false) {
   if (!preview && (preferences.completionSound === false || performance.now() - completionSound.lastAt < 3000)) return;
   const volume = Number($('completion-volume').value) / 100;
@@ -181,18 +274,28 @@ $('completion-sound').onchange = async () => {
 $('preview-completion-sound').onclick = () => playCompletionSound(true);
 
 function connectionLabels() {
+  if (!state.options) return;
   const local = isLocal();
+  const name = agentName();
   $('server-host').textContent = local ? 'This machine' : state.options.host;
   $('machine-badge').textContent = local ? 'LOCAL' : 'REMOTE';
-  $('welcome-eyebrow').textContent = local ? 'CODEX ON YOUR MACHINE' : 'A LOCAL WINDOW TO YOUR SERVER';
-  $('welcome-description').textContent = local ? 'Talk to Codex here. Your code and commands run on this machine.' : 'Talk to Codex here. Your code and commands run on your remote machine.';
+  $('welcome-eyebrow').textContent = local ? `${name.toUpperCase()} ON YOUR MACHINE` : 'A LOCAL WINDOW TO YOUR SERVER';
+  $('welcome-description').textContent = `Talk to ${name} here. Your code and commands run on ${local ? 'this' : 'your remote'} machine.`;
   $('workspace-label').textContent = local ? 'Local workspace' : 'Server workspace';
   $('workspace').setAttribute('aria-label', $('workspace-label').textContent);
-  $('transport-note').textContent = local ? 'Local connection · Codex runs on this machine' : 'Encrypted SSH connection · Codex runs remotely';
-  $('permissions').querySelector('[value="danger-full-access"]').textContent = local ? 'Full local access' : 'Full server access';
-  $('permissions').title = 'Full access runs commands without approval prompts.';
+  $('transport-note').textContent = local ? `Local connection · ${name} runs on this machine` : `Encrypted SSH connection · ${name} runs remotely`;
+  const permissions = $('permissions'), provider = selectedProvider(), permissionOptions = agentMetadata(provider)?.permissionOptions;
+  const labels = { 'read-only': 'Read only', 'workspace-write': 'Workspace access', 'danger-full-access': local ? 'Full local access' : 'Full server access' };
+  for (const option of permissions.options) {
+    const supported = permissionOptions?.find(entry => entry.value === option.value);
+    option.hidden = option.disabled = Boolean(permissionOptions && !supported);
+    option.textContent = supported?.label || labels[option.value];
+  }
+  if (permissions.dataset.provider !== provider && !drafts.restoring && permissions.selectedOptions[0]?.disabled) permissions.value = 'workspace-write';
+  permissions.dataset.provider = provider;
+  permissions.title = permissions.selectedOptions[0]?.disabled ? `This saved access setting is unsupported by ${name}. Choose an available option.` : 'Full access runs commands without approval prompts.';
   $('folder-title').textContent = local ? 'Choose a local folder' : 'Choose a server folder';
-  $('folder-description').textContent = local ? 'Choose where Codex should work on this machine. Any folder can be a project.' : 'Choose where Codex should work on the server. Any folder can be a project.';
+  $('folder-description').textContent = `Choose where ${name} should work ${local ? 'on this machine' : 'on the server'}. Any folder can be a project.`;
   $('folder-label').textContent = local ? 'Local folder path' : 'Server folder path';
   $('folder-list').setAttribute('aria-label', local ? 'Local folders' : 'Server folders');
 }
@@ -205,24 +308,58 @@ function settingsMode() {
 }
 
 function settingsConnectionOptions() {
-  return { mode: $('connection-mode').value, host: $('host').value, port: $('port').value, key: $('key').value, cwd: $('default-cwd').value, localCwd: $('local-cwd').value, codexPath: $('codex-path').value };
+  const local = $('connection-mode').value === 'local';
+  const current = state.options || {};
+  const executablePath = local ? $('codex-path').value : providerPreference(current, 'codex').executablePath;
+  const providerOptions = { ...state.options?.providerOptions };
+  const paths = new Map([...document.querySelectorAll('input[data-provider-path]')].map(input => [input.dataset.providerPath, local ? input.value : providerPreference(current, input.dataset.providerPath).executablePath]));
+  for (const input of $('provider-settings').querySelectorAll('input[data-provider]')) providerOptions[input.dataset.provider] = { ...providerOptions[input.dataset.provider], enabled: input.checked, executablePath: paths.get(input.dataset.provider) ?? providerPreference(current, input.dataset.provider).executablePath };
+  return { provider: 'codex', mode: $('connection-mode').value, ...Object.fromEntries(['host', 'port', 'key', 'cwd'].map(key => [key, local ? current[key] : $(key === 'cwd' ? 'default-cwd' : key).value])), localCwd: local ? $('local-cwd').value : current.localCwd, executablePath, ...(Object.keys(providerOptions).length ? { providerOptions } : {}) };
 }
-function connectionSettingsChanged() {
-  const next = settingsConnectionOptions(); const current = state.options || {};
-  const fields = next.mode === 'local' ? ['localCwd', 'codexPath'] : ['host', 'port', 'key', 'cwd'];
-  return next.mode !== (current.mode || 'ssh') || fields.some(key => key === 'port' ? Number(next[key]) !== Number(current[key] ?? 22) : String(next[key] || '').trim() !== String(current[key] || '').trim());
+function providerPreference(options, id) {
+  const agent = options?.agents?.find(agent => agent.id === id) || agentMetadata(id);
+  return { enabled: options?.providerOptions?.[id]?.enabled ?? agent?.enabled ?? agent?.defaultEnabled ?? true, executablePath: String(options?.providerOptions?.[id]?.executablePath ?? (id === 'codex' ? options?.executablePath ?? options?.codexPath : '') ?? '').trim() };
+}
+function changedProviders(next) {
+  const ids = new Set(['codex', ...(state.options?.agents || agents.available).map(agent => agent.id), ...Object.keys(state.options?.providerOptions || {}), ...Object.keys(next.providerOptions || {})]);
+  return [...ids].filter(id => JSON.stringify(providerPreference(next, id)) !== JSON.stringify(providerPreference(state.options, id)));
+}
+function machineSettingsChanged(next) {
+  const current = state.options || {};
+  const fields = next.mode === 'local' ? ['localCwd'] : ['host', 'port', 'key', 'cwd'];
+  return next.mode !== (current.mode || 'ssh') || fields.some(key => key === 'port' ? Number(next[key] ?? 22) !== Number(current[key] ?? 22) : String(next[key] || '').trim() !== String(current[key] || '').trim());
+}
+function connectionSettingsChanged(next = settingsConnectionOptions()) {
+  return machineSettingsChanged(next) || changedProviders(next).length > 0;
+}
+function renderProviderSettings(options) {
+  const available = options.agents || agents.available;
+  $('provider-settings').replaceChildren();
+  for (const agent of available.length ? available : [{ id: 'codex', name: 'Codex' }]) {
+    const label = document.createElement('label'); label.className = 'provider-setting';
+    const input = document.createElement('input'); input.type = 'checkbox'; input.dataset.provider = agent.id; input.checked = providerPreference(options, agent.id).enabled;
+    const text = document.createElement('span'); text.textContent = agent.name;
+    const detail = document.createElement('small'); detail.textContent = agent.available === false ? 'Adapter not installed yet' : agent.connected ? 'Connected' : 'Starts when enabled';
+    text.append(detail); label.append(input, text); $('provider-settings').append(label);
+  }
 }
 function connectionBusy() {
   const working = thread => thread?.status?.type === 'active';
   return state.connected && Boolean(state.active.size || state.dispatching.size || state.sending || state.commandBusy || working(state.thread) || state.threads.some(working) || [...state.pinnedThreads.values()].some(working));
 }
+function settingsBusy(next = settingsConnectionOptions()) {
+  if (machineSettingsChanged(next)) return connectionBusy();
+  const changed = new Set(changedProviders(next));
+  return state.connected && (state.sending || state.commandBusy || [...state.active.keys()].some(id => changed.has(identityProvider(id))) || [...state.threads, ...state.pinnedThreads.values(), state.thread].some(thread => thread?.status?.type === 'active' && changed.has(threadProvider(thread))));
+}
 function updateSettingsActions() {
   $('save-connect').hidden = state.connected && !connectionSettingsChanged();
-  $('save-connect').disabled = state.connecting || connectionBusy();
-  $('save-connect').title = connectionBusy() ? 'Finish or stop running tasks before changing the connection' : '';
+  $('save-connect').disabled = state.connecting || state.recovering || settingsBusy();
+  $('save-connect').title = settingsBusy() ? 'Finish or stop affected tasks before changing these settings' : '';
 }
 
 function fillSettings(options) {
+  $('skip-test-diffs').checked = preferences.skipTestDiffs !== false;
   $('completion-sound').checked = preferences.completionSound !== false;
   setCompletionVolume(preferences.completionVolume ?? 50);
   $('file-opener').value = preferences.fileOpener || 'vscode';
@@ -233,7 +370,8 @@ function fillSettings(options) {
   $('key').value = options.key;
   $('default-cwd').value = options.cwd;
   $('local-cwd').value = options.localCwd || '';
-  $('codex-path').value = options.codexPath || '';
+  for (const input of document.querySelectorAll('input[data-provider-path]')) input.value = providerPreference(options, input.dataset.providerPath).executablePath;
+  renderProviderSettings(options);
   settingsMode();
 }
 
@@ -241,10 +379,11 @@ function isWriterConflict(error) { return /already has an active writer/i.test(e
 function showError(error) {
   state.retryError = null;
   state.titleError = null;
+  state.providerError = null;
   let message = (error.message || String(error)).replace(/^Error invoking remote method '[^']+':\s*/, '').replace(/^Error:\s*/, '');
   if (isWriterConflict(error)) {
     if (state.writerConflicts.has(queueKey(state.thread?.id))) { $('error').hidden = true; updateBusy(); return; }
-    message = 'Another Codex session owns this chat.';
+    message = `Another ${agentName()} session owns this chat.`;
   }
   $('error-text').textContent = message; $('error-text').title = message;
   $('error').hidden = false;
@@ -270,7 +409,7 @@ function updateSendButton() {
   $('send').textContent = stop ? '■' : '↑'; $('send').classList.toggle('stop-send', stop);
   $('send').title = stop ? 'Stop task' : busy ? 'Send after the current turn finishes' : 'Send message';
   $('send').setAttribute('aria-label', stop ? 'Stop task' : 'Send message');
-  $('send').disabled = !state.connected || state.connecting || state.sending || state.commandBusy || state.loading || interrupting || queueLocked(state.queues.get(queueKey(state.thread?.id))) || state.images.some(image => !image.url);
+  $('send').disabled = !stop && modelUnavailable() || agentMetadata(selectedProvider())?.connected === false || !state.connected || state.connecting || state.sending || state.commandBusy || state.loading || interrupting || queueLocked(state.queues.get(queueKey(state.thread?.id))) || state.images.some(image => !image.url);
   $('send-time').disabled = $('send').disabled;
 }
 async function stopTurn() {
@@ -284,7 +423,8 @@ async function stopTurn() {
 }
 function updateBusy() {
   for (const button of $('shortcut-buttons').children) button.disabled = shortcutUnavailable({ mode: button.dataset.mode });
-  const busy = state.owned.has(state.thread?.id) && Boolean(state.active.get(state.thread?.id));
+  const compact = state.connected && compacting.has(state.thread?.id);
+  const busy = compact || state.owned.has(state.thread?.id) && Boolean(state.active.get(state.thread?.id));
   const waiting = interactionStatus(state.thread?.id);
   $('writer-notice').hidden = !state.writerConflicts.has(queueKey(state.thread?.id));
   $('activity').hidden = !$('writer-notice').hidden && !busy && !state.sending && !state.loading;
@@ -297,7 +437,7 @@ function updateBusy() {
   $('timeline').classList.toggle('loading', state.loading);
   $('activity').classList.toggle('busy', busy && !waiting);
   $('activity').classList.toggle('waiting', Boolean(waiting));
-  $('activity').textContent = state.sending ? 'Sending…' : state.loading ? 'Loading conversation…' : waiting || (busy ? (isLocal() ? 'Codex is working locally…' : 'Codex is working on the server…') : '');
+  $('activity').textContent = state.sending ? 'Sending…' : state.loading ? 'Loading conversation…' : waiting || (compact ? 'Compacting context…' : busy ? `${agentName()} is working ${isLocal() ? 'locally' : 'on the server'}…` : '');
   $('model').disabled = state.loading || busy;
   $('effort').disabled = state.loading || busy;
   $('permissions').disabled = state.loading || busy;
@@ -317,7 +457,7 @@ function updateBusy() {
   for (const button of $('messages').querySelectorAll('.edit-message')) {
     const turnId = button.dataset.turnId;
     button.hidden = turns.has(turnId); turns.add(turnId);
-    button.disabled = !state.connected || state.sending || state.commandBusy || state.loading || state.active.has(state.thread?.id);
+    button.disabled = modelUnavailable() || !supports('thread/revert') || !state.connected || state.sending || state.commandBusy || state.loading || state.active.has(state.thread?.id);
     button.title = state.active.has(state.thread?.id) ? 'Stop the running task before editing' : 'Edit and resend in this conversation';
   }
   saveComposerDraft();
@@ -338,7 +478,7 @@ function applyRateLimit(snapshot) {
   usage.account = { ...account, rateLimits: !account.rateLimits || id === (account.rateLimits.limitId || 'codex') ? merged : account.rateLimits, rateLimitsByLimitId: { ...account.rateLimitsByLimitId, [id]: merged } };
 }
 async function refreshUsage() {
-  if (!state.connected || usage.reading) return;
+  if (!state.connected || usage.reading || !supports('account/rateLimits/read')) return;
   const request = { options: state.options, generation: usage.generation, updates: [] }; usage.reading = request;
   renderUsage();
   try {
@@ -618,10 +758,14 @@ function renderThreads() {
 }
 
 async function loadProjects() {
+  if (!supportsAny('project/list')) { projects.data = []; return true; }
   const generation = ++projects.generation; const options = state.options;
-  const data = []; let cursor = null;
-  do { const page = await rpc('project/list', { limit: 100, cursor, sortKey: 'position', sortDirection: 'asc' }); data.push(...page.data); cursor = page.nextCursor; } while (cursor && state.options === options && generation === projects.generation);
+  const data = [], errors = []; let cursor = null;
+  do { const page = await rpc('project/list', { limit: 100, cursor, sortKey: 'position', sortDirection: 'asc' }); data.push(...page.data); errors.push(...page.errors || []); cursor = page.nextCursor; } while (cursor && state.options === options && generation === projects.generation);
   if (state.options !== options || generation !== projects.generation) return false;
+  const failed = new Set(errors.map(error => error.provider));
+  for (const project of projects.data) if (failed.has(identityProvider(project.id)) && !data.some(entry => entry.id === project.id)) data.push(project);
+  reportProviderErrors(errors);
   projects.data = data;
   if (!data.some(project => project.id === projects.selected)) projects.selected = null;
   for (const id of projects.expanded) if (!data.some(project => project.id === id)) projects.expanded.delete(id);
@@ -641,9 +785,9 @@ async function restoreStartupProject() {
     await expandProject(project, false);
   }
 }
-function projectAtPath(path) {
-  const normalize = value => value.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
-  return projects.data.find(project => project.roots.some(root => normalize(root.path) === normalize(path)));
+const normalizedFolder = value => value.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
+function projectAtPath(path, provider = selectedProvider()) {
+  return projects.data.find(project => identityProvider(project.id) === provider && project.roots.some(root => normalizedFolder(root.path) === normalizedFolder(path)));
 }
 function startProject(project) {
   if (!state.connected || state.sending || state.commandBusy || !project.roots[0]?.path) return;
@@ -663,11 +807,19 @@ function renderThreadIndicators() {
     const threadId = button.dataset.threadId;
     const thread = threads.get(threadId);
     const waiting = interactionStatus(threadId);
-    const working = !waiting && state.connected && (state.active.has(threadId) || state.dispatching.has(queueKey(threadId)) || thread?.status?.type === 'active');
+    const compact = state.connected && compacting.has(threadId);
+    const working = !waiting && state.connected && (compact || state.active.has(threadId) || state.dispatching.has(queueKey(threadId)) || thread?.status?.type === 'active');
     const completion = state.completions.get(queueKey(threadId));
     const unread = state.unread.has(queueKey(threadId));
+    const key = queueKey(threadId);
+    if (!drafts.pending.has(key)) {
+      try { drafts.pending.set(key, Boolean(api.hasDraft?.({ machine: accessKey(), kind: 'composer', threadId, cwd: thread?.cwd || '', projectId: thread?.projectId || null }))); }
+      catch (error) { drafts.pending.set(key, false); showError(`Could not check unsent draft: ${error.message}`); }
+    }
+    const visibleDraft = state.thread?.id === threadId && drafts.target?.threadId === threadId && drafts.target.machine === accessKey() && !drafts.suspended && !state.loading;
+    const pending = visibleDraft ? Boolean($('prompt').value.trim() || state.images.length) : drafts.pending.get(key);
     button.classList.toggle('unread', unread);
-    const label = waiting || (working ? 'Working…' : unread ? 'Unread' : completion === 'completed' ? 'Finished' : completion === 'failed' ? 'Failed' : '');
+    const label = waiting || (compact ? 'Compacting context…' : working ? 'Working…' : pending ? 'Unsent prompt' : unread ? 'Unread' : completion === 'completed' ? 'Finished' : completion === 'failed' ? 'Failed' : '');
     const scheduled = scheduledFor(threadId);
     let clock = button.querySelector('.thread-schedule');
     const scheduledLabel = scheduled.length ? `${scheduled.length} scheduled message(s); next ${new Date(scheduled[0].runAt).toLocaleString()}` : '';
@@ -680,7 +832,7 @@ function renderThreadIndicators() {
       }
       clock.title = scheduledLabel; clock.setAttribute('aria-label', scheduledLabel);
     }
-    const description = [label, scheduledLabel].filter(Boolean).join(' · ');
+    const description = [label, pending && (waiting || working) ? 'Unsent prompt' : '', pending && unread ? 'Unread' : '', scheduledLabel].filter(Boolean).join(' · ');
     const title = button.querySelector('strong').textContent;
     button.title = title + (description ? ' · ' + description : '');
     if (description) button.setAttribute('aria-label', button.title); else button.removeAttribute('aria-label');
@@ -688,7 +840,7 @@ function renderThreadIndicators() {
     if (!label) { indicator?.remove(); continue; }
     if (!indicator) { indicator = document.createElement('span'); indicator.setAttribute('role', 'img'); }
     button.prepend(indicator);
-    indicator.className = 'thread-state ' + (waiting ? 'waiting' : working ? 'working' : unread ? 'unread' : completion);
+    indicator.className = 'thread-state ' + (waiting ? 'waiting' : working ? 'working' : pending ? 'draft' : unread ? 'unread' : completion);
     indicator.setAttribute('aria-label', label); indicator.title = label;
   }
 }
@@ -777,6 +929,9 @@ function conversationArrow(event) {
 function setThreadRuntimeStatus(threadId, status) {
   for (const thread of [...state.threads, ...state.pinnedThreads.values(), ...(state.thread ? [state.thread] : [])]) if (thread.id === threadId) thread.status = status;
 }
+function finishCompaction(threadId, turnId) {
+  if (!turnId || compacting.get(threadId)?.turnId === turnId) compacting.delete(threadId);
+}
 
 async function togglePin(thread) {
   if (!state.connected || state.pinning.has(thread.id) || state.archiving?.threadId === thread.id) return;
@@ -800,18 +955,29 @@ async function loadThreads(more = false, projectId = null) {
   const query = JSON.stringify([accessKey(), searchTerm, projects.data.map(project => project.id).sort()]);
   const sameQuery = state.threadQuery === query;
   const filters = more ? [projectId] : [null, ...projects.data.map(project => project.id)];
-  const pages = await Promise.all(filters.map(async id => {
+  const results = await Promise.allSettled(filters.map(async id => {
     const limit = id && !projects.expanded.has(id) ? 5 : 50;
     const loaded = state.threadCoverage?.get(id) || 0;
     const target = !more && sameQuery && limit === 50 ? loaded : 0;
-    const data = []; let cursor = more ? (id ? projects.cursors.get(id) : state.threadCursor) : null;
+    const data = [], errors = []; let cursor = more ? (id ? projects.cursors.get(id) : state.threadCursor) : null;
     do {
       const page = await rpc('thread/list', { limit, sortKey: 'updated_at', modelProviders: [], searchTerm, cursor, ...(projects.data.length ? { projectId: id } : {}) });
-      data.push(...page.data); cursor = page.nextCursor;
+      data.push(...page.data); errors.push(...page.errors || []); cursor = page.nextCursor;
     } while (cursor && data.length < target && generation === state.listGeneration);
-    return { data, nextCursor: cursor };
+    return { data, nextCursor: cursor, errors };
   }));
   if (generation !== state.listGeneration) return;
+  if (results.every(result => result.status === 'rejected')) throw results[0].reason;
+  const pages = results.map((result, index) => result.status === 'fulfilled' ? result.value : {
+    data: sameQuery ? state.threads.filter(thread => !projects.data.length || (thread.projectId || null) === filters[index]) : [],
+    nextCursor: sameQuery ? (filters[index] ? projects.cursors.get(filters[index]) : state.threadCursor) : null,
+    errors: [{ provider: filters[index] ? identityProvider(filters[index]) : null, message: result.reason.message }]
+  });
+  const errors = pages.flatMap(page => page.errors);
+  const failed = new Set(errors.map(error => error.provider));
+  const listed = new Set(pages.flatMap(page => page.data.map(thread => thread.id)));
+  if (!more && sameQuery) for (const thread of state.threads) if (failed.has(threadProvider(thread)) && !listed.has(thread.id)) { pages[0].data.push(thread); listed.add(thread.id); }
+  reportProviderErrors(errors);
   const machine = accessKey();
   for (const [index, id] of filters.entries()) {
     const ids = preferences.threadOrders[machine]?.[id];
@@ -873,6 +1039,7 @@ function resetThread(folder) {
   $('thread-path').textContent = $('workspace').value;
   $('prompt').value = '';
   activateComposerDraft();
+  syncComposerAgent();
   renderThreads();
   renderRequests();
   updateBusy();
@@ -889,8 +1056,9 @@ function setThread(thread) {
   const keepDraftSettings = api.draft && drafts.target && ($('prompt').value || state.images.length);
   if (!keepDraftSettings) {
     if (thread.model && [...$('model').options].some(option => option.value === thread.model)) $('model').value = thread.model;
-    updateEfforts(thread.reasoningEffort);
   }
+  syncComposerAgent();
+  if (!keepDraftSettings) updateEfforts(thread.reasoningEffort);
   activateComposerDraft();
   renderThreads();
   renderRequests();
@@ -919,9 +1087,14 @@ async function openThread(thread, allowBusy = false) {
     state.turnCursor = history.nextCursor;
     $('older-turns').hidden = !state.turnCursor;
     state.active.delete(thread.id);
+    compacting.delete(thread.id);
     for (const turn of [...history.data].reverse()) {
+      if (turn.status === 'inProgress') {
+        state.active.set(thread.id, turn.id);
+        const last = turn.items?.at(-1);
+        if (last?.type === 'contextCompaction' && Number.isFinite(last.startedAtMs) && last.completedAtMs == null) compacting.set(thread.id, { itemId: last.id, turnId: turn.id });
+      }
       for (const item of turn.items || []) renderItem(item, false, turn.id);
-      if (turn.status === 'inProgress') state.active.set(thread.id, turn.id);
     }
     const buffered = state.historyEvents;
     state.historyEvents = null;
@@ -959,7 +1132,7 @@ function messageImage(source, alt = 'Image') {
       const file = imagePath(source);
       if (!imageLoads.has(file)) {
         if (imageLoads.size >= 20) imageLoads.delete(imageLoads.keys().next().value);
-        const request = api.readImage(file).catch(error => { if (imageLoads.get(file) === request) imageLoads.delete(file); throw error; });
+        const request = api.readImage(file, { provider: selectedProvider() }).catch(error => { if (imageLoads.get(file) === request) imageLoads.delete(file); throw error; });
         imageLoads.set(file, request);
       }
       url = await imageLoads.get(file);
@@ -1106,6 +1279,9 @@ function updateFileDiff(entry, context) {
   body.lastElementChild.disabled = file.kind === 'delete';
   diff.scrollTop = top; diff.scrollLeft = left;
 }
+function isTestFile(filePath) {
+  return /(?:^|\/)(?:__tests__|tests?)(?:\/|$)|(?:^|\/)test_[^/]+$|[._-](?:test|spec)\.[^/]+$/i.test(filePath.replace(/\\/g, '/'));
+}
 function renderFileSummary(turnId) {
   if (!turnId) return;
   let card = [...$('messages').querySelectorAll('.changed-files')].find(element => element.dataset.turnId === turnId);
@@ -1153,15 +1329,16 @@ function renderFileSummary(turnId) {
   const entries = new Map([...rows.children].map(entry => [entry.dataset.fileId, entry]));
   let next = rows.firstElementChild;
   const context = { machine: accessKey(), cwd: state.thread?.cwd || $('workspace').value };
-  const updateToggleTitle = () => { card.firstElementChild.title = card.querySelector('.changed-file-entry:not([open])') ? 'Expand all file diffs' : 'Collapse all file diffs'; };
+  const shouldExpand = entry => preferences.skipTestDiffs === false || !isTestFile(entry.dataset.path);
+  const updateToggleTitle = () => { card.firstElementChild.title = [...rows.children].some(entry => shouldExpand(entry) && !entry.open) || !card.querySelector('.changed-file-entry[open]') ? 'Expand all file diffs' : 'Collapse all file diffs'; };
   card.firstElementChild.onclick = event => {
     event.preventDefault();
     const entries = [...rows.children];
-    const expand = !card.open || entries.some(entry => !entry.open);
+    const expand = !card.open || entries.some(entry => shouldExpand(entry) && !entry.open);
     card.open = true; card.expandAll = expand;
     for (const entry of entries) {
-      entry.open = expand;
-      if (expand) updateFileDiff(entry, context);
+      if (!expand || shouldExpand(entry)) entry.open = expand;
+      if (entry.open) updateFileDiff(entry, context);
     }
     setTimelineFollowing(false, expand ? card : null);
     updateToggleTitle();
@@ -1173,7 +1350,7 @@ function renderFileSummary(turnId) {
       entry = document.createElement('details'); entry.className = 'changed-file-entry'; entry.dataset.fileId = file.id;
       const summary = document.createElement('summary'); summary.className = 'changed-file'; entry.append(summary);
       summary.onclick = () => { card.expandAll = false; };
-      entry.open = Boolean(card.expandAll);
+      entry.open = Boolean(card.expandAll) && (preferences.skipTestDiffs === false || !isTestFile(file.path));
       entry.ontoggle = () => {
         if (!entry.isConnected) return;
         if (entry.open) { setTimelineFollowing(false, card.expandAll ? card : entry); updateFileDiff(entry, context); }
@@ -1203,7 +1380,7 @@ function renderItem(item, prepend = false, turnId = null) {
   const anchorTop = anchor?.isConnected && anchor.checkVisibility() ? anchor.getBoundingClientRect().top : null;
   let record = state.items.get(item.id);
   const isMessage = ['userMessage', 'agentMessage', 'plan', 'exitedReviewMode', 'imageView', 'imageGeneration'].includes(item.type);
-  if (!isMessage && !['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'reasoning', 'webSearch', 'collabAgentToolCall', 'functionCallOutput'].includes(item.type)) return;
+  if (!isMessage && !['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'reasoning', 'webSearch', 'collabAgentToolCall', 'functionCallOutput', 'contextCompaction'].includes(item.type)) return;
   if (!record) {
     const element = document.createElement(isMessage ? 'article' : 'details');
     element.className = isMessage ? `message ${item.type}` : 'tool';
@@ -1252,7 +1429,7 @@ function renderItem(item, prepend = false, turnId = null) {
       record.label.replaceChildren(); record.label.dataset.type = item.type;
       const mark = document.createElement('span');
       mark.className = 'mini-mark'; mark.textContent = '›_';
-      record.label.append(mark, document.createTextNode(item.type === 'plan' ? 'Plan' : 'Codex'));
+      record.label.append(mark, document.createTextNode(item.type === 'plan' ? 'Plan' : agentName()));
     }
     if (item.type === 'imageView' || item.type === 'imageGeneration') {
       record.body.replaceChildren();
@@ -1271,6 +1448,9 @@ function renderItem(item, prepend = false, turnId = null) {
   } else if (item.type === 'reasoning') {
     record.label.textContent = 'Thinking';
     record.body.textContent = (item.summary || []).join('\n');
+  } else if (item.type === 'contextCompaction') {
+    record.label.textContent = 'Context compaction';
+    record.body.textContent = 'Condenses earlier messages so the conversation can continue.';
   } else {
     record.label.textContent = item.type === 'functionCallOutput' ? `${item.namespace || ''} ${item.name || 'Tool result'}` : `${item.server || ''} ${item.tool || item.type} · ${item.status || ''}`;
     const output = item.result || item.output || item.contentItems || item.arguments || item;
@@ -1301,7 +1481,7 @@ function renderItem(item, prepend = false, turnId = null) {
       record.pinButton = document.createElement('button'); record.pinButton.type = 'button'; record.pinButton.className = 'message-pin'; record.pinButton.innerHTML = pinIcon;
       record.pinButton.onclick = () => {
         if (state.items.get(record.item.id) !== record) return;
-        const preview = `${record.item.type === 'userMessage' ? 'You' : 'Codex'}: ${record.body.textContent.trim().replace(/\s+/g, ' ') || 'Image'}`.slice(0, 200);
+        const preview = `${record.item.type === 'userMessage' ? 'You' : agentName()}: ${record.body.textContent.trim().replace(/\s+/g, ' ') || 'Image'}`.slice(0, 200);
         return saveMessagePin({ itemId: record.item.id, turnId: record.turnId, preview }, !currentMessagePins().some(pin => pin.itemId === record.item.id)).catch(showError);
       };
     }
@@ -1352,7 +1532,7 @@ function hideSlash() {
   slash.dismissed = $('prompt').value; slash.skillOnly = false;
 }
 async function loadSkills(force = false) {
-  if (!state.connected) return;
+  if (!state.connected || !supports('skills/list')) return;
   const cwd = state.thread?.cwd || $('workspace').value.trim();
   if (!force && slash.cwd === cwd) return;
   const generation = ++slash.generation;
@@ -1432,9 +1612,13 @@ function skillInputs(text, existing = [], cwd = state.thread?.cwd || $('workspac
   return [...new Map([...existing, ...available].map(skill => [skill.path, skill])).values()].filter(skill => text.split(/\s+/).includes('$' + skill.name)).map(skill => ({ type: 'skill', name: skill.name, path: skill.path }));
 }
 function collaborationParams(message) {
-  if (!modes.catalog.length) return {};
-  const preset = modes.catalog.find(entry => entry.mode === message.mode);
-  const model = message.model || message.thread.model || state.models.find(model => model.isDefault)?.model;
+  const provider = threadProvider(message.thread);
+  const catalog = modes.catalog.filter(entry => (entry.provider || 'codex') === provider);
+  const preset = catalog.find(entry => entry.mode === message.mode);
+  if (!preset && message.mode === 'plan') throw new Error(`Plan mode is unavailable for ${agentName(provider)}.`);
+  if (!catalog.length) return {};
+  const chosen = message.model || message.thread.model;
+  const model = chosen && !chosen.endsWith(':model:') ? chosen : state.models.find(model => (model.provider || 'codex') === provider && model.isDefault)?.model;
   if (!preset || !model) throw new Error('Select a model before using Plan mode.');
   return { collaborationMode: { mode: message.mode, settings: { model, reasoning_effort: message.effort || preset.reasoning_effort || null, developer_instructions: null } } };
 }
@@ -1463,9 +1647,9 @@ async function executeSlash(value) {
     } else if (command === 'skills') {
       await loadSkills(true); slash.skillOnly = true; slash.dismissed = null; $('prompt').value = '/'; updateSlash(false);
     } else if (command === 'plan') {
-      if (!state.connected) throw new Error('Connect to Codex first.');
+      if (!state.connected) throw new Error(`Connect to ${agentName()} first.`);
       if (!modes.catalog.length) modes.catalog = (await rpc('collaborationMode/list')).data;
-      if (!modes.catalog.some(entry => entry.mode === 'plan')) throw new Error('Plan mode is unavailable on this machine.');
+      if (!modes.catalog.some(entry => (!entry.provider || entry.provider === selectedProvider()) && entry.mode === 'plan')) throw new Error('Plan mode is unavailable on this machine.');
       modes.plan = args === 'off' ? false : args ? true : !modes.plan;
       if (state.thread) modes.threads.set(state.thread.id, modes.plan);
       if (args && !['on', 'off'].includes(args)) { $('prompt').value = args; await send(null, false, {}); }
@@ -1590,12 +1774,13 @@ async function retryQueue(queue) {
 }
 function renderQueue() {
   const queue = state.queues.get(queueKey(state.thread?.id));
+  const native = state.nativeQueues.get(state.thread?.id);
   if (queueDrag.source) {
     if (queueDrag.source.queue === queue && queueDrag.source.options === state.options && queueDrag.source.selection === state.selection) return;
     clearQueueDrag(); return;
   }
   $('queued-messages').replaceChildren();
-  $('queued-messages').hidden = !queue?.messages.length;
+  $('queued-messages').hidden = !queue?.messages.length && !native?.items.length;
   for (const message of queue?.messages || []) {
     const row = document.createElement('div'); row.className = 'queued-message';
     const handle = document.createElement('button'); handle.type = 'button'; handle.className = 'queue-drag-handle';
@@ -1630,6 +1815,29 @@ function renderQueue() {
     else if (queue.paused) action('Retry', async () => retryQueue(queue));
     action('×', async () => { const previous = queue.messages; queue.messages = queue.messages.filter(entry => entry !== message); try { await persistQueue(queue); } catch (error) { queue.messages = previous; throw error; } finally { renderQueue(); } });
     row.lastChild.setAttribute('aria-label', 'Remove queued message');
+    $('queued-messages').append(row);
+  }
+  for (const [index, item] of (native?.items || []).entries()) {
+    const row = document.createElement('div'); row.className = 'queued-message native-queued-message';
+    const label = document.createElement('span');
+    label.textContent = `${native.autoDrain ? 'Queued' : 'Paused'} in ${agentName()} · ${item.text || (item.attachments?.length ? `${item.attachments.length} attachment(s)` : item.kind === 'compact' ? 'Compact context' : 'Queued message')}`;
+    row.append(label);
+    const options = state.options, threadId = state.thread.id;
+    const action = (text, method, params) => {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'subtle'; button.textContent = text;
+      button.disabled = !state.connected || state.loading || !supports(method) || Boolean(item.editLock);
+      button.onclick = async () => {
+        if (options !== state.options || state.thread?.id !== threadId || state.nativeQueues.get(threadId) !== native || button.disabled) return;
+        button.disabled = true;
+        try { await rpc(method, { threadId, ...params }); }
+        catch (error) { if (options === state.options) showError(error); }
+        finally { if (options === state.options && state.thread?.id === threadId) renderQueue(); }
+      };
+      row.append(button);
+    };
+    if (!native.autoDrain && index === 0) action('Resume', 'queue/resume');
+    action('×', 'queue/delete', { queueItemId: item.queueItemId });
+    row.lastChild.setAttribute('aria-label', 'Remove queued message from ' + agentName());
     $('queued-messages').append(row);
   }
   if (state.thread && !state.loading) scrollToBottom();
@@ -1768,7 +1976,7 @@ async function flushQueue(threadId) {
 }
 function shortcutUnavailable(shortcut) {
   if (shortcut?.mode === 'fill') return state.connecting || state.sending || state.loading || state.commandBusy || drafts.suspended;
-  return !state.connected || state.connecting || state.sending || state.loading || state.commandBusy || state.images.some(image => !image.url) || queueLocked(state.queues.get(queueKey(state.thread?.id)));
+  return modelUnavailable() || !state.connected || state.connecting || state.sending || state.loading || state.commandBusy || state.images.some(image => !image.url) || queueLocked(state.queues.get(queueKey(state.thread?.id)));
 }
 function promptSkillNames(text) { return [...new Set(text.split(/\s+/).filter(token => /^\$[a-zA-Z_][\w:.-]*$/.test(token)).map(token => token.slice(1)))]; }
 async function resolvePromptSkills(text, required = false) {
@@ -1845,6 +2053,7 @@ async function send(event, steer = false, action = null) {
   if (state.commandBusy && !action) return;
   const images = shortcut ? [] : [...state.images];
   if ((!text && !images.length) || images.some(image => !image.url) || !state.connected || state.sending || state.loading) return;
+  if (modelUnavailable()) { showError(`${agentName()} model is unavailable. Reconnect or select another model.`); return; }
   saveComposerDraft(); const originalDraft = drafts.target;
   const delayHours = !steer && !action ? Number($('send-time').value) : 0;
   const input = [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...images.map(image => ({ type: 'image', url: image.url })), ...skillInputs(text, action?.skills)];
@@ -1860,8 +2069,10 @@ async function send(event, steer = false, action = null) {
       message.input = [...input.filter(part => part.type !== 'skill'), ...skillInputs(text, skills)];
     }
     if (!state.thread) {
-      const result = await rpc('thread/start', { cwd: $('workspace').value.trim(), historyMode: 'paginated', ...access, ...(projects.selected ? { projectId: projects.selected } : {}), ...(message.model ? { model: message.model } : {}) });
-      if (originalDraft && api.moveDraft) api.moveDraft(originalDraft, { machine: message.machine, kind: 'composer', threadId: result.thread.id, cwd: result.thread.cwd, projectId: result.thread.projectId || projects.selected || null });
+      const projectId = projects.selected && identityProvider(projects.selected) === selectedProvider() ? projects.selected : null;
+      const result = await rpc('thread/start', { cwd: $('workspace').value.trim(), historyMode: 'paginated', ...access, ...(projectId ? { projectId } : {}), ...(message.model ? { model: message.model } : {}) });
+      if (projectId && !result.thread.projectId) result.thread.projectId = projectId;
+      if (originalDraft && api.moveDraft) api.moveDraft(originalDraft, { machine: message.machine, kind: 'composer', threadId: result.thread.id, cwd: result.thread.cwd, projectId: result.thread.projectId || projectId || null });
       if (!result.thread.preview?.trim()) result.thread.preview = text || 'Image';
       state.newThreads.add(result.thread.id);
       state.owned.add(result.thread.id);
@@ -1953,7 +2164,7 @@ function showThreadMenu(thread, x, y) {
   $('project-menu').hidden = true;
   state.contextThread = thread;
   const menu = $('thread-menu'); menu.hidden = false;
-  $('clone-conversation').disabled = !state.connected || state.sending || state.commandBusy || state.loading;
+  $('clone-conversation').disabled = !supports('thread/fork', threadProvider(thread)) || !state.connected || state.sending || state.commandBusy || state.loading;
   $('mark-unread').disabled = state.unread.has(queueKey(thread.id)) || state.loading && state.thread?.id === thread.id;
   $('archive-conversation').disabled = !canArchiveConversation(thread);
   $('archive-conversation').title = state.active.has(thread.id) || thread.status?.type === 'active' ? 'Stop the running task before archiving' : state.queues.get(queueKey(thread.id))?.messages.length ? 'Send or remove queued messages before archiving' : scheduledFor(thread.id).some(task => task.status === 'pending') ? 'Cancel scheduled messages before archiving' : '';
@@ -2007,9 +2218,11 @@ async function resendMessage(target, text) {
   let lock, queue, reverted = false, saved = false;
   $('edit-message-error').textContent = ''; $('edit-message-error').hidden = true;
   try {
+    if (modelUnavailable()) throw new Error('Selected model is unavailable. Reconnect or select another model before resending.');
     const message = { draftId: crypto.randomUUID(), text, images: [], input: [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...target.content.filter(part => !['text', 'skill'].includes(part.type)), ...skillInputs(text, target.content.filter(part => part.type === 'skill'), thread.cwd)], access: policy(), mode: modes.plan ? 'plan' : 'default', model: $('model').value, effort: $('effort').value, machine, thread };
+    turnSettings(message);
     if (state.active.has(thread.id)) throw new Error('Stop the running task before editing earlier messages.');
-    if (thread.historyMode === 'legacy' || thread.ephemeral) throw new Error('This conversation uses a history format that Codex cannot edit in place.');
+    if (thread.historyMode === 'legacy' || thread.ephemeral) throw new Error(`This conversation uses a history format that ${agentName()} cannot edit in place.`);
     lock = await api.editLock(thread.id);
     if (!current()) return;
     await ensureWritable(thread.id);
@@ -2018,6 +2231,8 @@ async function resendMessage(target, text) {
     queue = state.queues.get(key);
     if (queue?.messages.length) await pauseQueue(queue, 'history-edit');
     if (!current()) return;
+    if (modelUnavailable(message.model, threadProvider(thread))) throw new Error('Selected model is unavailable. Reconnect or select another model before resending.');
+    turnSettings(message);
     const result = await rpc('thread/revert', { threadId: thread.id, beforeTurnId: target.turnId });
     reverted = true;
     trace('edit.reverted', { machine, threadId: thread.id, turnId: target.turnId });
@@ -2084,14 +2299,36 @@ function updateEfforts(preferred) {
   const model = state.models.find(model => model.model === $('model').value);
   $('effort').replaceChildren(new Option('Default reasoning', ''));
   for (const entry of model?.supportedReasoningEfforts || []) $('effort').add(new Option(entry.reasoningEffort, entry.reasoningEffort));
+  if (previous && modelUnavailable() && ![...$('effort').options].some(option => option.value === previous)) $('effort').add(new Option(previous, previous, false, false));
   if ([...$('effort').options].some(option => option.value === previous)) $('effort').value = previous;
 }
 async function connect(options) {
-  if (state.connecting) return;
+  if (state.connecting || state.recovering) return;
+  if (state.connected && !machineSettingsChanged(options)) {
+    if (settingsBusy(options)) { showError('Finish or stop affected tasks before changing these settings.'); return; }
+    const changed = changedProviders(options).length > 0;
+    saveComposerDraft();
+    const current = state.options; state.recovering = true;
+    try {
+      const result = await api.connect(options);
+      if (state.options !== current) return;
+      if (result?.options) Object.assign(state.options, result.options);
+      state.connected = result?.connected ?? result?.options?.agents?.some(agent => agent.connected !== false && agent.enabled !== false && agent.available !== false) ?? state.connected;
+      if (changed && state.connected) {
+        await refreshAgentCatalogs();
+        if (result?.reconnected?.length) await refreshProjects();
+      } else renderModels();
+      fillSettings(state.options); $('settings-error').textContent = ''; $('settings-dialog').close();
+      status(state.connected ? connectedStatus() : 'Agents disabled');
+    } catch (error) { if (state.options === current) { $('settings-error').textContent = error.message; showError(error); } }
+    finally { state.recovering = false; updateBusy(); }
+    return;
+  }
   if (connectionBusy()) { showError('Finish or stop running tasks before changing the connection.'); return; }
   saveComposerDraft();
   state.connecting = true; status('Connecting…'); updateBusy();
-  try { await api.connect(options); }
+  let connected = true;
+  try { const result = await api.connect(options); options = result?.options || options; connected = result?.connected ?? options.agents?.some(agent => agent.connected !== false && agent.enabled !== false && agent.available !== false) ?? true; }
   catch (error) {
     state.connecting = false; status(state.connected ? connectedStatus() : 'Not connected'); updateBusy();
     $('settings-error').textContent = error.message;
@@ -2104,6 +2341,7 @@ async function connect(options) {
   clearProjectDrag(); $('project-menu').hidden = true;
   pauseQueues();
   state.connected = false;
+  state.nativeQueues.clear();
   state.options = options;
   usage.generation++; usage.threads.clear(); usage.account = null; usage.reading = null; usage.updatedAt = 0; usage.error = null;
   state.commandBusy = false; state.branching = null; state.resending = null; state.archiving = null;
@@ -2113,7 +2351,7 @@ async function connect(options) {
   state.owned.clear(); state.resuming.clear();
   for (const threadId of state.titleRetries.keys()) clearTitleRetry(threadId);
   state.names.clear(); state.titling.clear(); state.newThreads.clear();
-  slash.generation++; slash.skills = []; slash.cwd = null; slash.loading = false; modes.catalog = []; modes.threads.clear();
+  slash.generation++; slash.skills = []; slash.cwd = null; slash.loading = false; modes.catalog = []; modes.threads.clear(); state.models = [];
   $('edit-queue-dialog').close();
   $('thread-menu').hidden = true; $('rename-dialog').close(); $('edit-message-dialog').close();
   restoreAccess();
@@ -2128,7 +2366,8 @@ async function connect(options) {
   state.listGeneration++;
   state.folderGeneration++;
   $('folder-dialog').close();
-  state.active.clear();
+  state.active.clear(); compacting.clear();
+  state.finished.clear();
   state.requests.clear();
   connectionLabels();
   $('workspace').value = isLocal() ? options.localCwd : options.cwd;
@@ -2137,7 +2376,8 @@ async function connect(options) {
   renderRequests();
   $('settings-error').textContent = '';
   try {
-    state.connected = true;
+    state.connected = connected;
+    if (!connected) { $('settings-dialog').close(); renderModels(); return; }
     $('workspace').value = isLocal() ? options.localCwd : options.cwd;
     $('thread-path').textContent = $('workspace').value;
     $('settings-dialog').close();
@@ -2145,14 +2385,9 @@ async function connect(options) {
     resetThread();
     status(connectedStatus());
     refreshUsage();
-    const models = await rpc('model/list', { limit: 100 });
-    state.models = models.data;
-    modes.catalog = (await rpc('collaborationMode/list')).data;
-    $('model').replaceChildren(new Option(isLocal() ? 'Local default model' : 'Server default model', ''));
-    for (const model of state.models) $('model').add(new Option(model.displayName || model.model, model.model));
-    updateEfforts();
+    await refreshAgentCatalogs();
     try { state.pinnedIds = new Set(await api.pins()); } catch (error) { showError(error); }
-    await loadProjects();
+    await loadProjects().catch(showError);
     await restoreStartupProject();
     await loadThreads();
   } catch (error) {
@@ -2166,12 +2401,35 @@ async function connect(options) {
     drafts.suspended = false;
     if (state.connected) { try { await restoreLastDraft(); } catch (error) { showError(`Could not reopen saved draft: ${error.message}`); } }
     else activateComposerDraft();
-    state.connecting = false; status(state.connected ? connectedStatus() : 'Not connected');
+    state.connecting = false; status(state.connected ? connectedStatus() : connected ? 'Not connected' : 'Agents disabled');
   }
 }
 function handleNotification(message) {
+  if (message.machine && message.machine !== accessKey()) return;
   if (message.method === 'scheduler/updated') { refreshSchedules().catch(showError); return; }
   const { method, params = {}, id } = message;
+  if (method === 'provider/queue/updated') {
+    if (params.queue?.items?.length) state.nativeQueues.set(params.threadId, params.queue);
+    else state.nativeQueues.delete(params.threadId);
+    if (state.thread?.id === params.threadId) renderQueue();
+    return;
+  }
+  if (['item/started', 'item/completed'].includes(method) && params.item?.type === 'contextCompaction') {
+    if (method === 'item/started' && !state.finished.has(params.turnId) && (!state.active.has(params.threadId) || state.active.get(params.threadId) === params.turnId)) compacting.set(params.threadId, { itemId: params.item.id, turnId: params.turnId });
+    else if (method === 'item/completed' && compacting.get(params.threadId)?.itemId === params.item.id) finishCompaction(params.threadId, params.turnId);
+    updateBusy();
+  }
+  if (method === 'thread/compacted') { finishCompaction(params.threadId, params.turnId); updateBusy(); return; }
+  if (method === 'providers/updated') {
+    if (!state.options) return;
+    state.options.agents = params.agents;
+    const errors = params.agents.filter(agent => agent.error).map(agent => ({ provider: agent.id, message: agent.error }));
+    if (errors.length) reportProviderErrors(errors);
+    else if (state.providerError && $('error-text').textContent === state.providerError) { state.providerError = null; $('error').hidden = true; }
+    syncComposerAgent(); updateBusy();
+    if (params.reconnected?.length && !params.reconfigured?.length) return refreshAgentCatalogs().then(refreshProjects).catch(showError);
+    return;
+  }
   if (timelineView.following && state.thread && params.threadId === state.thread.id && !state.loading && !timelineAtBottom()) setTimelineFollowing(false);
   const retry = state.retryError;
   const progress = ['turn/completed', 'item/agentMessage/delta', 'item/plan/delta', 'item/reasoning/summaryTextDelta', 'item/reasoning/summaryPartAdded', 'item/reasoning/textDelta'].includes(method)
@@ -2185,6 +2443,7 @@ function handleNotification(message) {
     return;
   }
   if (method === 'account/rateLimits/updated') {
+    if (message.provider && message.provider !== selectedProvider()) return;
     if (state.connected && params.rateLimits) {
       if (usage.reading) usage.reading.updates.push(params.rateLimits);
       applyRateLimit(params.rateLimits); usage.updatedAt = Date.now(); renderUsage();
@@ -2192,15 +2451,36 @@ function handleNotification(message) {
     return;
   }
   if (method === 'account/updated') {
+    if (message.provider && message.provider !== selectedProvider()) return;
     usage.generation++; usage.account = null; usage.reading = null; usage.error = null; usage.updatedAt = 0;
     renderUsage(); refreshUsage(); return;
+  }
+  if (method === 'provider/closed') {
+    const provider = message.provider || params.provider;
+    for (const threadId of state.nativeQueues.keys()) if (identityProvider(threadId) === provider) state.nativeQueues.delete(threadId);
+    const agent = agentMetadata(provider); if (agent) agent.connected = false;
+    for (const map of [state.active, state.resuming]) for (const threadId of map.keys()) if (identityProvider(threadId) === provider) map.delete(threadId);
+    for (const threadId of state.owned) if (identityProvider(threadId) === provider) state.owned.delete(threadId);
+    for (const threadId of compacting.keys()) if (identityProvider(threadId) === provider) compacting.delete(threadId);
+    for (const thread of [...state.threads, ...state.pinnedThreads.values(), ...(state.thread ? [state.thread] : [])]) if (threadProvider(thread) === provider) thread.status = { type: 'notLoaded' };
+    for (const [key, request] of state.requests) if (request.provider === provider || identityProvider(request.params.threadId) === provider) state.requests.delete(key);
+    for (const queue of state.queues.values()) if (queue.machine === accessKey() && threadProvider(queue.thread) === provider) pauseQueue(queue, 'provider-closed').catch(showError);
+    if (selectedProvider() === provider) {
+      state.selection++; state.loading = false; state.historyEvents = null;
+      if (!params.reconfigured) {
+        showError(`${agentName(provider)} disconnected: ${params.message || 'Connection closed'}`);
+        state.providerError = $('error-text').textContent;
+      }
+    }
+    syncComposerAgent(); renderRequests(); updateBusy(); return;
   }
   if (method === 'connection/closed') {
     clearQueueDrag(false);
     clearThreadDrag();
     clearProjectDrag(); $('project-menu').hidden = true;
     pauseQueues('connection-closed');
-    state.connected = false; state.owned.clear(); state.resuming.clear(); state.active.clear(); state.requests.clear();
+    state.nativeQueues.clear();
+    state.connected = false; state.owned.clear(); state.resuming.clear(); state.active.clear(); state.requests.clear(); compacting.clear();
     state.selection++; state.loading = false; state.historyEvents = null;
     $('folder-dialog').close();
     status('Disconnected'); renderRequests(); showError(params.message);
@@ -2213,21 +2493,23 @@ function handleNotification(message) {
       state.requests.set(id, message); renderRequests();
       if (fresh && state.connected) playCompletionSound();
     }
-    else { api.respond(id, {}).catch(showError); showError(`Codex requested an unsupported interaction: ${method}`); }
+    else { api.respond(id, {}).catch(showError); showError(`${agentName()} requested an unsupported interaction: ${method}`); }
     return;
   }
   if (method === 'thread/name/updated') { applyName(params.threadId, params.threadName || params.name); return; }
   if (method === 'project/changed') { refreshProjects().catch(showError); return; }
   if (method === 'thread/project/updated') { applyProject(params.threadId, params.projectId); loadThreads().catch(showError); return; }
   if (method === 'serverRequest/resolved') { state.requests.delete(params.requestId); renderRequests(); return; }
-  if (method === 'thread/status/changed') { setThreadRuntimeStatus(params.threadId, params.status); renderThreadIndicators(); updateSettingsActions(); return; }
+  if (method === 'thread/status/changed') { if (params.status?.type !== 'active') finishCompaction(params.threadId); setThreadRuntimeStatus(params.threadId, params.status); updateBusy(); return; }
   if (method === 'turn/started' && !state.finished.has(params.turn.id)) {
+    if (compacting.get(params.threadId)?.turnId !== params.turn.id) finishCompaction(params.threadId);
     state.owned.add(params.threadId); state.writerConflicts.delete(queueKey(params.threadId));
     setCompletion(params.threadId);
     setThreadRuntimeStatus(params.threadId, { type: 'active' });
     state.active.set(params.threadId, params.turn.id); updateBusy();
   }
   if (method === 'turn/completed') {
+    finishCompaction(params.threadId, params.turn.id);
     const activeTurn = state.active.get(params.threadId);
     if (!state.finished.has(params.turn.id) && (!activeTurn || activeTurn === params.turn.id)) {
       setThreadRuntimeStatus(params.threadId, { type: 'idle' });
@@ -2250,9 +2532,10 @@ function handleNotification(message) {
     flushQueue(params.threadId).catch(showError);
   }
   if (method === 'error') {
+    if (!params.willRetry) { finishCompaction(params.threadId, params.turnId); updateBusy(); }
     const queue = state.queues.get(queueKey(params.threadId));
     if (queue && !params.willRetry) { pauseQueue(queue, 'native-error').catch(showError); renderQueue(); }
-    showError(params.error?.message || params.message || 'Codex reported an error.');
+    showError(params.error?.message || params.message || `${agentName()} reported an error.`);
     if (params.willRetry && params.threadId && params.turnId) state.retryError = { threadId: params.threadId, turnId: params.turnId };
   }
   if (!state.thread || params.threadId !== state.thread.id) return;
@@ -2294,7 +2577,8 @@ function renderRequests() {
     if (existing) { existing.hidden = false; continue; }
     const card = document.createElement('div'); card.className = 'request-card';
     const heading = document.createElement('strong');
-    heading.textContent = request.method.includes('requestUserInput') ? 'Codex has a question' : 'Codex needs your approval';
+    const name = agentName(request.provider || identityProvider(request.params.threadId));
+    heading.textContent = request.method.includes('requestUserInput') ? `${name} has a question` : `${name} needs your approval`;
     const reason = document.createElement('p'); reason.textContent = request.params.reason || request.params.message || '';
     card.append(heading, reason);
     const actions = document.createElement('div'); actions.className = 'request-actions';
@@ -2378,6 +2662,7 @@ async function browseFolders(path) {
     }
     $('folder-status').textContent = entries.length ? `${entries.length} subfolders · select one to open it` : 'No subfolders. You can use this folder.';
     $('parent-folder').disabled = path === '/' || /^[a-z]:\/$/i.test(path);
+    $('use-folder').textContent = folderActionLabel(path);
     $('use-folder').disabled = false;
   } catch (error) {
     if (generation !== state.folderGeneration) return;
@@ -2385,11 +2670,16 @@ async function browseFolders(path) {
     $('folder-error').textContent = error.message;
   }
 }
+function folderActionLabel(path) {
+  if (state.folderPurpose === 'project') return 'Add this folder as a project →';
+  if (state.thread?.cwd && !state.thread.projectId && path && normalizedFolder(state.thread.cwd) === normalizedFolder(path) && supports('thread/metadata/update') && (supports('project/create') || projectAtPath(path))) return 'Group this conversation here →';
+  return state.thread ? 'Start a new conversation in this folder →' : 'Use this folder →';
+}
 async function openProjectPicker(purpose = 'conversation') {
   if (!state.connected || state.sending) return;
   state.folderPurpose = purpose === 'project' ? 'project' : 'conversation';
   $('folder-host').textContent = $('server-host').textContent;
-  $('use-folder').textContent = state.folderPurpose === 'project' ? 'Add this folder as a project →' : state.thread ? 'Start a new conversation in this folder →' : 'Use this folder →';
+  $('use-folder').textContent = folderActionLabel(state.thread?.cwd || $('workspace').value);
   $('folder-dialog').showModal();
   await browseFolders(state.thread?.cwd || $('workspace').value || '/');
 }
@@ -2400,8 +2690,8 @@ $('folder-dialog').onclose = () => { state.folderGeneration++; state.folderPath 
 $('folder-form').onsubmit = event => { event.preventDefault(); browseFolders($('folder-location').value); };
 $('folder-location').oninput = () => { state.folderGeneration++; state.folderPath = null; $('use-folder').disabled = true; };
 $('parent-folder').onclick = () => browseFolders(($('folder-location').value.replace(/\/+$/, '').replace(/\/[^/]*$/, '')) || '/');
-$('use-folder').onclick = () => {
-  if (!state.folderPath || !state.connected) return;
+$('use-folder').onclick = async () => {
+  if (!state.folderPath || !state.connected || $('use-folder').disabled) return;
   if (state.folderPurpose === 'project') {
     state.projectDraft = { path: state.folderPath, options: state.options, idempotencyKey: crypto.randomUUID() };
     $('save-project').disabled = false;
@@ -2411,13 +2701,41 @@ $('use-folder').onclick = () => {
     $('project-error').textContent = ''; $('folder-dialog').close(); $('project-dialog').showModal(); $('project-name').select();
     return;
   }
-  projects.selected = projectAtPath(state.folderPath)?.id || null;
-  $('workspace').value = state.folderPath;
-  $('thread-path').textContent = state.folderPath;
-  if (state.thread) resetThread();
-  else changeDraftWorkspace();
-  $('folder-dialog').close();
-  $('prompt').focus();
+  const path = state.folderPath, options = state.options, provider = selectedProvider(), generation = state.folderGeneration, selection = state.selection;
+  const operation = {}; state.folderSelecting = operation;
+  const current = () => state.folderSelecting === operation && state.options === options && state.connected && state.folderGeneration === generation && state.folderPath === path && state.selection === selection && selectedProvider() === provider;
+  $('use-folder').disabled = true; $('folder-error').textContent = '';
+  try {
+    let project = projectAtPath(path, provider);
+    if (!project && supports('project/create', provider)) {
+      let draft = state.folderProject;
+      if (!draft || draft.options !== options || draft.path !== normalizedFolder(path) || draft.provider !== provider) draft = state.folderProject = { options, path: normalizedFolder(path), provider, idempotencyKey: crypto.randomUUID() };
+      $('folder-status').textContent = 'Adding project…';
+      project = draft.project || (await rpc('project/create', { provider, name: (normalizedFolder(path).split('/').pop() || 'Project').slice(0, 120), roots: [{ path }], idempotencyKey: draft.idempotencyKey })).project;
+      draft.project = project;
+    }
+    if (!current()) return;
+    if (project) {
+      if (!projects.data.some(entry => entry.id === project.id)) projects.data.push(project);
+      projects.collapsed.delete(project.id);
+      if (state.thread?.cwd && !state.thread.projectId && normalizedFolder(state.thread.cwd) === normalizedFolder(path) && supports('thread/metadata/update', provider)) {
+        await moveThreadToProject(state.thread, project.id, options);
+        if (!current()) return;
+        $('folder-dialog').close(); $('prompt').focus(); return;
+      }
+    }
+    projects.selected = project?.id || null;
+    $('workspace').value = path;
+    $('thread-path').textContent = path;
+    if (state.thread) resetThread();
+    else changeDraftWorkspace();
+    renderThreads();
+    $('folder-dialog').close(); $('prompt').focus();
+  } catch (error) {
+    if (current()) { $('folder-status').textContent = ''; $('folder-error').textContent = error.message; }
+  } finally {
+    if (state.folderSelecting === operation) { state.folderSelecting = null; $('use-folder').disabled = !state.folderPath || !state.connected; }
+  }
 };
 $('cancel-project').onclick = () => $('project-dialog').close();
 $('project-form').onsubmit = async event => {
@@ -2506,6 +2824,7 @@ for (const direction of ['up', 'down']) $(`move-project-${direction}`).onclick =
   moveProject(target.project.id, projects.data[index + (direction === 'up' ? -1 : 2)]?.id || null, target.options).catch(showError);
 };
 async function moveProject(projectId, beforeProjectId, options = state.options) {
+  if (beforeProjectId && identityProvider(beforeProjectId) !== identityProvider(projectId)) throw new Error('Projects can only be reordered within their agent.');
   if (!state.connected || options !== state.options || projectDrag.pending === options || projectId === beforeProjectId) return;
   const index = projects.data.findIndex(project => project.id === projectId);
   if (index < 0 || beforeProjectId && !projects.data.some(project => project.id === beforeProjectId) || (projects.data[index + 1]?.id || null) === beforeProjectId) return;
@@ -2625,6 +2944,7 @@ function bindThreadDrop(target, projectId) {
   };
 }
 async function moveThreadToProject(thread, projectId, options = state.options) {
+  if (projectId && identityProvider(projectId) !== threadProvider(thread)) throw new Error('Choose a project belonging to this chat’s agent.');
   if (!state.connected || options !== state.options || (thread.projectId || null) === projectId || projectId && !projects.data.some(project => project.id === projectId)) return;
   const key = queueKey(thread.id);
   if (threadDrag.pending.has(key)) return;
@@ -2730,15 +3050,19 @@ for (const type of ['dragover', 'drop']) document.addEventListener(type, event =
   if (type === 'drop' && event.target.closest('main') && !document.querySelector('dialog[open]')) addImages(event.dataTransfer.files);
 });
 $('permissions').onchange = () => { localStorage.setItem(accessKey(), $('permissions').value); };
-function accessKey() { return 'access:' + (isLocal() ? 'local' : `${state.options?.host || ''}:${state.options?.port || 22}`); }
+function accessKey() {
+  if (state.options?.machine) return state.options.machine;
+  if (state.options?.provider && state.options.provider !== 'codex') throw new Error('Missing agent connection identity.');
+  return 'access:' + (isLocal() ? 'local' : `${state.options?.host || ''}:${state.options?.port || 22}`);
+}
 function restoreAccess() {
   const saved = localStorage.getItem(accessKey());
   $('permissions').value = ['read-only', 'workspace-write', 'danger-full-access'].includes(saved) ? saved : 'workspace-write';
 }
-$('prompt').oninput = () => { slash.dismissed = null; slash.index = 0; slash.skillOnly = false; saveComposerDraft(); updateSendButton(); updateSlash(); };
+$('prompt').oninput = () => { slash.dismissed = null; slash.index = 0; slash.skillOnly = false; saveComposerDraft(); renderThreadIndicators(); updateSendButton(); updateSlash(); };
 $('prompt').onkeydown = promptKeydown;
 $('plan-mode').onclick = () => { modes.plan = false; if (state.thread) modes.threads.set(state.thread.id, false); updateBusy(); };
-$('model').onchange = () => { updateEfforts(); usage.threads.delete(state.thread?.id); renderUsage(); };
+$('model').onchange = () => { syncComposerAgent(); updateEfforts(); usage.threads.delete(state.thread?.id); updateBusy(); };
 $('workspace').oninput = () => { $('thread-path').textContent = $('workspace').value; projects.selected = projectAtPath($('workspace').value.trim())?.id || null; changeDraftWorkspace(); };
 $('composer').addEventListener('change', () => saveComposerDraft());
 addEventListener('beforeunload', () => {
@@ -2833,8 +3157,14 @@ async function init() {
   await restoreQueues();
   await refreshSchedules();
   const options = await api.settings();
+  agents.available = await api.providers();
   fillSettings(options);
-  await connect(options);
+  if (options.settingsError) {
+    state.options = options; connectionLabels(); status('Not connected');
+    $('settings-error').textContent = options.settingsError;
+    if (!$('settings-dialog').open) $('settings-dialog').showModal();
+    showError(options.settingsError);
+  } else await connect(options);
   usage.timer = setInterval(() => { if (state.connected && !document.hidden) refreshUsage(); }, 60000);
 }
 init().catch(showError);

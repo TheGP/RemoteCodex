@@ -45,6 +45,10 @@ class DraftStore {
       return { name: image.name, size: data.length, url: `data:${image.mime};base64,${data.toString('base64')}` };
     }) };
   }
+  hasContent(target) {
+    const value = this.metadata(target);
+    return Boolean(value && (value.text.trim() || value.images.length));
+  }
   last(machine) {
     try {
       const target = normalizeTarget(JSON.parse(fs.readFileSync(path.join(this.directory, `last-${hash(machine)}.json`), 'utf8')));
@@ -97,11 +101,12 @@ class DraftStore {
 }
 
 function registerDraftIpc(ipcMain, drafts, checkSender, onError = () => {}) {
-  for (const operation of ['read-draft', 'save-draft', 'clear-draft', 'last-draft', 'move-draft']) ipcMain.on(operation, (event, target, patch) => {
+  for (const operation of ['read-draft', 'has-draft', 'save-draft', 'clear-draft', 'last-draft', 'move-draft']) ipcMain.on(operation, (event, target, patch) => {
     try {
       checkSender(event);
       let value;
       if (operation === 'read-draft') { value = drafts.read(target); if (target.kind === 'composer') drafts.remember(target); }
+      else if (operation === 'has-draft') value = drafts.hasContent(target);
       else if (operation === 'save-draft') drafts.save(target, patch);
       else if (operation === 'clear-draft') { drafts.clear(target); if (target.kind !== 'composer') drafts.remember({ ...target, kind: 'composer', itemId: null }); }
       else if (operation === 'move-draft') drafts.move(target, patch);

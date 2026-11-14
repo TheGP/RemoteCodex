@@ -21,6 +21,7 @@ async function checks() {
     if (patch.fileOpener) savedPreferences.fileOpener = patch.fileOpener;
     if ('completionSound' in patch) savedPreferences.completionSound = patch.completionSound;
     if ('completionVolume' in patch) savedPreferences.completionVolume = patch.completionVolume;
+    if ('skipTestDiffs' in patch) savedPreferences.skipTestDiffs = patch.skipTestDiffs;
     if (patch.messagePin) {
       const { machine, threadId, itemId, turnId, preview, pinned } = patch.messagePin;
       savedPreferences.messagePins ||= {}; savedPreferences.messagePins[machine] ||= {};
@@ -246,6 +247,7 @@ async function checks() {
   const calls = [];
   api.rpc = async (method, params) => {
     calls.push({ method, params });
+    if (method === 'project/create') return { project: { id: 'folder-project-' + calls.filter(call => call.method === 'project/create').length, name: params.name, roots: params.roots } };
     check(method === 'fs/readDirectory', 'Folder browser used a write or shell operation');
     if (params.path === '/missing') throw new Error('Folder does not exist');
     return { entries: params.path === '/root' ? [{ fileName: "project with 'quotes'", isDirectory: true }, { fileName: 'notes.txt', isDirectory: false }] : [] };
@@ -255,7 +257,7 @@ async function checks() {
   await $('folder-list').querySelector('button').onclick();
   check(state.folderPath === "/root/project with 'quotes'", 'Folder name was escaped incorrectly');
   check(calls.at(-1).params.path === state.folderPath, 'Folder browser used the wrong path');
-  $('use-folder').onclick();
+  await $('use-folder').onclick();
   check($('workspace').value === "/root/project with 'quotes'" && !$('folder-dialog').open, 'Chosen project was not applied');
   await openProjectPicker();
   await browseFolders('/missing');
@@ -264,15 +266,97 @@ async function checks() {
   $('folder-location').value = '/different'; $('folder-location').oninput();
   check($('use-folder').disabled && !state.folderPath, 'Typed but unverified folder could be selected');
   let resolveOld;
-  api.rpc = (_method, params) => params.path === '/old' ? new Promise(resolve => { resolveOld = resolve; }) : Promise.resolve({ entries: [] });
+  api.rpc = (method, params) => {
+    if (method === 'project/create') return Promise.resolve({ project: { id: 'folder-project-new', name: params.name, roots: params.roots } });
+    return params.path === '/old' ? new Promise(resolve => { resolveOld = resolve; }) : Promise.resolve({ entries: [] });
+  };
   const old = browseFolders('/old');
   await browseFolders('/new');
   resolveOld({ entries: [{ fileName: 'stale', isDirectory: true }] }); await old;
   check(state.folderPath === '/new' && !$('folder-list').children.length, 'Stale folder response replaced the current folder');
   setThread(thread);
-  $('use-folder').onclick();
+  await $('use-folder').onclick();
   check(!state.thread && $('workspace').value === '/new', 'Project change reused the old conversation');
   results.push('remote folder navigation, selection, errors, and stale requests');
+
+  {
+    const beforeRpc = api.rpc, beforeOptions = state.options, beforeProjects = projects.data, beforeSelected = projects.selected;
+    const beforeThreads = state.threads, beforeModels = state.models, beforeModel = $('model').value, beforeWorkspace = $('workspace').value;
+    const codex = { id: 'codex', name: 'Codex', connected: true }, sample = { id: 'sample', name: 'Sample', connected: true, methods: ['fs/readDirectory', 'thread/start', 'thread/read', 'thread/turns/list', 'turn/start'] };
+    const options = { mode: 'local', localCwd: '/projects/original', agents: [codex, sample] };
+    const original = { id: 'picker-original-chat', name: 'Keep the original chat', cwd: '/projects/original' };
+    const operations = []; let createFailure = false, pendingCreate = null, created = 0;
+    state.options = options; projects.data = []; projects.selected = null; state.models = [];
+    renderModels(); $('model').value = ''; syncComposerAgent(); setThread(original); $('prompt').value = 'Keep the original typed draft';
+    api.rpc = async (method, params, context) => {
+      operations.push({ method, params, context });
+      if (method === 'fs/readDirectory') return { entries: [] };
+      if (method === 'project/create') {
+        if (pendingCreate) return new Promise(resolve => { pendingCreate.resolve = resolve; });
+        if (createFailure) throw new Error('Cannot create this project');
+        return { project: { id: 'picker-project-' + ++created, name: params.name, roots: params.roots } };
+      }
+      if (method === 'thread/start') return { thread: { id: 'picker-created-chat', name: 'Chosen project chat', cwd: params.cwd } };
+      if (method === 'turn/start') return { turn: { id: 'picker-created-turn', status: 'completed' } };
+      return { data: [], nextCursor: null };
+    };
+    const choose = async path => { await openProjectPicker(); await browseFolders(path); return $('use-folder').onclick(); };
+    await choose('/projects/new folder');
+    const project = projects.data.find(project => project.roots.some(root => root.path === '/projects/new folder'));
+    const create = operations.find(operation => operation.method === 'project/create');
+    check(project?.name === 'new folder' && create.params.name === 'new folder' && create.params.roots[0].path === '/projects/new folder' && create.params.idempotencyKey && projects.selected === project.id && !state.thread && !$('folder-dialog').open, 'The normal Choose project picker did not create and select a sidebar project');
+    $('prompt').value = 'Check the chosen project'; await send();
+    check(operations.find(operation => operation.method === 'thread/start')?.params.projectId === project.id && state.thread.projectId === project.id, 'The new conversation lost its selected project when the server omitted projectId');
+    const createCount = () => operations.filter(operation => operation.method === 'project/create').length;
+    const count = createCount(); await choose('/projects/new folder/');
+    check(createCount() === count && projects.selected === project.id, 'Selecting the same folder created a duplicate project');
+    projects.data.push({ id: 'agent:sample:project:collision', name: 'Sample folder', roots: [{ path: '/projects/collision' }] });
+    await choose('/projects/collision');
+    check(createCount() === count + 1 && identityProvider(projects.selected) === 'codex', 'A project from another provider captured a folder selected for Codex');
+
+    setThread(original); $('prompt').value = 'Keep this after project failure'; createFailure = true;
+    await choose('/projects/retry');
+    check(state.thread === original && $('prompt').value === 'Keep this after project failure' && $('folder-dialog').open && $('folder-error').textContent.includes('Cannot create') && !$('use-folder').disabled, 'Project creation failure erased the original chat/draft or prevented retry');
+    const retryKey = operations.at(-1).params.idempotencyKey;
+    createFailure = false; await $('use-folder').onclick();
+    check(operations.filter(operation => operation.method === 'project/create').at(-1).params.idempotencyKey === retryKey, 'Retrying the same folder changed its project idempotency key');
+
+    resetThread(); delete original.projectId; setThread(original); state.threads = [original];
+    state.active.set(original.id, 'picker-active-repair'); state.owned.add(original.id);
+    $('prompt').value = 'Keep this active-chat draft';
+    renderItem({ id: 'picker-repair-history', type: 'agentMessage', text: 'Keep the active conversation history' });
+    const repairHistory = $('messages').innerHTML, beforeRepair = operations.length;
+    await choose(original.cwd);
+    check(state.thread === original && original.projectId === projects.selected && state.active.get(original.id) === 'picker-active-repair' && $('prompt').value === 'Keep this active-chat draft' && $('messages').innerHTML === repairHistory && !$('folder-dialog').open, 'Repairing the current folder replaced or interrupted its running chat, history or draft');
+    check(operations.slice(beforeRepair).some(operation => operation.method === 'thread/metadata/update' && operation.params.threadId === original.id && operation.params.projectId === projects.selected) && !operations.slice(beforeRepair).some(operation => ['thread/start', 'turn/interrupt', 'thread/resume'].includes(operation.method)), 'Repairing an existing folder restarted inference instead of changing project metadata');
+    state.active.delete(original.id); state.owned.delete(original.id);
+
+    for (const stale of ['folder', 'navigation', 'connection', 'provider']) {
+      state.options = options; $('model').value = ''; syncComposerAgent(); setThread(original); $('prompt').value = 'Keep the newer navigation draft';
+      pendingCreate = {};
+      await openProjectPicker(); await browseFolders('/projects/stale-' + stale);
+      const pending = $('use-folder').onclick();
+      const beforeDouble = createCount(); await $('use-folder').onclick();
+      check(createCount() === beforeDouble, 'Double-clicking a folder submitted another project creation');
+      if (stale === 'folder') await browseFolders('/projects/newer-folder');
+      else if (stale === 'navigation') { resetThread('/projects/newer-navigation'); $('prompt').value = 'Keep a newly selected draft'; }
+      else if (stale === 'connection') state.options = { mode: 'ssh', host: 'newer-machine', port: 22 };
+      else { state.thread = null; $('model').value = 'agent:sample:model:'; syncComposerAgent(); }
+      const currentThread = state.thread, currentPrompt = $('prompt').value, currentFolder = $('workspace').value, currentProject = projects.selected;
+      pendingCreate.resolve({ project: { id: 'stale-created-' + stale, name: 'Late project', roots: [{ path: '/projects/stale-' + stale }] } });
+      await pending; pendingCreate = null;
+      check(state.thread === currentThread && $('prompt').value === currentPrompt && $('workspace').value === currentFolder && projects.selected === currentProject, 'A stale project response changed the current conversation, draft or project: ' + stale);
+      $('folder-dialog').close();
+    }
+    state.options = options; state.thread = null; $('model').value = 'agent:sample:model:'; syncComposerAgent();
+    const unsupportedCount = createCount(); await choose('/projects/sample-no-projects');
+    check(createCount() === unsupportedCount && selectedProvider() === 'sample' && !projects.selected && $('workspace').value === '/projects/sample-no-projects', 'A provider without project support sent a bogus project RPC or selected another provider');
+    $('folder-dialog').close(); $('error').hidden = true;
+    state.owned.delete('picker-created-chat');
+    api.rpc = beforeRpc; state.options = beforeOptions; projects.data = beforeProjects; projects.selected = beforeSelected; state.threads = beforeThreads; state.models = beforeModels;
+    $('workspace').value = beforeWorkspace; resetThread(); renderModels(); $('model').value = beforeModel; syncComposerAgent(); updateBusy();
+  }
+  results.push('the normal folder picker creates or reuses provider-scoped projects, preserves project membership on first send, retains failed drafts and retry keys, ignores stale navigation, coalesces double clicks, and supports agents without project APIs');
 
   state.options = { mode: 'local' };
   connectionLabels();
@@ -287,6 +371,32 @@ async function checks() {
   connectionLabels();
   check($('machine-badge').textContent === 'REMOTE' && $('server-host').textContent === 'test-server', 'Switching back to SSH kept local labels');
   results.push('local and SSH labels and form validation stay separate');
+
+  {
+    const previousOptions = state.options, previousThread = state.thread, modelOptions = $('model').innerHTML, model = $('model').value;
+    const permission = $('permissions').value, permissionProvider = $('permissions').dataset.provider, restoring = drafts.restoring;
+    const permissionOptions = [{ value: 'workspace-write', label: 'Ask before changes' }, { value: 'danger-full-access', label: 'Full access' }];
+    state.options = { mode: 'local', host: 'host', port: 22, cwd: '/tmp', localCwd: '/tmp', codexPath: '/legacy/codex', providerOptions: { codex: { enabled: true, executablePath: '/tools/codex' }, zcode: { enabled: false, executablePath: '/tools/zcode.cjs' } }, agents: [{ id: 'codex', name: 'Codex' }, { id: 'zcode', name: 'ZCode', permissionOptions }] };
+    state.thread = null; $('model').replaceChildren(new Option('Codex', ''), new Option('ZCode', 'agent:zcode:model:glm'));
+    connectionLabels(); $('permissions').value = 'read-only'; $('model').value = 'agent:zcode:model:glm'; connectionLabels();
+    check($('permissions').value === 'workspace-write' && $('permissions').querySelector('[value="read-only"]').hidden && $('permissions').querySelector('[value="read-only"]').disabled && $('permissions').selectedOptions[0].textContent === 'Ask before changes', 'Choosing ZCode retained an unsupported read-only mode or used Codex permission labels');
+    $('model').value = ''; connectionLabels(); $('permissions').value = 'read-only';
+    drafts.restoring = true; $('model').value = 'agent:zcode:model:glm'; connectionLabels(); drafts.restoring = false; connectionLabels();
+    check($('permissions').value === 'read-only' && $('permissions').title.includes('unsupported by ZCode'), 'Restoring a ZCode read-only draft silently increased its permissions');
+    $('model').value = ''; connectionLabels();
+    check(!$('permissions').querySelector('[value="read-only"]').hidden && !$('permissions').querySelector('[value="read-only"]').disabled && $('permissions').querySelector('[value="workspace-write"]').textContent === 'Workspace access', 'Returning to Codex retained ZCode permission restrictions');
+    fillSettings(state.options);
+    check($('codex-path').value === '/tools/codex' && $('zcode-path').value === '/tools/zcode.cjs', 'Settings lost an agent executable or preferred the legacy Codex path over its saved override');
+    $('zcode-path').value = '/other/zcode.cjs';
+    check(settingsConnectionOptions().providerOptions.zcode.executablePath === '/other/zcode.cjs' && changedProviders(settingsConnectionOptions()).join() === 'zcode', 'Editing the ZCode executable changed another provider or omitted its path');
+    $('connection-mode').value = 'ssh'; $('codex-path').value = '/ignored/codex'; $('zcode-path').value = '/ignored/zcode';
+    const ssh = settingsConnectionOptions();
+    check(ssh.providerOptions.codex.executablePath === '/tools/codex' && ssh.providerOptions.zcode.executablePath === '/tools/zcode.cjs', 'Hidden local executable fields changed saved paths while configuring SSH');
+    state.options = previousOptions; state.thread = previousThread; $('model').innerHTML = modelOptions; $('model').value = model;
+    $('permissions').value = permission; $('permissions').dataset.provider = permissionProvider; drafts.restoring = restoring;
+    connectionLabels(); fillSettings(previousOptions);
+  }
+  results.push('agent executable paths save independently and stay unchanged for SSH; ZCode permissions use native labels, hide unsupported read-only access, and retain saved restricted drafts');
 
   const recent = { id: 'recent', preview: 'Recent conversation', cwd: '/tmp', updatedAt: 20 };
   const older = { id: 'older', name: 'Older pinned conversation', cwd: '/older', updatedAt: 1 };
@@ -698,6 +808,55 @@ async function checks() {
   handleNotification({ method: 'item/started', params: { threadId: threadA.id, turnId: 'live-turn', item: { id: 'activity-live-command', type: 'commandExecution', command: 'pwd', status: 'inProgress' } } });
   check(state.items.get('activity-delta').group === state.items.get('activity-live-command').group, 'A streamed item without a start notification split the live activity group');
   results.push('activity logs use one live line, retain full output, toggle without resetting during updates, keep replies and turns separate, and preserve prepended history order');
+  {
+    const previous = { rpc: api.rpc, options: state.options, thread: state.thread, threads: state.threads, active: state.active, owned: state.owned, audio: completionSound.audio, connected: state.connected };
+    const a = { id: 'compaction-a', cwd: '/tmp', name: 'Compaction A' }, b = { id: 'compaction-b', cwd: '/tmp', name: 'Compaction B' };
+    state.options = { mode: 'local' }; state.connected = true; state.active = new Map(); state.owned = new Set(); state.threads = [a, b];
+    resetThread(); setThread(a); renderThreads();
+    let chimes = 0; completionSound.audio = { pause() {}, currentTime: 0, play: async () => { chimes++; } };
+    const calls = []; api.rpc = async method => { calls.push(method); return { data: [a, b], nextCursor: null }; };
+    const event = (method, threadId, turnId, itemId) => handleNotification({ method, params: { threadId, turnId, item: { id: itemId, type: 'contextCompaction' } } });
+    handleNotification({ method: 'turn/started', params: { threadId: a.id, turn: { id: 'compact-turn-a' } } });
+    handleNotification({ method: 'turn/started', params: { threadId: b.id, turn: { id: 'compact-turn-b' } } });
+    event('item/started', a.id, 'compact-turn-a', 'compact-item-a');
+    check($('activity').textContent === 'Compacting context…' && $('activity').classList.contains('busy') && $('threads').querySelector(`[data-thread-id="${a.id}"] .thread-state`).title === 'Compacting context…', 'Compaction did not replace the working status and sidebar description');
+    check(state.items.get('compact-item-a').label.textContent === 'Context compaction', 'Compaction was missing from the expandable activity log');
+    event('item/started', b.id, 'compact-turn-b', 'compact-item-b');
+    check(!state.items.has('compact-item-b') && $('activity').textContent === 'Compacting context…', 'A background compaction appeared in another conversation’s activity log');
+    setThread(b); check($('activity').textContent === 'Compacting context…', 'Switching to a compacting conversation lost its status');
+    setThread(a); event('item/completed', a.id, 'compact-turn-a', 'older-item');
+    check(compacting.has(a.id), 'A completion for another compaction item cleared the running one');
+    event('item/completed', a.id, 'compact-turn-a', 'compact-item-a');
+    check($('activity').textContent.includes('is working') && state.active.get(a.id) === 'compact-turn-a' && !chimes && !calls.includes('turn/start'), 'Finishing compaction ended the turn, played a completion sound, or dispatched queued work');
+    setThread(b); handleNotification({ method: 'thread/compacted', params: { threadId: b.id, turnId: 'compact-turn-b' } });
+    check(!compacting.has(b.id) && $('activity').textContent.includes('is working'), 'The legacy compaction-completed event left the status stuck');
+    setThread(a); event('item/started', a.id, 'compact-turn-a', 'compact-retry');
+    handleNotification({ method: 'error', params: { threadId: a.id, turnId: 'compact-turn-a', willRetry: true, message: 'Retrying compaction' } });
+    check(compacting.has(a.id), 'A retryable error cleared ongoing compaction');
+    handleNotification({ method: 'error', params: { threadId: a.id, turnId: 'compact-turn-a', willRetry: false, message: 'Compaction failed' } });
+    check(!compacting.has(a.id), 'A terminal compaction error left the status stuck');
+    event('item/started', a.id, 'compact-turn-a', 'compact-interrupted');
+    handleNotification({ method: 'turn/completed', params: { threadId: a.id, turn: { id: 'compact-turn-a', status: 'interrupted' } } });
+    event('item/started', a.id, 'compact-turn-a', 'late-compact-item');
+    check(!compacting.has(a.id), 'Interrupted turns or late start events resurrected compaction');
+    handleNotification({ method: 'turn/started', params: { threadId: a.id, turn: { id: 'compact-new-turn' } } });
+    event('item/started', a.id, 'compact-new-turn', 'compact-new-item');
+    event('item/started', 'agent:sample:thread:compaction', 'agent:sample:turn:compact', 'agent:sample:item:compact');
+    handleNotification({ provider: 'sample', method: 'provider/closed', params: { message: 'Sample closed' } });
+    check(compacting.has(a.id) && !compacting.has('agent:sample:thread:compaction'), 'One provider’s disconnect cleared another provider’s compaction');
+    handleNotification({ method: 'connection/closed', params: { message: 'Disconnected' } });
+    check(!compacting.size && !$('activity').textContent.includes('Compacting'), 'Disconnect left compaction visible');
+    state.connected = true; state.owned.add(a.id);
+    let completed = false;
+    api.rpc = async method => method === 'thread/read' ? { thread: a } : { data: [{ id: 'history-compact-turn', status: 'inProgress', items: [{ id: 'history-compact', type: 'contextCompaction', startedAtMs: 100, completedAtMs: completed ? 200 : null }] }], nextCursor: null, receivedSequence: 10 };
+    await openThread(a);
+    check($('activity').textContent === 'Compacting context…' && state.items.has('history-compact'), 'Opening an already-compacting chat did not restore its status from recorded lifecycle times');
+    completed = true; await openThread(a);
+    check(!compacting.has(a.id) && !$('activity').textContent.includes('Compacting'), 'A completed history item was mistaken for ongoing compaction');
+    compacting.clear(); state.active = previous.active; state.owned = previous.owned; state.threads = previous.threads; state.options = previous.options; state.connected = previous.connected; api.rpc = previous.rpc; completionSound.audio = previous.audio;
+    resetThread(); if (previous.thread) setThread(previous.thread); $('error').hidden = true;
+  }
+  results.push('context compaction shows a live status and sidebar description, remains in the activity log, survives chat switching/history loading, and clears on completion, terminal errors, interruption and provider disconnect without finishing the turn');
   check(!document.querySelector('.brand,.welcome-mark') && !document.getElementById('brand-caption'), 'Removed branding still takes space');
   state.threads = Array.from({ length: 65 }, (_, index) => ({ id: 'pagination-' + index, name: 'Conversation ' + index }));
   state.threadCursor = 'more'; state.pinnedIds.clear(); renderThreads();
@@ -1197,6 +1356,34 @@ async function checks() {
   check(state.thread.id === branchSource.id && $('edit-message-dialog').open && $('edited-message').value === 'Draft after revert failure' && !state.commandBusy, 'Failed revert changed the source or lost the editor draft');
   $('edit-message-dialog').close(); await settle(); $('error').hidden = true;
   api.rpc = originalRpc; sourceTurns = structuredClone(initialSourceTurns); await openThread(branchSource);
+  {
+    const models = state.models, options = state.options, metadata = state.options.agents, editLock = api.editLock, catalog = modes.catalog, plan = modes.plan;
+    const record = state.items.get(firstPrompt.id), model = $('model').value;
+    for (const phase of ['before-edit', 'during-lock', 'provider-disabled', 'plan-before-edit', 'plan-during-lock']) {
+      state.models = [...models, { model: 'edit-guard-model' }]; renderModels(); $('model').value = 'edit-guard-model';
+      modes.plan = phase.startsWith('plan'); modes.catalog = phase === 'plan-during-lock' ? [{ provider: 'codex', mode: 'plan' }] : [];
+      openMessageEdit(record); $('edited-message').value = 'Preserve this unavailable-model edit';
+      const before = branchCalls.length;
+      let locks = 0;
+      api.editLock = async (_threadId, token) => {
+        if (token) return;
+        locks++;
+        if (phase === 'during-lock') { state.models = []; renderModels(); }
+        if (phase === 'provider-disabled') state.options.agents = [{ id: 'codex', name: 'Codex', enabled: false }];
+        if (phase === 'plan-during-lock') modes.catalog = [];
+        return 'guard-lock';
+      };
+      if (phase === 'before-edit') { state.models = []; renderModels(); }
+      await $('edit-message-form').onsubmit({ preventDefault() {} });
+      check(!branchCalls.slice(before).some(call => ['thread/revert', 'turn/start'].includes(call.method)) && sourceTurns.length === initialSourceTurns.length && $('edit-message-dialog').open && $('edited-message').value === 'Preserve this unavailable-model edit' && $('edit-message-error').textContent.includes(phase.startsWith('plan') ? 'Plan mode is unavailable' : 'model is unavailable'), 'Unavailable edit settings rewrote history, lost the editor draft, or failed to explain the block: ' + phase);
+      check(!phase.endsWith('before-edit') || locks === 0, 'Unavailable edit acquired a writer lock before validation');
+      state.models = models; state.options = options; state.options.agents = metadata; renderModels(); $('model').value = model; updateBusy();
+      modes.catalog = catalog; modes.plan = plan;
+      $('edit-message-dialog').close(); await settle();
+    }
+    api.editLock = editLock;
+  }
+  results.push('Edit & resend checks unavailable models, disabled providers and missing Plan presets before locking and immediately before reverting history; editor drafts survive');
   branchSource.historyMode = 'legacy';
   const beforeUnsupported = branchCalls.length;
   state.items.get(firstPrompt.id).label.querySelector('.edit-message').click(); $('edited-message').value = 'Keep this legacy draft';
@@ -1920,6 +2107,7 @@ async function checks() {
   check(!$('usage-meter').title && !$('usage-panel').matches(':popover-open'), 'Usage still uses a native hover tooltip or opens without a click');
   await $('usage-meter').onclick();
   const resetTime = $('usage-details').querySelector('time');
+  check($('usage-panel').checkVisibility() && $('usage-panel').getBoundingClientRect().width > 0 && $('usage-panel').getBoundingClientRect().height > 0, 'Usage opened internally but remained invisible after agent initialization');
   check($('usage-panel').matches(':popover-open') && resetTime?.dateTime === new Date(quotaReset * 1000).toISOString() && resetTime.querySelector('strong') && resetTime.querySelector('span') && !$('usage-details').textContent.includes('%'), 'Usage reset dates are missing, embedded in prose, or repeat the graph percentages');
   const readsBeforeClose = usageReads;
   await $('usage-meter').onclick();
@@ -2030,6 +2218,61 @@ async function checks() {
   }
   openSettings(); await $('settings-form').onsubmit({ preventDefault() {} });
   check(!themeConnectCalls && !$('settings-dialog').open, 'Submitting unchanged connection settings reconnected Codex');
+  {
+    const rpcBefore = api.rpc, metadata = themeConnection.agents;
+    const codex = { id: 'codex', name: 'Codex', available: true, enabled: true, connected: true };
+    const zcode = { id: 'zcode', name: 'ZCode', available: false, defaultEnabled: false, enabled: false, connected: false, methods: [] };
+    themeConnection.agents = [codex, zcode]; openSettings();
+    const checkbox = id => $('provider-settings').querySelector(`input[data-provider="${id}"]`);
+    check(checkbox('codex').checked && !checkbox('zcode').checked && checkbox('zcode').parentElement.textContent.includes('Adapter not installed yet'), 'Provider switches misrepresent the installed adapter or its default');
+    checkbox('codex').checked = false; updateSettingsActions();
+    check($('save-connect').disabled, 'Disabling a provider with running chats was allowed');
+    await $('settings-form').onsubmit({ preventDefault() {} });
+    check(!themeConnectCalls && state.connected && state.active.size === 2, 'An active-provider disable restarted running chats');
+    checkbox('codex').checked = true; checkbox('zcode').checked = true; updateSettingsActions();
+    check(!$('save-connect').disabled, 'An unrelated running provider blocked saving a planned provider preference');
+    const question = { provider: 'codex', params: { threadId: themeThread.id }, marker: 'keep-question' };
+    state.requests.set('provider-settings-question', question);
+    let saved;
+    api.connect = async options => {
+      saved = options;
+      const agents = [codex, { ...zcode, enabled: true }];
+      handleNotification({ method: 'providers/updated', machine: accessKey(), params: { agents, reconfigured: ['zcode'], reconnected: [] } });
+      return { connected: true, options: { ...options, agents } };
+    };
+    api.rpc = async method => ({ data: method === 'model/list' ? state.models : modes.catalog, nextCursor: null });
+    await $('settings-form').onsubmit({ preventDefault() {} });
+    check(saved.providerOptions.codex.enabled && saved.providerOptions.zcode.enabled && state.options === themeConnection && state.thread === themeThread && state.active.size === 2 && state.requests.get('provider-settings-question') === question && state.queues.get(themeQueue.key) === themeQueue && !themeQueue.paused && $('prompt').value === 'Keep this unsent draft' && $('messages').innerHTML === themeHistory, 'Saving a provider preference lost running chats, queues, history, questions, drafts, or the selected session');
+    openSettings();
+    check(checkbox('zcode').checked && $('save-connect').hidden && ![...$('model').options].some(option => identityProvider(option.value) === 'zcode'), 'Saved preference was lost, reported as changed, or exposed an uninstalled provider model');
+    const previousProjects = projects.data, previousThreads = state.threads;
+    const sample = { id: 'sample', name: 'Sample', available: true, enabled: false, connected: false };
+    const project = { id: 'agent:sample:project:enabled-project', name: 'Enabled project', roots: [{ path: '/projects/enabled' }] };
+    const thread = { id: 'agent:sample:thread:enabled-chat', provider: 'sample', name: 'Enabled conversation', projectId: project.id, cwd: '/projects/enabled' };
+    themeConnection.agents.push(sample); themeConnection.providerOptions.sample = { enabled: false };
+    openSettings(); checkbox('sample').checked = true;
+    const calls = [];
+    api.connect = async options => {
+      const agents = [codex, { ...zcode, enabled: true }, { ...sample, enabled: true, connected: true }];
+      handleNotification({ method: 'providers/updated', machine: accessKey(), params: { agents, reconnected: ['sample'], reconfigured: ['sample'] } });
+      return { connected: true, reconnected: ['sample'], options: { ...options, agents } };
+    };
+    api.rpc = async (method, params) => {
+      calls.push(method);
+      if (method === 'project/list') return { data: [...previousProjects, project], nextCursor: null };
+      if (method === 'thread/list') return { data: params.projectId === project.id ? [thread] : previousThreads.filter(entry => (entry.projectId || null) === (params.projectId || null)), nextCursor: null };
+      return { data: method === 'model/list' ? state.models : modes.catalog, nextCursor: null };
+    };
+    await $('settings-form').onsubmit({ preventDefault() {} });
+    check(calls.includes('project/list') && calls.includes('thread/list') && projects.data.some(entry => entry.id === project.id) && $('threads').querySelector(`.thread[data-thread-id="${thread.id}"]`), 'Enabling an installed provider did not immediately load its projects and conversations');
+    check(state.thread === themeThread && state.active.size === 2 && state.requests.get('provider-settings-question') === question && state.queues.get(themeQueue.key) === themeQueue && !themeQueue.paused && $('prompt').value === 'Keep this unsent draft' && $('messages').innerHTML === themeHistory, 'Refreshing an enabled provider interrupted an existing chat, question, queue, history or draft');
+    projects.data = previousProjects; projects.cursors.delete(project.id); state.threads = previousThreads;
+    state.requests.delete('provider-settings-question'); delete themeConnection.providerOptions; themeConnection.agents = metadata;
+    api.rpc = rpcBefore; api.connect = async () => { themeConnectCalls++; throw new Error('Expected test connection attempt'); };
+    $('settings-dialog').close(); $('error').hidden = true;
+  }
+  results.push('provider switches persist planned preferences and preserve unrelated active chats, questions, queue, history and typed draft; own running providers cannot be disabled');
+  results.push('enabling an installed provider immediately displays its projects and conversations without disturbing existing chats');
   openSettings(); $('local-cwd').value = '/changed-project'; $('local-cwd').dispatchEvent(new Event('input', { bubbles: true }));
   check(!$('save-connect').hidden, 'Changed connection settings cannot be saved');
   status(connectedStatus());
@@ -2083,6 +2326,22 @@ async function checks() {
   $('settings-dialog').close(); $('error').hidden = true; state.connected = true;
   await savePreferences({ theme: 'system' }); applyTheme('system');
   results.push('themes preserve fonts and live chats; connected apps hide reconnect, active tasks block connection changes without losing state, and idle or disconnected connections still work');
+
+  {
+    const options = state.options, connectBefore = api.connect, rpcBefore = api.rpc;
+    resetThread(); state.active.clear(); state.queues.clear(); state.threads = [];
+    const codex = { id: 'codex', name: 'Codex', enabled: true, available: true, connected: true };
+    state.options = { ...options, agents: [codex], providerOptions: { codex: { enabled: true, executablePath: '' } } };
+    $('prompt').value = 'Keep this draft with every agent disabled'; const session = state.options;
+    let rpcCalls = 0;
+    api.rpc = async () => { rpcCalls++; return { data: [] }; };
+    api.connect = async next => ({ connected: false, options: { ...next, agents: [{ ...codex, enabled: false, connected: false }] } });
+    openSettings(); $('provider-settings').querySelector('input[data-provider="codex"]').checked = false;
+    await $('settings-form').onsubmit({ preventDefault() {} });
+    check(!state.connected && state.options === session && !rpcCalls && $('prompt').value === 'Keep this draft with every agent disabled' && state.options.providerOptions.codex.enabled === false && !$('settings-dialog').open, 'Disabling the last idle provider made catalog calls, discarded the draft, or failed to save an offline configuration');
+    api.connect = connectBefore; api.rpc = rpcBefore; state.options = options; state.connected = true; fillSettings(options);
+  }
+  results.push('all agents can be disabled without catalog requests or losing the current typed draft');
 
   resetThread(); state.active.clear(); state.queues.clear(); projects.expanded.clear();
   const focusOptions = state.options; state.options = { mode: 'local' }; state.connected = true;
@@ -2345,6 +2604,8 @@ async function checks() {
   const draftData = new Map(); const draftLast = new Map(); const draftWrites = [];
   const draftId = target => JSON.stringify([target.machine, target.kind, target.threadId || [target.cwd, target.projectId || null], target.itemId || null]);
   api.draft = target => { if (target.kind === 'composer') draftLast.set(target.machine, structuredClone(target)); return structuredClone(draftData.get(draftId(target)) || null); };
+  let draftChecks = 0;
+  api.hasDraft = target => { draftChecks++; const value = draftData.get(draftId(target)); return Boolean(value && (value.text.trim() || value.images.length)); };
   api.saveDraft = (target, patch) => {
     draftWrites.push(structuredClone({ target, patch }));
     const value = { text: '', images: [], ...draftData.get(draftId(target)), ...structuredClone(patch) };
@@ -2358,6 +2619,8 @@ async function checks() {
   state.options = { mode: 'local' }; state.connected = true; resetThread();
   const draftA = { id: 'draft-a', cwd: '/tmp/draft-a', projectId: 'draft-project-a', model: 'native-model', historyMode: 'paginated' };
   const draftB = { id: 'draft-b', cwd: '/tmp/draft-b', projectId: 'draft-project-b', historyMode: 'paginated' };
+  state.threads = [draftA, draftB]; renderThreads();
+  const draftRow = id => [...$('threads').querySelectorAll('.thread')].find(button => button.dataset.threadId === id);
   const draftNativeCalls = []; let failDraftSend = true;
   api.rpc = async (method, params) => {
     draftNativeCalls.push({ method, params });
@@ -2374,6 +2637,15 @@ async function checks() {
   $('effort').value = 'high'; modes.plan = true; $('permissions').value = 'read-only'; $('send-time').value = '72';
   const rawDraft = '  Unsent A\nwith its final newline\n';
   $('prompt').value = rawDraft; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
+  check(draftRow(draftA.id).querySelector('.thread-state.draft')?.title === 'Unsent prompt', 'Typing did not immediately mark the idle chat with an unsent prompt');
+  state.active.set(draftA.id, 'draft-working-turn'); renderThreadIndicators();
+  check(draftRow(draftA.id).querySelector('.thread-state.working') && draftRow(draftA.id).title.includes('Unsent prompt'), 'An unsent prompt hid the running spinner or lost its tooltip');
+  state.active.delete(draftA.id); state.unread.add(queueKey(draftA.id)); state.completions.set(queueKey(draftA.id), 'completed'); renderThreadIndicators();
+  check(draftRow(draftA.id).querySelector('.thread-state.draft') && draftRow(draftA.id).classList.contains('unread') && draftRow(draftA.id).title.includes('Unread'), 'A completed or unread chat concealed its unsent draft or lost unread state');
+  state.unread.delete(queueKey(draftA.id)); state.completions.delete(queueKey(draftA.id));
+  $('prompt').value = ' \n '; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
+  check(!draftRow(draftA.id).querySelector('.thread-state.draft'), 'Whitespace-only input kept the draft dot');
+  $('prompt').value = rawDraft; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
   state.images = [{ name: 'unsent.png', url: imagePng, size: 1 }]; renderImages();
   const writesBeforeTyping = draftWrites.length;
   $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
@@ -2382,6 +2654,7 @@ async function checks() {
   check(draftData.get(draftId(drafts.target)).text.endsWith('last character') && !('images' in draftWrites.at(-1).patch), 'The last keystroke was not saved synchronously or typing resent image data');
   $('prompt').value = rawDraft; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
   await openThread(draftB); check(!$('prompt').value && !state.images.length, 'A draft leaked into another conversation');
+  check(draftRow(draftA.id).querySelector('.thread-state.draft') && !draftRow(draftB.id).querySelector('.thread-state.draft'), 'Switching chats lost a background draft marker or marked an empty prompt');
   $('prompt').value = 'Draft B'; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
   await openThread(draftA);
   check($('prompt').value === rawDraft && state.images[0]?.url === imagePng && $('send-time').value === '72' && $('model').value === 'draft-model' && $('effort').value === 'high' && modes.plan, 'Chat switching lost draft text, images, schedule, model or Plan mode');
@@ -2390,6 +2663,12 @@ async function checks() {
   await restoreLastDraft();
   check(state.thread.id === draftA.id && $('prompt').value === rawDraft && state.images[0]?.url === imagePng && $('model').value === 'draft-model', 'Restart did not reopen the last unsent conversation draft or native metadata overwrote its model');
   check(!draftNativeCalls.slice(beforeDraftRestart).some(call => ['turn/start', 'thread/resume'].includes(call.method)), 'Restoring a typed draft sent it or claimed its writer');
+  drafts.pending.clear(); renderThreadIndicators();
+  const checksAfterReload = draftChecks; renderThreadIndicators(); renderThreadIndicators();
+  check(draftRow(draftA.id).querySelector('.thread-state.draft') && draftRow(draftB.id).querySelector('.thread-state.draft') && draftChecks === checksAfterReload, 'Reloading lost saved draft markers or repeatedly reread draft files');
+  const localOptions = state.options; state.options = { mode: 'ssh', host: 'draft-indicator-other-host', port: 22 }; renderThreadIndicators();
+  check(!draftRow(draftA.id).querySelector('.thread-state.draft') && !draftRow(draftB.id).querySelector('.thread-state.draft'), 'Unsent draft markers crossed machines');
+  state.options = localOptions; renderThreadIndicators();
   saveComposerDraft(); drafts.target = null; state.thread = null; state.options = { mode: 'ssh', host: 'draft-host', port: 22 }; $('workspace').value = '/remote'; resetThread();
   $('prompt').value = 'Remote draft'; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
   saveComposerDraft(); drafts.target = null; state.thread = null; state.options = { mode: 'local' }; await restoreLastDraft();
@@ -2424,7 +2703,8 @@ async function checks() {
   check($('edit-message-dialog').open && $('edited-message').value === 'Unfinished earlier-message edit' && $('prompt').value === rawDraft, 'Restart did not restore the editor independently of the composer draft');
   $('cancel-message-edit').click(); await new Promise(resolve => setTimeout(resolve, 0));
   results.push('unsent composer and editor drafts save every change, survive restart and chat/project/machine switches, retain images and settings, migrate first-send drafts, clear only after success, and never auto-send');
-  for (const method of ['draft', 'saveDraft', 'clearDraft', 'moveDraft', 'lastDraft']) delete api[method];
+  results.push('unsent prompts have a yellow idle indicator immediately and across chat switches/restarts; working spinners and unread state survive, whitespace clears it, and cached markers stay scoped to their machine');
+  for (const method of ['draft', 'hasDraft', 'saveDraft', 'clearDraft', 'moveDraft', 'lastDraft']) delete api[method];
   drafts.target = null; drafts.snapshot = null; drafts.images = []; state.queues.clear(); $('error').hidden = true;
   state.options = { mode: 'local' };
   resetThread(); state.options = { mode: 'local' }; state.connected = true; state.active.clear(); state.queues.clear();
@@ -2581,6 +2861,41 @@ async function checks() {
     resetThread();
   }
   results.push('the file-count header expands/collapses every diff together, handles mixed states and incoming files, preserves panes/focus/scroll anchoring, and keeps other turns independent');
+  {
+    state.thread = { id: 'skip-test-diff-chat', cwd: '/work/project' }; $('welcome').hidden = true;
+    const turn = 'skip-test-diff-turn';
+    const testPaths = ['src/main.test.ts', 'src/main.spec.tsx', 'tests/helpers.ts', '__tests__/suite.ts', 'src\\test\\helper.cs', 'pkg/module_test.go', 'test_parser.py'];
+    const sourcePaths = ['src/main.ts', 'src/contest.ts'];
+    const patch = file => ({ id: 'skip-test-' + file, type: 'fileChange', status: 'completed', changes: [{ path: file, kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-old\n+new' }] });
+    for (const file of [...sourcePaths, ...testPaths]) renderItem(patch(file), false, turn);
+    const card = $('messages').querySelector('.changed-files'), header = card.firstElementChild;
+    const entry = file => [...card.querySelectorAll('.changed-file-entry')].find(entry => entry.dataset.path === file);
+    fillSettings(state.options);
+    check($('skip-test-diffs').checked, 'Skipping test diffs is not enabled by default');
+    header.click();
+    check(sourcePaths.every(file => entry(file).open) && testPaths.every(file => !entry(file).open), 'Bulk expansion opened test files or skipped ordinary source files');
+    check(header.title === 'Collapse all file diffs', 'Skipped test files prevented bulk collapse');
+    renderItem(patch('src/live.test.ts'), false, turn); renderItem(patch('src/live.ts'), false, turn);
+    check(!entry('src/live.test.ts').open && entry('src/live.ts').open, 'Streaming file changes ignored the test diff preference');
+    await toggleFile(entry(testPaths[0]));
+    check(entry(testPaths[0]).open, 'Skipped test files cannot be opened individually');
+    header.click();
+    check(!card.querySelector('.changed-file-entry[open]'), 'Bulk collapse left manually opened test files expanded');
+    $('skip-test-diffs').checked = false; await $('skip-test-diffs').onchange();
+    Object.assign(preferences, await api.preferences()); fillSettings(state.options); header.click();
+    check(!$('skip-test-diffs').checked && [...card.querySelectorAll('.changed-file-entry')].every(entry => entry.open), 'Disabling the saved setting did not restore expansion of every diff');
+    const save = api.savePreferences; api.savePreferences = async () => { throw new Error('Preference write failed'); };
+    $('skip-test-diffs').checked = true; await $('skip-test-diffs').onchange();
+    check(!$('skip-test-diffs').checked && preferences.skipTestDiffs === false && !$('error').hidden, 'A failed preference write changed the selected diff behavior');
+    api.savePreferences = save; $('error').hidden = true;
+    $('skip-test-diffs').checked = true; await $('skip-test-diffs').onchange();
+    resetThread();
+    renderItem(patch('only.test.ts'), false, 'tests-only-turn');
+    const testsOnly = $('messages').querySelector('.changed-files'); testsOnly.firstElementChild.click();
+    check(!testsOnly.querySelector('.changed-file-entry[open]'), 'A tests-only summary ignored the skip preference');
+    resetThread();
+  }
+  results.push('test diffs stay collapsed by default during bulk expansion and streaming, remain manually accessible, and the setting persists without changing behavior on failed saves');
   state.thread = { id: 'diff-reuse-chat', cwd: '/work/project' }; $('welcome').hidden = true;
   const reuseTurn = 'diff-reuse-turn';
   const appliedPatch = (id, path, diff, movePath) => ({ id, type: 'fileChange', status: 'completed', changes: [{ path, kind: { type: 'update', ...(movePath ? { move_path: movePath } : {}) }, diff }] });
@@ -2955,6 +3270,219 @@ async function checks() {
     api.rpc = previousRpc; state.options = previousOptions; resetThread();
   }
   results.push('message date/time stays hover-only, uses recorded local timestamps in history and live events, survives streaming and pagination, and never invents missing dates');
+  {
+    const previousOptions = state.options, previousRpc = api.rpc, previousAgents = agents.available, previousModels = state.models;
+    resetThread(); state.active.clear(); state.threads = []; state.connected = true;
+    const codex = { id: 'codex', name: 'Codex', connected: true, defaultModel: '', methods: ['model/list', 'thread/start', 'thread/list', 'thread/read', 'thread/turns/list', 'turn/start', 'turn/interrupt', 'thread/revert'] };
+    const sample = { id: 'sample', name: 'Sample Agent', connected: true, defaultModel: 'agent:sample:model:', methods: ['model/list', 'thread/start', 'thread/list', 'thread/read', 'thread/turns/list', 'turn/start', 'turn/interrupt'] };
+    agents.available = [codex, sample]; state.options = { mode: 'local', machine: 'access:local', localCwd: '/tmp', agents: agents.available };
+    state.models = [{ model: 'shared-model', provider: 'codex', displayName: 'Shared model' }, { model: 'agent:sample:model:shared-model', provider: 'sample', displayName: 'Shared model' }];
+    const sampleThread = { id: 'agent:sample:thread:same-chat', provider: 'sample', model: 'agent:sample:model:shared-model', cwd: '/tmp' };
+    const calls = []; api.rpc = async (method, params, context) => {
+      calls.push({ method, params, context });
+      if (method === 'thread/start') return { thread: sampleThread };
+      if (method === 'turn/start') return { turn: { id: context.provider === 'sample' ? 'agent:sample:turn:same-turn' : 'same-turn', status: 'inProgress' } };
+      return { data: [], nextCursor: null };
+    };
+    renderModels();
+    check($('model').querySelectorAll('optgroup').length === 2 && !$('model').querySelector('option[value="agent:sample:model:shared-model"]').disabled, 'New chats cannot select models from both connected agents');
+    handleNotification({ provider: 'codex', machine: 'access:local', method: 'turn/started', params: { threadId: 'same-chat', turn: { id: 'same-turn' } } });
+    resetThread(); $('model').value = 'agent:sample:model:shared-model'; $('model').onchange();
+    check(selectedProvider() === 'sample' && state.active.get('same-chat') === 'same-turn' && accessKey() === 'access:local', 'Choosing another agent stopped the existing chat or changed machine storage');
+    await rpc('skills/list').catch(() => {});
+    check(!calls.some(call => call.method === 'skills/list'), 'Unsupported skills reached an agent');
+    await rpc('turn/start', { threadId: 'same-chat', model: 'shared-model' });
+    check(calls.at(-1).context.provider === 'codex', 'Background dispatch used the selected agent instead of the queued conversation owner');
+    const previousCatalog = modes.catalog; modes.catalog = []; modes.plan = false;
+    projects.selected = 'codex-project'; $('prompt').value = 'Start a sample chat';
+    await send();
+    const started = calls.find(call => call.method === 'thread/start');
+    check(started?.context.provider === 'sample' && started.params.model === sampleThread.model && !started.params.projectId, 'Selecting a model did not create the chat on its agent or forwarded another agent’s project: ' + JSON.stringify({ started, provider: selectedProvider(), model: $('model').value, error: $('error-text').textContent, sending: state.sending, commandBusy: state.commandBusy, calls }));
+    check(state.thread?.id === sampleThread.id && state.active.size === 2 && calls.at(-1).context.provider === 'sample', 'Sending to another agent replaced the running Codex chat or did not start its own turn');
+    modes.catalog = previousCatalog;
+    const thread = sampleThread;
+    setThread(thread);
+    check([...$('model').options].filter(option => !option.disabled).every(option => identityProvider(option.value) === 'sample'), 'Existing conversation allowed a model from a different agent');
+    state.models[0].supportedReasoningEfforts = [{ reasoningEffort: 'high' }];
+    state.models[1].supportedReasoningEfforts = [{ reasoningEffort: 'low' }];
+    updateEfforts('low');
+    setThread({ id: 'legacy-codex-chat', cwd: '/tmp' });
+    check($('model').value === '' && [...$('effort').options].every(option => option.value === ''), 'A chat without model metadata retained another agent’s reasoning choices');
+    setThread(thread);
+    check($('effort').options.length === 2 && $('effort').options[1].value === 'low', 'Switching back did not restore the selected model’s reasoning choices');
+    const reply = renderItem({ id: 'agent:sample:item:reply', type: 'agentMessage', text: 'Hello' }, false, 'agent:sample:turn:same-turn');
+    check(reply.label.textContent.includes('Sample Agent'), 'Replies used the wrong agent label');
+    handleNotification({ provider: 'codex', machine: 'access:local', method: 'item/agentMessage/delta', params: { threadId: 'same-chat', itemId: 'wrong-agent', delta: 'Wrong chat' } });
+    check(!state.items.has('wrong-agent'), 'Another agent’s output appeared in the selected conversation');
+    handleNotification({ provider: 'sample', machine: 'access:local', method: 'turn/started', params: { threadId: thread.id, turn: { id: 'agent:sample:turn:same-turn' } } });
+    check(state.active.size === 2 && state.active.get(thread.id) === 'agent:sample:turn:same-turn', 'Concurrent runs overwrote another agent’s active turn');
+    handleNotification({ provider: 'sample', machine: 'access:local', method: 'provider/closed', params: { message: 'Sample closed' } });
+    check(state.connected && state.active.get('same-chat') === 'same-turn' && !state.active.has(thread.id), 'One agent disconnecting cleared another agent’s running chat');
+    {
+      const beforeRpc = api.rpc, beforeProjects = projects.data;
+      const codexProject = { id: 'codex-project', roots: [{ path: '/tmp' }], name: 'Codex project' };
+      const sampleProject = { id: 'agent:sample:project:project', roots: [{ path: '/tmp' }], name: 'Sample project' };
+      const cached = { id: 'agent:sample:thread:cached', projectId: sampleProject.id, cwd: '/tmp', name: 'Cached inactive sample chat' };
+      projects.data = [codexProject, sampleProject]; let failing = false;
+      api.rpc = async (method, params) => {
+        if (method === 'thread/list') {
+          if (params.projectId === sampleProject.id) { if (failing) throw new Error('Sample list failed'); return { data: [cached], nextCursor: null }; }
+          return { data: params.projectId === codexProject.id ? [{ id: failing ? 'new-codex-result' : 'old-codex-result', cwd: '/tmp', projectId: codexProject.id }] : [], nextCursor: null };
+        }
+        if (method === 'project/list') return { data: [codexProject], errors: [{ provider: 'sample', message: 'Sample projects failed' }], nextCursor: null };
+        return { data: [], nextCursor: null };
+      };
+      await loadThreads(); failing = true; await loadThreads();
+      check(state.threads.some(entry => entry.id === 'new-codex-result') && state.threads.some(entry => entry.id === cached.id) && $('error-text').textContent.includes('Sample list failed'), 'One project’s failure blocked healthy refreshes, removed cached chats, or hid the error');
+      codex.methods.push('project/list');
+      await loadProjects(); codex.methods.pop();
+      check(projects.data.some(entry => entry.id === sampleProject.id) && projects.data.some(entry => entry.id === codexProject.id), 'A partial project response erased the failed agent’s cached projects');
+      api.rpc = beforeRpc; projects.data = beforeProjects;
+    }
+    {
+      const beforeConnect = api.connect;
+      const options = state.options, selection = state.selection;
+      const running = { id: 'same-chat', cwd: '/tmp', model: 'shared-model', status: { type: 'active' } };
+      setThread(running); $('prompt').value = 'Keep this unsent draft';
+      handleNotification({ id: 'recovery-question', provider: 'codex', method: 'item/tool/requestUserInput', params: { threadId: running.id, questions: [{ id: 'answer', question: 'Continue?' }] } });
+      const answer = state.requestCards.get('recovery-question').querySelector('input'); answer.value = 'Keep my answer';
+      const queue = { key: queueKey(running.id), machine: accessKey(), thread: running, messages: [{ draftId: 'recovery-queued', text: 'Queued later', images: [], input: [{ type: 'text', text: 'Queued later' }], access: { sandbox: 'read-only', approvalPolicy: 'never' }, mode: 'default', model: 'shared-model', effort: '', machine: accessKey(), thread: running }], paused: false };
+      state.queues.set(queue.key, queue);
+      let recovered = 0;
+      const metadata = [codex, { ...sample, connected: true, error: null }];
+      api.connect = async () => { recovered++; return { reused: true, reconnected: ['sample'], options: { ...options, agents: metadata } }; };
+      await connect(options);
+      check(recovered === 1 && state.options === options && state.selection === selection && state.active.get(running.id) === 'same-turn' && !queue.paused && queue.messages.length === 1 && $('prompt').value === 'Keep this unsent draft' && state.requestCards.get('recovery-question').querySelector('input') === answer && answer.value === 'Keep my answer', 'Recovering an agent was blocked by a healthy running chat or reset its draft, question, queue, or active state');
+      await handleNotification({ method: 'providers/updated', machine: accessKey(), params: { agents: metadata, reconnected: ['sample'] } });
+      check(state.active.get(running.id) === 'same-turn' && state.requestCards.get('recovery-question').querySelector('input') === answer && !queue.paused, 'Background recovery refreshed catalogs by resetting a healthy running conversation');
+      state.queues.delete(queue.key); state.requests.delete('recovery-question'); renderRequests(); api.connect = beforeConnect;
+    }
+    {
+      const beforeRpc = api.rpc, beforeModels = state.models, beforeModes = modes.catalog;
+      codex.methods.push('collaborationMode/list');
+      const catalog = [
+        { provider: 'codex', model: 'shared-model', supportedReasoningEfforts: [{ reasoningEffort: 'high' }] },
+        { provider: 'sample', model: sampleThread.model, supportedReasoningEfforts: [{ reasoningEffort: 'low' }], displayName: 'Updated sample model' }
+      ];
+      const presets = [{ provider: 'codex', mode: 'plan' }, { provider: 'sample', mode: 'plan' }];
+      state.models = catalog; modes.catalog = presets; renderModels();
+      setThread({ id: 'same-chat', cwd: '/tmp', model: 'shared-model', reasoningEffort: 'high' });
+      modes.plan = true; $('prompt').value = 'Keep the selected settings';
+      let failed = 'codex';
+      api.rpc = async method => ({ data: (method === 'model/list' ? catalog : presets).filter(entry => entry.provider !== failed), errors: [{ provider: failed, message: 'Temporary catalog failure' }] });
+      const before = JSON.stringify(composerSnapshot());
+      await refreshAgentCatalogs();
+      check(JSON.stringify(composerSnapshot()) === before && state.models.some(model => model.provider === 'sample' && model.displayName === 'Updated sample model'), 'A partial catalog refresh changed the typed draft/model/reasoning/Plan mode or blocked the healthy agent’s models');
+      check(collaborationParams({ thread: state.thread, mode: 'plan', model: $('model').value, effort: $('effort').value }).collaborationMode.mode === 'plan', 'A partial catalog failure silently stripped Plan mode from the outgoing request');
+      setThread({ ...sampleThread, reasoningEffort: 'low' }); modes.plan = true; failed = 'sample';
+      await refreshAgentCatalogs();
+      check($('model').value === sampleThread.model && $('effort').value === 'low' && collaborationParams({ thread: state.thread, mode: 'plan', model: $('model').value }).collaborationMode.settings.model === sampleThread.model, 'Catalog preservation assumed Codex was the failed provider or mixed identical Plan modes across agents');
+      api.rpc = async () => { throw new Error('All catalogs failed'); };
+      await refreshAgentCatalogs();
+      check($('model').value === sampleThread.model && $('effort').value === 'low' && modes.catalog.length === 2, 'A total catalog failure discarded cached settings');
+      handleNotification({ provider: 'sample', machine: accessKey(), method: 'provider/closed', params: { message: 'Sample closed again' } });
+      api.rpc = async method => ({ data: (method === 'model/list' ? catalog : presets).filter(entry => entry.provider === 'codex'), nextCursor: null });
+      await refreshAgentCatalogs();
+      check($('model').value === sampleThread.model && $('model').selectedOptions[0].disabled && $('effort').value === 'low', 'Refreshing another agent discarded the disconnected chat’s selected model and reasoning');
+      api.rpc = async method => ({ data: method === 'model/list' ? catalog : method === 'collaborationMode/list' ? presets : [], nextCursor: null });
+      const recovered = () => state.options.agents.map(agent => ({ ...agent, connected: true, error: null }));
+      await handleNotification({ method: 'providers/updated', machine: accessKey(), params: { agents: recovered(), reconnected: ['sample'] } });
+      check($('error').hidden && $('model').value === sampleThread.model && $('effort').value === 'low', 'Recovery retained its disconnect banner or changed the restored model settings');
+      handleNotification({ provider: 'sample', machine: accessKey(), method: 'provider/closed', params: { message: 'Sample closed once more' } });
+      showError('Could not save queued messages');
+      await handleNotification({ method: 'providers/updated', machine: accessKey(), params: { agents: recovered(), reconnected: ['sample'] } });
+      check(!$('error').hidden && $('error-text').textContent === 'Could not save queued messages', 'Agent recovery dismissed an unrelated newer error');
+      api.rpc = async method => ({ data: (method === 'model/list' ? catalog : presets).filter(entry => entry.provider === 'codex'), nextCursor: null });
+      await refreshAgentCatalogs();
+      check(!state.models.some(model => model.provider === 'sample') && !modes.catalog.some(mode => mode.provider === 'sample'), 'A successful catalog refresh kept legitimately removed entries');
+      let missingPlan;
+      try { collaborationParams({ thread: state.thread, mode: 'plan', model: sampleThread.model }); } catch (error) { missingPlan = error; }
+      check(missingPlan?.message.includes('Plan mode is unavailable'), 'Plan mode silently became a normal turn when no preset was available');
+      const blockedCalls = []; state.owned.add(sampleThread.id); modes.plan = true; $('prompt').value = 'This must stay in Plan mode'; $('model').value = sample.defaultModel;
+      api.rpc = async method => { blockedCalls.push(method); return { data: [], nextCursor: null }; };
+      await send();
+      check(!blockedCalls.includes('turn/start') && $('prompt').value === 'This must stay in Plan mode' && $('error-text').textContent.includes('Plan mode is unavailable'), 'An unavailable Plan preset executed a normal turn or lost the unsent prompt');
+      check(Object.keys(collaborationParams({ thread: state.thread, mode: 'default', model: sampleThread.model })).length === 0, 'An agent without collaboration presets could not use its default mode');
+      codex.methods.pop(); api.rpc = beforeRpc; state.models = beforeModels; modes.catalog = beforeModes; modes.plan = false; $('error').hidden = true;
+    }
+    {
+      const beforeDraft = api.draft, beforeSaveDraft = api.saveDraft, beforeRpc = api.rpc, beforeDraftState = { ...drafts };
+      const saved = { text: 'Keep this on Sample', images: [], model: sampleThread.model, effort: 'high', mode: 'default' };
+      const writes = [], sent = [];
+      state.active.clear(); state.thread = null; state.models = [{ model: 'shared-model', provider: 'codex' }];
+      state.options.agents = [codex, { ...sample, connected: false }];
+      $('model').value = ''; renderModels();
+      Object.assign(drafts, { target: null, snapshot: null, images: [], suspended: false });
+      api.draft = () => structuredClone(saved); api.saveDraft = (_target, patch) => writes.push(structuredClone(patch));
+      api.rpc = async (method, params, context) => { sent.push({ method, params, context }); return { data: [], nextCursor: null }; };
+      activateComposerDraft(); updateBusy();
+      check($('prompt').value === saved.text && $('model').value === saved.model && selectedProvider() === 'sample' && $('effort').value === 'high' && $('model').selectedOptions[0].disabled && $('send').disabled, 'Restarting without a provider changed the draft’s agent/model/reasoning or enabled sending');
+      $('prompt').value += ' with more details'; $('prompt').oninput();
+      check(writes.at(-1)?.model === saved.model && writes.at(-1)?.effort === saved.effort, 'Typing over an unavailable-provider draft overwrote its saved model settings');
+      await send();
+      check(sent.length === 0 && $('prompt').value.includes('more details') && $('error-text').textContent.includes('model is unavailable'), 'Enter sent an unavailable-provider draft to another agent or cleared it');
+      await runShortcut({ prompt: 'Review this', mode: 'send' });
+      check(sent.length === 0, 'A shortcut bypassed the unavailable model guard');
+      renderModels();
+      check($('model').value === saved.model && $('effort').value === 'high' && $('send').disabled, 'A catalog rebuild discarded the missing saved model');
+      state.options.agents = [codex]; renderModels();
+      check($('model').value === saved.model && $('send').disabled, 'Removing a provider silently reassigned its draft');
+      state.options.agents = [codex, { ...sample, connected: true }];
+      api.rpc = async method => ({ data: method === 'model/list' ? [...state.models, { model: saved.model, provider: 'sample', supportedReasoningEfforts: [{ reasoningEffort: 'high' }] }] : [], nextCursor: null });
+      await refreshAgentCatalogs();
+      check($('model').value === saved.model && !$('model').selectedOptions[0].disabled && !modelUnavailable() && $('effort').value === 'high' && !$('send').disabled && $('prompt').value.includes('more details'), 'Recovery failed to enable the original draft with its settings intact');
+      api.rpc = async (method, params, context) => { sent.push({ method, params, context }); return {}; };
+      await rpc('thread/start', { model: $('model').value });
+      check(sent.length === 1 && sent[0].context.provider === 'sample', 'The recovered draft still routed to Codex');
+      state.options.agents = [codex, { ...sample, connected: false }]; renderModels();
+      $('model').value = 'shared-model'; $('model').onchange();
+      check(selectedProvider() === 'codex' && !$('send').disabled, 'Explicitly choosing an available model did not unblock the composer');
+      api.draft = beforeDraft; api.saveDraft = beforeSaveDraft; api.rpc = beforeRpc; Object.assign(drafts, beforeDraftState);
+      $('error').hidden = true;
+    }
+    results.push('unavailable-provider drafts retain their owner/model/reasoning across restart, typing and catalog rebuilds; Enter/shortcuts cannot reroute them, and recovery or an explicit model choice enables sending');
+    state.active.clear(); state.options = previousOptions; agents.available = previousAgents; state.models = previousModels; api.rpc = previousRpc;
+    resetThread(); renderModels(); fillSettings(previousOptions);
+  }
+  results.push('model groups choose agents per conversation; partial failures preserve healthy lists and cached projects, recovery preserves running chats/drafts/queues/questions, and reasoning choices follow the chat’s model');
+  results.push('partial and total catalog failures preserve each agent’s selected model/reasoning/Plan settings; unavailable Plan mode cannot execute a normal turn, and recovery clears only its own disconnect banner');
+  {
+    const previousOptions = state.options, previousRpc = api.rpc, previousConnected = state.connected, previousNativeQueues = new Map(state.nativeQueues);
+    resetThread();
+    const thread = { id: 'agent:zcode:thread:native-queue', provider: 'zcode', name: 'Native queue', cwd: '/tmp' };
+    state.connected = true; state.options = { mode: 'local', agents: [{ id: 'codex', name: 'Codex', connected: true, methods: [] }, { id: 'zcode', name: 'ZCode', connected: true, methods: ['queue/delete', 'queue/resume'] }] };
+    setThread(thread);
+    const unsent = { key: queueKey(thread.id), machine: accessKey(), thread, paused: true, messages: [{ text: 'Unsent app draft', images: [], input: [{ type: 'text', text: 'Unsent app draft' }] }] };
+    state.queues.set(unsent.key, unsent);
+    const queue = { autoDrain: false, pauseReason: 'stopped', items: [{ queueItemId: 'accepted-one', text: 'Already accepted one' }, { queueItemId: 'accepted-two', text: 'Already accepted two' }] };
+    const notify = value => handleNotification({ provider: 'zcode', machine: accessKey(), method: 'provider/queue/updated', params: { threadId: thread.id, queue: value } });
+    const nativeRows = () => [...$('queued-messages').querySelectorAll('.native-queued-message')];
+    const calls = [];
+    api.rpc = async (method, params, context) => { calls.push({ method, params, context }); return {}; };
+    notify(queue);
+    check(nativeRows().length === 2 && nativeRows()[0].textContent.includes('Paused in ZCode') && !nativeRows().some(row => row.querySelector('.queue-drag-handle') || [...row.querySelectorAll('button')].some(button => ['Retry', 'Edit', 'Steer'].includes(button.textContent))) && state.queues.get(unsent.key) === unsent, 'Native accepted inputs were hidden, exposed resend/edit controls, or replaced app-owned unsent drafts');
+    await [...nativeRows()[0].querySelectorAll('button')].find(button => button.textContent === 'Resume').onclick();
+    check(calls.length === 1 && calls[0].method === 'queue/resume' && calls[0].params.threadId === thread.id && calls[0].context.provider === 'zcode' && state.nativeQueues.get(thread.id) === queue && !queue.autoDrain, 'Resuming native work resent accepted input or changed queue authority before projection');
+    notify({ ...queue, autoDrain: true });
+    check(nativeRows()[0].textContent.includes('Queued in ZCode') && !nativeRows().some(row => row.textContent.includes('Resume')), 'Native auto-drain projection did not update the visible queue');
+    await nativeRows()[0].querySelector('button[aria-label]').onclick();
+    check(calls.at(-1).method === 'queue/delete' && calls.at(-1).params.queueItemId === 'accepted-one' && state.nativeQueues.get(thread.id).items.length === 2, 'Native cancel sent the wrong identifier or removed accepted work before projection');
+    notify({ ...queue, autoDrain: true, items: [queue.items[1]] });
+    check(nativeRows().length === 1 && nativeRows()[0].textContent.includes('Already accepted two') && unsent.messages[0].text === 'Unsent app draft', 'Authoritative native removal changed the unsent app queue');
+    api.rpc = async () => { throw new Error('Native queue operation failed'); };
+    await nativeRows()[0].querySelector('button[aria-label]').onclick();
+    check(nativeRows().length === 1 && $('error-text').textContent.includes('Native queue operation failed'), 'Failed native cancel lost the accepted message or hid its error');
+    handleNotification({ provider: 'codex', machine: accessKey(), method: 'provider/queue/updated', params: { threadId: 'native-codex-background', queue } });
+    handleNotification({ provider: 'zcode', machine: 'access:other-machine:22', method: 'provider/queue/updated', params: { threadId: thread.id, queue: { items: [] } } });
+    check(nativeRows().length === 1 && state.nativeQueues.has('native-codex-background'), 'Another machine changed the visible native queue or a background queue was dropped');
+    handleNotification({ provider: 'zcode', method: 'provider/closed', params: { reconfigured: true } });
+    check(!state.nativeQueues.has(thread.id) && state.nativeQueues.has('native-codex-background') && !$('queued-messages').hidden && state.queues.get(unsent.key) === unsent, 'Closing one provider removed another native queue or its unsent app draft');
+    handleNotification({ method: 'connection/closed', params: { message: 'Test connection closed' } });
+    check(!state.nativeQueues.size, 'A closed connection retained accepted queues from its machine');
+    state.queues.delete(unsent.key); savedQueues.delete(unsent.key); state.nativeQueues = previousNativeQueues;
+    state.options = previousOptions; state.connected = previousConnected; api.rpc = previousRpc; $('error').hidden = true; resetThread();
+  }
+  results.push('native accepted queues display authoritative paused/running state, resume or cancel by ID without resending, retain failed operations, preserve unsent drafts, and clear per provider/machine');
   api.rpc = originalRpc; state.threads = [branchSource]; await openThread(branchSource); connectionLabels(); status(connectedStatus());
   projects.data = [{ id: branchSource.projectId, name: 'Rapidcode', roots: [{ path: branchSource.cwd }] }];
   await expandProject(projects.data[0], false);
@@ -2969,7 +3497,7 @@ module.exports = async () => {
     testWindow.webContents.session.webRequest.onBeforeRequest({ urls: ['file://*/*renderer.js'] }, (_details, callback) => callback({ cancel: true }));
     await testWindow.loadFile(path.join(__dirname, '..', 'index.html'));
     const source = fs.readFileSync(path.join(__dirname, '..', 'renderer.js'), 'utf8').replace('init().catch(showError);', '');
-    const results = await testWindow.webContents.executeJavaScript(`(async () => { const window = { codex: {} }; ${source}\nreturn (${checks.toString()})().catch(error => ({ error: error.stack })); })()`);
+    const results = await testWindow.webContents.executeJavaScript(`(async () => { const window = { agent: {} }; ${source}\nreturn (${checks.toString()})().catch(error => ({ error: error.stack })); })()`);
     if (results.error) throw new Error(results.error);
     const artifacts = path.join(__dirname, '..', 'artifacts', 'branches-ui');
     fs.mkdirSync(artifacts, { recursive: true });
@@ -2991,7 +3519,7 @@ module.exports = async () => {
     }
     await testWindow.webContents.executeJavaScript("(async () => { document.getElementById('theme-select').value = 'system'; await document.getElementById('theme-select').onchange(); })()");
     await testWindow.loadFile(path.join(__dirname, '..', 'index.html'));
-    await testWindow.webContents.executeJavaScript(`(() => { const window = { codex: {} }; ${source}
+    await testWindow.webContents.executeJavaScript(`(() => { const window = { agent: {} }; ${source}
       $('welcome').hidden = true;
       renderItem({ id: 'preview-user', type: 'userMessage', startedAtMs: Date.UTC(2026, 10, 11, 3, 4, 5), content: [{ type: 'text', text: 'Check the project and run the tests.' }] });
       renderItem({ id: 'preview-thought', type: 'reasoning', summary: ['Checking project configuration and tests.'] }, false, 'preview-turn');
@@ -3018,6 +3546,10 @@ module.exports = async () => {
       globalThis.previewQuestion = () => {
         preferences.completionSound = false;
         handleNotification({ id: 'preview-question', method: 'item/tool/requestUserInput', params: { threadId: state.thread.id, turnId: 'preview-running', questions: [{ id: 'location', question: 'Where should the Linux/Windows fingerprint choice be available?', options: [{ label: 'Project settings', description: 'Configure it for each project' }] }] } });
+      };
+      globalThis.previewProviders = () => {
+        state.options.agents = [{ id: 'codex', name: 'Codex', enabled: true, available: true, connected: true }, { id: 'zcode', name: 'ZCode', available: false, defaultEnabled: false, enabled: false, connected: false }];
+        fillSettings(state.options);
       };
     })()`);
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -3048,7 +3580,7 @@ module.exports = async () => {
     await testWindow.webContents.executeJavaScript("document.getElementById('usage-meter').click()");
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'usage-panel.png'), (await testWindow.webContents.capturePage()).toPNG());
-    const fits = await testWindow.webContents.executeJavaScript("(() => { const panel = document.getElementById('usage-panel'); const rect = panel.getBoundingClientRect(); return panel.matches(':popover-open') && rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight; })()");
+    const fits = await testWindow.webContents.executeJavaScript("(() => { const panel = document.getElementById('usage-panel'); const rect = panel.getBoundingClientRect(); return panel.matches(':popover-open') && panel.checkVisibility() && rect.width > 0 && rect.height > 0 && rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight; })()");
     if (!fits) throw new Error('Usage panel extends beyond the viewport');
     testWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
     testWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
@@ -3068,7 +3600,7 @@ module.exports = async () => {
     testWindow.webContents.sendInputEvent({ type: 'char', keyCode: '\r' });
     testWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
     await new Promise(resolve => setTimeout(resolve, 100));
-    if (!await testWindow.webContents.executeJavaScript("[...document.querySelectorAll('.changed-file-entry')].every(entry => entry.open)")) throw new Error('Enter on the file-count header did not expand all diffs');
+    if (!await testWindow.webContents.executeJavaScript("[...document.querySelectorAll('.changed-file-entry')].every(entry => entry.open === !entry.dataset.path.endsWith('.test.ts'))")) throw new Error('Enter on the file-count header did not expand source diffs while skipping tests');
     fs.writeFileSync(path.join(artifacts, 'changed-files-all-open.png'), (await testWindow.webContents.capturePage()).toPNG());
     testWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Space' });
     testWindow.webContents.sendInputEvent({ type: 'char', keyCode: ' ' });
@@ -3088,6 +3620,8 @@ module.exports = async () => {
     await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file').click(); document.getElementById('open-settings').click()");
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'completion-sound-settings.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript('previewProviders()');
+    fs.writeFileSync(path.join(artifacts, 'provider-settings.png'), (await testWindow.webContents.capturePage()).toPNG());
     await testWindow.webContents.executeJavaScript("document.getElementById('settings-dialog').close(); previewQuestion()");
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'waiting-question.png'), (await testWindow.webContents.capturePage()).toPNG());

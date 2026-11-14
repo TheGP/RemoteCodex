@@ -2,7 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const MAX_LOG_BYTES = 10 * 1024 * 1024;
-const fields = new Set(['source', 'machine', 'threadId', 'turnId', 'method', 'requestId', 'queueLength', 'queueCount', 'paused', 'phase', 'reason', 'error', 'connected', 'owned', 'working', 'steer', 'delayHours', 'status', 'willRetry', 'durationMs', 'version', 'level', 'module', 'idleMs', 'firstOutputMs', 'pendingRequests', 'count', 'pid', 'exitCode', 'signal']);
+const fields = new Set(['provider', 'source', 'machine', 'threadId', 'turnId', 'method', 'requestId', 'queueLength', 'queueCount', 'paused', 'phase', 'reason', 'error', 'connected', 'owned', 'working', 'steer', 'delayHours', 'status', 'willRetry', 'durationMs', 'version', 'level', 'module', 'idleMs', 'firstOutputMs', 'pendingRequests', 'count', 'pid', 'exitCode', 'signal']);
 
 function stderrDiagnostic(line) {
   line = line.replace(/\x1b\[[0-9;]*m/g, '');
@@ -78,7 +78,7 @@ class TurnDiagnostics {
     if (record.quiet) this.write('turn.resumed', threadId, record, { method });
     record.quiet = false;
     record.lastAt = this.now();
-    record.phase = ['agentMessage', 'reasoning', 'plan', 'commandExecution', 'fileChange', 'mcpToolCall', 'webSearch', 'dynamicToolCall'].includes(item?.type) ? item.type + (method === 'item/completed' ? ':completed' : ':started') : method;
+    record.phase = ['agentMessage', 'reasoning', 'plan', 'commandExecution', 'fileChange', 'mcpToolCall', 'webSearch', 'dynamicToolCall', 'contextCompaction'].includes(item?.type) ? item.type + (method === 'item/completed' ? ':completed' : ':started') : method;
     if (output && record.firstOutputMs === undefined) {
       record.firstOutputMs = this.now() - record.startedAt;
       this.write('turn.first-output', threadId, record);

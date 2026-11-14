@@ -29,6 +29,21 @@ test('typed text, images and send choices survive fresh store instances without 
   assert.equal(store.read(target).images[0].url, image.url);
 });
 
+test('draft markers read metadata without loading images and stay separate by chat and machine', t => {
+  const store = fixture(t);
+  assert.equal(store.hasContent(target), false);
+  store.save(target, { text: ' \n ' }); assert.equal(store.hasContent(target), false);
+  store.save(target, { text: 'Unsent prompt' });
+  assert.equal(new DraftStore(store.directory).hasContent(target), true);
+  assert.equal(store.hasContent({ ...target, threadId: 'other-chat' }), false);
+  assert.equal(store.hasContent({ ...target, machine: 'access:other-machine' }), false);
+  store.save(target, { text: '', images: [image] });
+  fs.unlinkSync(path.join(store.folder(target), store.metadata(target).images[0].file));
+  assert.equal(store.hasContent(target), true);
+  assert.throws(() => store.read(target), /ENOENT/);
+  store.clear(target); assert.equal(store.hasContent(target), false);
+});
+
 test('drafts stay separate across chats, machines, projects, folders and editor types', t => {
   const store = fixture(t);
   const targets = [target, { ...target, threadId: 'other-chat' }, { ...target, machine: 'access:user@server:22' }, { ...target, threadId: null }, { ...target, threadId: null, projectId: 'project-two' }, { ...target, threadId: null, cwd: '/other-folder' }, { ...target, kind: 'edit-message', itemId: 'turn-one' }, { ...target, kind: 'edit-queue', itemId: 'queued-one' }];

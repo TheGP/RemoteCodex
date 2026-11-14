@@ -13,7 +13,7 @@ function fixture(t) {
   const store = new ScheduleStore(path.join(directory, 'schedules.json'));
   const now = Date.now();
   const calls = [];
-  const connection = { ready: true, child: {}, call: async (method, params) => { calls.push({ method, params }); return method === 'turn/start' ? { turn: { id: 'scheduled-turn' } } : { thread: method === 'thread/read' ? { ...thread, status: { type: 'notLoaded' } } : thread }; } };
+  const connection = { ready: true, session: {}, call: async (method, params) => { calls.push({ method, params }); return method === 'turn/start' ? { turn: { id: 'scheduled-turn' } } : { thread: method === 'thread/read' ? { ...thread, status: { type: 'notLoaded' } } : thread }; } };
   const scheduler = new Scheduler({ store, connection, available: () => true });
   return { store, now, calls, connection, scheduler, add: (args = {}) => store.add(thread, { prompt: 'Check the deployment', delay_seconds: 1, ...args }, null, now) };
 }
@@ -98,7 +98,7 @@ test('cancellation or a connection switch during preflight cannot send a task', 
   assert.equal(f.scheduler.dispatching.size, 0);
   f.add();
   const switched = f.scheduler.tick(f.now + 2000);
-  f.connection.child = {}; finish({ thread }); await switched;
+  f.connection.session = {}; finish({ thread }); await switched;
   assert.equal(f.store.list().at(-1).status, 'pending');
 });
 

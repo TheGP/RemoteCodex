@@ -74,6 +74,17 @@ function turnsFixture() {
   return { connection, entries, turns, at: value => { now = value; }, notify: (method, params, id) => connection.emit('notification', { method, params, id }) };
 }
 
+test('compaction lifecycle is visible in diagnostics without being counted as model output', () => {
+  const f = turnsFixture();
+  f.notify('turn/started', { threadId: 'chat', turn: { id: 'turn' } });
+  f.notify('item/started', { threadId: 'chat', turnId: 'turn', item: { type: 'contextCompaction' } });
+  assert.equal(f.entries.at(-1).details.phase, 'contextCompaction:started');
+  f.notify('item/completed', { threadId: 'chat', turnId: 'turn', item: { type: 'contextCompaction' } });
+  assert.equal(f.entries.at(-1).details.phase, 'contextCompaction:completed');
+  assert.ok(f.turns.turns.has('chat'));
+  assert.ok(!f.entries.some(entry => entry.event === 'turn.first-output'));
+});
+
 test('silent turns log once, isolate parallel chats, and record first output and recovery timing', () => {
   const f = turnsFixture();
   f.notify('turn/started', { threadId: 'quiet', turn: { id: 'one' } });

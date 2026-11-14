@@ -5,7 +5,7 @@ const { readImage } = require('../images.cjs');
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=', 'base64');
 function fixture(bytes = png) {
   const calls = [];
-  const connection = { ready: true, child: {}, call: async (method, params) => { calls.push({ method, params }); return { dataBase64: bytes.toString('base64') }; } };
+  const connection = { ready: true, session: {}, call: async (method, params) => { calls.push({ method, params }); return { dataBase64: bytes.toString('base64') }; } };
   return { calls, connection };
 }
 
@@ -36,8 +36,8 @@ test('oversized, corrupt, missing, and disconnected images fail safely', async (
   await assert.rejects(readImage(connection, '/tmp/corrupt.png'), /invalid/);
   connection.call = async () => { throw new Error('File not found'); };
   await assert.rejects(readImage(connection, '/tmp/missing.png'), /not found/);
-  connection.call = async () => { connection.child = {}; return { dataBase64: png.toString('base64') }; };
+  connection.call = async () => { connection.session = {}; return { dataBase64: png.toString('base64') }; };
   await assert.rejects(readImage(connection, '/tmp/stale.png'), /connection changed/);
   connection.ready = false;
-  await assert.rejects(readImage(connection, '/tmp/offline.png'), /Connect to Codex/);
+  await assert.rejects(readImage(connection, '/tmp/offline.png'), /Connect to a coding agent/);
 });

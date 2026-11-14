@@ -132,6 +132,19 @@ test('completion sound accepts only booleans and survives restarting', t => {
   store.update({ completionSound: true }); assert.equal(new PreferencesStore(file).read().completionSound, true);
 });
 
+test('skipping test diffs defaults on, persists both choices, and rejects invalid values', t => {
+  const file = fixture(t); const store = new PreferencesStore(file);
+  assert.notEqual(store.read().skipTestDiffs, false);
+  for (const skipTestDiffs of [false, true]) {
+    store.update({ skipTestDiffs });
+    assert.equal(new PreferencesStore(file).read().skipTestDiffs, skipTestDiffs);
+  }
+  for (const skipTestDiffs of [null, undefined, 0, 1, 'false', {}, []]) assert.throws(() => store.update({ skipTestDiffs }));
+  assert.equal(store.read().skipTestDiffs, true);
+  fs.writeFileSync(file, JSON.stringify({ ...store.read(), skipTestDiffs: 'false' }));
+  assert.throws(() => store.read(), /Invalid test diff preference/);
+});
+
 test('completion volume persists and rejects values outside the percentage range', t => {
   const file = fixture(t); const store = new PreferencesStore(file);
   for (const completionVolume of [0, 50, 100]) {

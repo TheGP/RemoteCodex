@@ -3,7 +3,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
-const { CodexConnection, connectionOptions } = require('./transport.cjs');
+const { connectionKey, rendererMethods } = require('./providers.cjs');
+const { AgentPool, agentTarget, poolOptions: connectionOptions } = require('./agent-pool.cjs');
 const { PinStore } = require('./pins.cjs');
 const { QueueStore } = require('./queues.cjs');
 const { PreferencesStore } = require('./preferences.cjs');
@@ -15,11 +16,12 @@ const { DiagnosticLog, TurnDiagnostics } = require('./diagnostics.cjs');
 const { DraftStore, registerDraftIpc } = require('./drafts.cjs');
 const { AgentWakeLock } = require('./wake-lock.cjs');
 
-const connection = new CodexConnection();
+const connection = new AgentPool();
 const page = pathToFileURL(path.join(__dirname, 'index.html')).href;
-const methods = new Set(['thread/list', 'thread/read', 'thread/resume', 'thread/start', 'thread/fork', 'thread/revert', 'thread/archive', 'thread/turns/list', 'thread/items/list', 'thread/name/set', 'thread/settings/update', 'thread/metadata/update', 'project/list', 'project/create', 'project/update', 'project/move', 'turn/start', 'turn/steer', 'turn/interrupt', 'model/list', 'account/read', 'account/rateLimits/read', 'fs/readDirectory', 'skills/list', 'collaborationMode/list', 'thread/compact/start', 'review/start', 'mcpServerStatus/list']);
+const methods = new Set(rendererMethods);
 let window;
 let settings;
+let settingsError = null;
 const manualNames = new Set();
 let titleQueue = Promise.resolve();
 const smoke = process.argv.includes('--smoke-test');
@@ -33,13 +35,16 @@ function checkSender(event) {
 }
 
 app.whenReady().then(async () => {
-  const wakeLock = new AgentWakeLock(powerSaveBlocker, connection, working => connection.emit('diagnostic', { event: 'power.keep-awake', details: { working } }));
-  app.on('before-quit', () => wakeLock.clear());
+  const agents = new Map();
+  connection.on('connection', ({ provider, connection: driver }) => {
+    const wakeLock = new AgentWakeLock(powerSaveBlocker, driver, working => driver.emit('diagnostic', { event: 'power.keep-awake', details: { working } }));
+    agents.set(provider, { wakeLock, diagnostics: new TurnDiagnostics(driver) });
+  });
+  app.on('before-quit', () => { for (const agent of agents.values()) agent.wakeLock.clear(); });
   const diagnostic = new DiagnosticLog(path.join(app.getPath('userData'), 'logs'));
   diagnostic.write('app.started', { version: app.getVersion() });
   connection.on('diagnostic', entry => diagnostic.write(entry.event, entry.details));
-  const turnDiagnostics = new TurnDiagnostics(connection);
-  const diagnosticTimer = setInterval(() => turnDiagnostics.check(), 15000); diagnosticTimer.unref();
+  const diagnosticTimer = setInterval(() => { for (const agent of agents.values()) agent.diagnostics.check(); }, 15000); diagnosticTimer.unref();
   app.on('before-quit', () => clearInterval(diagnosticTimer));
   for (const event of ['suspend', 'resume']) powerMonitor.on(event, () => diagnostic.write('power.' + event));
   ipcMain.on('diagnostic', (event, name, details) => {
@@ -47,11 +52,14 @@ app.whenReady().then(async () => {
     catch (error) { diagnostic.write('renderer.log.rejected', { error: error.message }); }
   });
   const settingsFile = path.join(app.getPath('userData'), 'connection.json');
-  settings = connectionOptions({ mode: 'local' });
-  try { settings = connectionOptions(JSON.parse(fs.readFileSync(settingsFile, 'utf8'))); } catch (error) {
-    if (error.code !== 'ENOENT') console.error('Could not load saved connection:', error.message);
+  settings = connectionOptions({ mode: 'local' }, connection.registry);
+  try { settings = connectionOptions(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), connection.registry); } catch (error) {
+    if (error.code !== 'ENOENT') {
+      settingsError = `Saved connection settings could not be loaded: ${error.message}`;
+      diagnostic.write('settings.load.failed', { error: error.message });
+    }
   }
-  if (smoke) settings = connectionOptions({ mode: localSmoke ? 'local' : 'ssh' });
+  if (smoke) settings = connectionOptions({ mode: localSmoke ? 'local' : 'ssh' }, connection.registry);
   const pins = new PinStore(path.join(app.getPath('userData'), 'pins.json'));
   const queues = new QueueStore(path.join(app.getPath('userData'), 'queues'));
   const drafts = new DraftStore(path.join(app.getPath('userData'), 'drafts'));
@@ -63,12 +71,19 @@ app.whenReady().then(async () => {
     checkSender(event);
     if (typeof threadId !== 'string' || !threadId || threadId.length > 200) throw new Error('Invalid conversation.');
     if (token) { if (editLocks.get(threadId) === token) editLocks.delete(threadId); return; }
-    if (!connection.ready) throw new Error('Connect to Codex first.');
+    if (!connection.ready) throw new Error('Connect to a coding agent first.');
     if (editLocks.has(threadId) || scheduler.dispatching.has(threadId)) throw new Error('This conversation is busy; try editing after the task finishes.');
     const lock = randomUUID(); editLocks.set(threadId, lock); return lock;
   });
   const schedulesChanged = () => { if (window && !window.isDestroyed()) window.webContents.send('notification', { method: 'scheduler/updated', params: {} }); };
-  const scheduleMachine = () => 'access:' + (settings.mode === 'local' ? 'local' : `${settings.host}:${settings.port}`);
+  const scheduleMachine = () => connectionKey(settings);
+  const publicSettings = () => ({ ...settings, machine: scheduleMachine(), agents: connection.listProviders(settings), settingsError });
+  const saveSettings = next => {
+    fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
+    fs.writeFileSync(settingsFile + '.tmp', JSON.stringify(next, null, 2), { mode: 0o600 });
+    fs.renameSync(settingsFile + '.tmp', settingsFile);
+    settings = next; settingsError = null;
+  };
   const scheduler = new Scheduler({
     store: schedules, connection, available: () => Boolean(window), machine: scheduleMachine,
     blocked: threadId => editLocks.has(threadId) || queues.hasMessages(scheduleMachine() + ':' + threadId),
@@ -78,7 +93,8 @@ app.whenReady().then(async () => {
     console.error('Scheduled task error:', error.message);
     if (window && !window.isDestroyed()) window.webContents.send('notification', { method: 'error', params: { message: `Scheduled task error: ${error.message}` } });
   });
-  const scheduleTimer = setInterval(tickSchedules, 15000); scheduleTimer.unref();
+  const recoverAgents = () => { if (connection.ready) connection.recover().catch(error => diagnostic.write('provider.recovery.failed', { error: error.message })); };
+  const scheduleTimer = setInterval(() => { tickSchedules(); recoverAgents(); }, 15000); scheduleTimer.unref();
   powerMonitor.on('resume', tickSchedules);
   app.on('before-quit', () => clearInterval(scheduleTimer));
   ipcMain.handle('scheduled-tasks', event => { checkSender(event); return schedules.summaries(); });
@@ -101,8 +117,9 @@ app.whenReady().then(async () => {
     try { queues.save(queue); diagnostic.write('queue.saved', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, paused: queue.paused }); }
     catch (error) { diagnostic.write('queue.save.failed', { threadId: queue?.thread?.id, error: error.message }); throw error; }
   });
-  ipcMain.handle('settings', event => { checkSender(event); return settings; });
-  ipcMain.handle('read-image', (event, file) => { checkSender(event); return readImage(connection, file); });
+  ipcMain.handle('settings', event => { checkSender(event); return publicSettings(); });
+  ipcMain.handle('providers', event => { checkSender(event); return connection.listProviders(settings); });
+  ipcMain.handle('read-image', (event, file, context) => { checkSender(event); return readImage(connection.connectionFor(connection.providerFor({}, context)), file); });
   ipcMain.handle('link-menu', (event, href, context) => {
     checkSender(event);
     if (typeof href !== 'string' || !href.trim() || href.length > 8192 || /[\u0000-\u001f\u007f]/.test(href)) throw new Error('Invalid link.');
@@ -117,8 +134,8 @@ app.whenReady().then(async () => {
   ipcMain.handle('open-link', (event, href, context) => {
     checkSender(event);
     if (typeof href === 'string' && /^https?:/i.test(href.trim())) return openWebLink(href, url => shell.openExternal(url));
-    const options = settings; const child = connection.child;
-    const current = () => { if (settings !== options || connection.child !== child || context?.machine !== scheduleMachine()) throw new Error('The conversation’s machine changed. Open the file link again.'); };
+    const options = settings; const session = connection.session;
+    const current = () => { if (settings !== options || connection.session !== session || context?.machine !== scheduleMachine()) throw new Error('The conversation’s machine changed. Open the file link again.'); };
     current();
     const opener = preferences.read().fileOpener || 'vscode';
     const opening = fileOpens.then(() => openFileLink(href, {
@@ -131,7 +148,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('pins', event => { checkSender(event); return pins.get(settings); });
   ipcMain.handle('set-pin', (event, threadId, pinned) => {
     checkSender(event);
-    if (!connection.ready) throw new Error('Connect to Codex first.');
+    if (!connection.ready) throw new Error('Connect to a coding agent first.');
     return pins.set(settings, threadId, pinned);
   });
   ipcMain.handle('choose-key', async event => {
@@ -141,28 +158,32 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('connect', async (event, value) => {
     checkSender(event);
-    const next = connectionOptions(value);
-    if (connection.ready && Object.keys(next).every(key => next[key] === settings[key])) return {};
-    if (connection.ready && wakeLock.id !== null) throw new Error('Finish or stop running tasks before changing the connection.');
+    const next = connectionOptions(value, connection.registry);
+    const changes = connection.changes(next);
+    if (connection.session && !changes.machineChanged) {
+      if (changes.providers.some(provider => agents.has(provider) && agents.get(provider).wakeLock.id !== null)) throw new Error('Finish or stop this agent’s running tasks before changing its settings.');
+      if (JSON.stringify(next) !== JSON.stringify(settings)) saveSettings(next);
+      const result = changes.providers.length ? await connection.reconfigure(next) : await connection.recover();
+      setImmediate(tickSchedules);
+      return { ...result, connected: connection.ready, options: publicSettings() };
+    }
+    if ([...agents.values()].some(agent => agent.wakeLock.id !== null)) throw new Error('Finish or stop running tasks before changing the connection.');
     editLocks.clear();
     try {
       const result = await connection.connect(next);
-      fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
-      fs.writeFileSync(settingsFile + '.tmp', JSON.stringify(next, null, 2), { mode: 0o600 });
-      fs.renameSync(settingsFile + '.tmp', settingsFile);
-      settings = next;
+      saveSettings(next);
       setImmediate(tickSchedules);
-      return result;
+      return { ...result, options: publicSettings() };
     } catch (error) {
-      if (connection.ready) connection.disconnect();
+      connection.disconnect();
       connection.emit('notification', { method: 'connection/closed', params: { message: error.message } });
       throw error;
     }
   });
-  ipcMain.handle('rpc', async (event, method, params) => {
+  ipcMain.handle('rpc', async (event, method, params, context) => {
     checkSender(event);
-    if (!methods.has(method)) throw new Error('Unsupported Codex operation.');
-    if (!connection.ready) throw new Error('Connect to Codex first.');
+    if (!methods.has(method)) throw new Error('Unsupported agent operation.');
+    if (!connection.ready) throw new Error('Connect to a coding agent first.');
     if (scheduler.dispatching.has(params?.threadId) && ['turn/start', 'thread/resume', 'thread/archive', 'thread/revert'].includes(method)) {
       diagnostic.write('rpc.scheduler.busy', { method, threadId: params.threadId });
       throw new Error('A scheduled message is being sent to this chat; try again shortly.');
@@ -172,7 +193,7 @@ app.whenReady().then(async () => {
       const options = settings;
       const pinned = pins.get(options).includes(params.threadId);
       if (pinned) pins.set(options, params.threadId, false);
-      try { return await connection.call(method, params); }
+      try { return await connection.call(method, params, undefined, context); }
       catch (error) {
         if (pinned) {
           try { pins.set(options, params.threadId, true); }
@@ -181,14 +202,14 @@ app.whenReady().then(async () => {
         throw error;
       }
     }
-    if (method === 'thread/name/set') manualNames.add(JSON.stringify([settings.mode, settings.host, settings.port, params.threadId]));
-    return connection.call(method, params);
+    if (method === 'thread/name/set') manualNames.add(JSON.stringify([settings.provider, settings.mode, settings.host, settings.port, params.threadId]));
+    return connection.call(method, params, undefined, context);
   });
   ipcMain.handle('title', (event, threadId, prompt) => {
     checkSender(event);
     if (typeof threadId !== 'string' || !threadId || threadId.length > 200 || typeof prompt !== 'string' || !prompt.trim() || prompt.length > 4000) throw new Error('Invalid title request.');
     const options = settings;
-    const nameKey = JSON.stringify([options.mode, options.host, options.port, threadId]);
+    const nameKey = JSON.stringify([options.provider, options.mode, options.host, options.port, threadId]);
     const current = () => connection.ready && settings === options && !manualNames.has(nameKey);
     const task = titleQueue.catch(() => {}).then(async () => {
       if (!current()) return null;
@@ -207,18 +228,18 @@ app.whenReady().then(async () => {
     titleQueue = task;
     return task;
   });
-  ipcMain.handle('respond', (event, id, result) => { checkSender(event); connection.respond(id, result); });
+  ipcMain.handle('respond', (event, id, result) => { checkSender(event); return connection.respond(id, result); });
   connection.on('notification', message => {
     if (message.method === 'connection/closed') editLocks.clear();
+    if (message.method === 'provider/closed') for (const threadId of editLocks.keys()) if (agentTarget(threadId, 'thread').provider === message.provider) editLocks.delete(threadId);
     if (['turn/started', 'turn/completed', 'thread/status/changed', 'error', 'connection/closed'].includes(message.method)) {
       const params = message.params || {};
-      diagnostic.write('native.' + message.method, { threadId: params.threadId, turnId: params.turn?.id || params.turnId, status: params.turn?.status || params.status?.type, willRetry: params.willRetry, error: params.turn?.error?.message || params.error?.message || params.message });
+      diagnostic.write('native.' + message.method, { provider: message.provider, threadId: params.threadId, turnId: params.turn?.id || params.turnId, status: params.turn?.status || params.status?.type, willRetry: params.willRetry, error: params.turn?.error?.message || params.error?.message || params.message });
     }
     if (message.id !== undefined && !['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput', 'item/permissions/requestApproval', 'mcpServer/elicitation/request'].includes(message.method)) {
-      connection.rejectRequest(message.id);
-      message = { method: 'error', params: { message: `Unsupported Codex request declined: ${message.method}` } };
+      connection.rejectRequest(message.id).catch(error => diagnostic.write('request.decline.failed', { error: error.message }));
+      message = { method: 'error', params: { message: `Unsupported agent request declined: ${message.method}` } };
     }
-    if (message.method === 'serverRequest/resolved') connection.requests.delete(message.params.requestId);
     if (window && !window.isDestroyed()) window.webContents.send('notification', message);
   });
   if (process.platform === 'darwin') app.dock.setIcon(path.join(__dirname, 'assets/icon.png'));

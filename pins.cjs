@@ -1,10 +1,12 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const { connectionKey } = require('./providers.cjs');
 
 class PinStore {
   constructor(file) { this.file = file; }
 
   key(options) {
+    if (options.provider && options.provider !== 'codex') return JSON.stringify([connectionKey(options)]);
     return JSON.stringify(options.mode === 'local' ? ['local', process.env.CODEX_HOME || 'default'] : ['ssh', options.host, Number(options.port)]);
   }
 

@@ -89,4 +89,8 @@ fieldset{border:0;padding:0;margin:0;min-width:0}dialog select#connection-mode{w
 
 .message-time{margin-left:auto;color:var(--muted);font-size:10px;font-weight:400;white-space:nowrap;opacity:0}.message:hover .message-time,.message:focus-within .message-time{opacity:1}.message-time+.edit-message,.message-time+.message-pin{margin-left:0}
 
-.thread-state.waiting{background:light-dark(#aa7a19,#d4b261)}#activity.waiting{color:light-dark(#8c661d,#d4b261)}
+.thread-state.waiting{background:light-dark(#aa7a19,#d4b261)}.thread-state.draft{background:light-dark(#ad8414,#e0bf58)}#activity.waiting{color:light-dark(#8c661d,#d4b261)}
+
+.changed-files>summary{list-style:none}.changed-files>summary::-webkit-details-marker{display:none}.changed-files>summary::before{content:"▶";display:inline-block;width:14px}.changed-files:has(.changed-file-entry[open])>summary::before{content:"▼"}
+
+.provider-settings legend{font-size:11px;font-weight:600;margin-top:16px}.provider-setting{display:flex;align-items:center;gap:9px}.provider-setting input{width:auto;margin:0;flex-shrink:0}.provider-setting small{display:block;color:var(--muted);font-size:10px;font-weight:400;margin-top:3px}

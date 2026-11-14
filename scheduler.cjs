@@ -81,9 +81,9 @@ class Scheduler {
   async tick(now = Date.now()) {
     if (this.running || !this.connection.ready || !this.available()) return;
     this.running = true;
-    const child = this.connection.child;
+    const session = this.connection.session;
     const machine = this.machine();
-    const current = () => this.connection.ready && this.connection.child === child && this.available() && this.machine() === machine;
+    const current = () => this.connection.ready && this.connection.session === session && this.available() && this.machine() === machine;
     try {
       const due = this.store.summaries().filter(task => (task.machine || 'access:local') === machine && task.status === 'pending' && Date.parse(task.runAt) <= now && (!task.retryAt || task.retryAt <= now)).sort((a, b) => a.runAt.localeCompare(b.runAt));
       for (const task of due) {

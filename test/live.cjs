@@ -1,8 +1,8 @@
 const assert = require('node:assert/strict');
-const { CodexConnection } = require('../transport.cjs');
+const { AgentConnection } = require('../providers.cjs');
 
 async function main() {
-  const connection = new CodexConnection();
+  const connection = new AgentConnection();
   let threadId;
   try {
     await connection.connect({ host: process.env.CODEX_TEST_HOST || 'root@warmer', cwd: '/tmp' });
@@ -19,7 +19,7 @@ async function main() {
         if (message.params?.threadId !== threadId) return;
         if (message.method === 'item/agentMessage/delta') delta += message.params.delta;
         if (message.method === 'turn/completed') { completed = message.params.turn; clearTimeout(timer); resolve(); }
-        if (message.id !== undefined) connection.rejectRequest(message.id);
+        if (message.id !== undefined) connection.rejectRequest(message.id).catch(reject);
       });
     });
     await connection.call('turn/start', { threadId, input: [{ type: 'text', text: 'Reply exactly REMOTE_CODEX_OK. Do not call tools.', text_elements: [] }] });

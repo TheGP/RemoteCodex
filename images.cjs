@@ -2,11 +2,11 @@ const path = require('node:path');
 
 async function readImage(connection, file) {
   if (typeof file !== 'string' || file.length > 8192 || file.includes('\0') || !/\.(png|jpe?g|webp|gif)$/i.test(file) || !file.startsWith('/') && !/^[a-z]:[\\/]/i.test(file) || /^[\\/]{2}/.test(file)) throw new Error('Use a PNG, JPEG, WebP, or GIF path on the connected machine.');
-  if (!connection.ready) throw new Error('Connect to Codex to load this image.');
-  const child = connection.child;
+  if (!connection.ready) throw new Error('Connect to a coding agent to load this image.');
+  const session = connection.session;
   const filePath = /^[a-z]:/i.test(file) ? path.win32.normalize(file) : path.posix.normalize(file);
   const result = await connection.call('fs/readFile', { path: filePath });
-  if (!connection.ready || connection.child !== child) throw new Error('The image connection changed.');
+  if (!connection.ready || connection.session !== session) throw new Error('The image connection changed.');
   const data = result.dataBase64;
   if (typeof data !== 'string' || !data.length || data.length % 4 || data.length > Math.ceil(20 * 1024 * 1024 / 3) * 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) throw new Error('Image is invalid or exceeds 20 MB.');
   const bytes = Buffer.from(data, 'base64');

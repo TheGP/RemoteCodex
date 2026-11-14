@@ -15,7 +15,7 @@ function connectionOptions(value = {}) {
   const key = String(value.key || '').trim();
   const cwd = String(value.cwd || '/root').trim();
   const localCwd = String(value.localCwd || os.homedir()).trim();
-  const codexPath = String(value.codexPath || '').trim();
+  const codexPath = String(value.executablePath ?? value.codexPath ?? '').trim();
   if (mode === 'ssh') {
     if (!/^[a-zA-Z0-9_][a-zA-Z0-9_.@:\[\]-]*$/.test(host)) throw new Error('Enter an SSH host such as root@warmer.');
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('SSH port must be between 1 and 65535.');
@@ -69,6 +69,8 @@ class CodexConnection extends EventEmitter {
     this.ready = false;
     this.spawnProcess = spawnProcess;
   }
+
+  get session() { return this.child; }
 
   async connect(options, schedulerMcp = null) {
     options = connectionOptions(options);
@@ -133,6 +135,7 @@ class CodexConnection extends EventEmitter {
       const receivedSequence = ++this.receivedSequence;
       if (message.method) {
         if (message.id !== undefined) this.requests.set(message.id, message);
+        if (message.method === 'serverRequest/resolved') this.requests.delete(message.params.requestId);
         this.emit('notification', { ...message, receivedSequence });
       } else if (this.pending.has(message.id)) {
         const request = this.pending.get(message.id);

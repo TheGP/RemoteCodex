@@ -5,6 +5,7 @@ const path = require('node:path');
 const assert = require('node:assert/strict');
 const { pathToFileURL } = require('node:url');
 const { DraftStore, registerDraftIpc } = require('../drafts.cjs');
+const { AgentConnection, connectionOptions, connectionKey } = require('../providers.cjs');
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-drafts-desktop-'));
 app.setPath('userData', path.join(directory, 'profile'));
@@ -13,12 +14,16 @@ app.whenReady().then(async () => {
   const store = new DraftStore(path.join(directory, 'drafts'));
   const index = path.resolve(__dirname, '..', 'index.html'); const page = pathToFileURL(index).href;
   const thread = { id: 'desktop-draft-chat', cwd: directory, name: 'Draft conversation', historyMode: 'paginated', status: { type: 'idle' } };
-  const calls = []; let window, finishSend;
+  const calls = []; let window, finishSend, settingsError = null, connections = 0;
+  const options = connectionOptions({ mode: 'local', localCwd: directory, host: 'unused', cwd: directory, port: 22, key: '', codexPath: '' });
+  const providers = new AgentConnection().listProviders();
+  const publicSettings = () => ({ ...options, machine: connectionKey(options), agents: providers, settingsError });
   registerDraftIpc(ipcMain, store, event => { if (event.sender !== window?.webContents || event.senderFrame?.url !== page) throw new Error('Untrusted draft caller'); });
-  ipcMain.handle('settings', () => ({ mode: 'local', localCwd: directory, host: 'unused', cwd: directory, port: 22, key: '', codexPath: '' }));
+  ipcMain.handle('settings', publicSettings);
+  ipcMain.handle('providers', () => providers);
   ipcMain.handle('preferences', () => ({ theme: 'system', startupProjects: {}, conversationStates: {}, threadOrders: {} }));
   for (const name of ['queues', 'pins', 'scheduled-tasks']) ipcMain.handle(name, () => []);
-  ipcMain.handle('connect', () => ({}));
+  ipcMain.handle('connect', () => { connections++; settingsError = null; return { options: publicSettings() }; });
   ipcMain.on('save-conversation-state', event => { event.returnValue = { ok: true }; });
   ipcMain.on('diagnostic', () => {});
   ipcMain.handle('rpc', (_event, method, params) => {
@@ -32,17 +37,27 @@ app.whenReady().then(async () => {
     return { data: [], nextCursor: null };
   });
   const evaluate = script => window.webContents.executeJavaScript(script);
-  const open = async () => {
+  const open = async (repair = false) => {
     window = new BrowserWindow({ show: false, webPreferences: { preload: path.resolve(__dirname, '..', 'preload.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false } });
     await window.loadFile(index);
     for (let attempt = 0; attempt < 100; attempt++) {
-      if (await evaluate('state.connected && !state.connecting && !state.loading')) return;
+      if (await evaluate(repair ? "!state.connected && document.getElementById('settings-dialog').open && document.getElementById('settings-error').textContent" : 'state.connected && !state.connecting && !state.loading')) return;
       await new Promise(resolve => setTimeout(resolve, 25));
     }
     throw new Error('Draft UI did not initialize: ' + await evaluate("document.getElementById('error-text').textContent"));
   };
   const close = async () => { const closing = window; await new Promise(resolve => { closing.once('closed', resolve); closing.close(); }); window = null; };
   try {
+    settingsError = 'Saved connection settings could not be loaded: invalid configuration';
+    await open(true);
+    assert.equal(connections, 0); assert.equal(calls.length, 0);
+    assert.equal(await evaluate("document.getElementById('connection-mode').value"), 'local');
+    await evaluate("document.getElementById('settings-form').onsubmit({ preventDefault() {} })");
+    assert.equal(connections, 1);
+    assert.equal(await evaluate('state.connected && !state.connecting && !state.options.settingsError'), true);
+    assert.equal(await evaluate("document.getElementById('settings-dialog').open"), false);
+    console.log('PASS invalid settings keep the real UI open without connecting; saving repaired settings connects and clears the error');
+    await close();
     await open();
     await evaluate("document.getElementById('prompt').value = '  Unsent before restart\\n'; document.getElementById('prompt').dispatchEvent(new Event('input', { bubbles: true })); document.getElementById('send-time').value = '24'; document.getElementById('send-time').dispatchEvent(new Event('change', { bubbles: true }));");
     assert.equal(new DraftStore(store.directory).last('access:local').draft.text, '  Unsent before restart\n');
@@ -55,9 +70,18 @@ app.whenReady().then(async () => {
     console.log('PASS real Electron preload saves input synchronously and before closing; reopening restores a new-chat draft and its send time');
     await evaluate(`openThread(${JSON.stringify(thread)})`);
     await evaluate("document.getElementById('prompt').value = 'Conversation draft'; document.getElementById('prompt').dispatchEvent(new Event('input', { bubbles: true }));");
+    assert.equal(await evaluate("Boolean(document.querySelector('.thread-state.draft'))"), true);
     await close(); await open();
     assert.equal(await evaluate('state.thread.id'), thread.id);
     assert.equal(await evaluate("document.getElementById('prompt').value"), 'Conversation draft');
+    assert.equal(await evaluate("Boolean(document.querySelector('.thread-state.draft'))"), true);
+    await evaluate("resetThread(); renderThreadIndicators()");
+    assert.equal(await evaluate("Boolean(document.querySelector('.thread-state.draft'))"), true);
+    await evaluate(`openThread(${JSON.stringify(thread)})`);
+    await evaluate("document.getElementById('prompt').value = ''; document.getElementById('prompt').dispatchEvent(new Event('input', { bubbles: true }));");
+    assert.equal(await evaluate("Boolean(document.querySelector('.thread-state.draft'))"), false);
+    await evaluate("document.getElementById('prompt').value = 'Conversation draft'; document.getElementById('prompt').dispatchEvent(new Event('input', { bubbles: true }));");
+    console.log('PASS unsent draft dots update while typing, persist across restart and navigation, and disappear when the prompt is cleared');
     await evaluate("document.querySelector('.edit-message').click(); document.getElementById('edited-message').value = 'Unfinished history edit'; document.getElementById('edited-message').dispatchEvent(new Event('input', { bubbles: true }));");
     await close(); await open();
     assert.equal(await evaluate("document.getElementById('edit-message-dialog').open"), true);
