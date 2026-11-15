@@ -188,6 +188,10 @@ async function restoreLastDraft() {
       const queue = state.queues.get(queueKey(result.thread.id)); const message = queue?.messages.find(message => message.draftId === saved.target.itemId);
       if (message) editQueuedMessage(queue, message);
       else if (!$('prompt').value) { $('prompt').value = saved.draft.text; saveComposerDraft(); }
+    } else if (saved.target.kind === 'edit-schedule') {
+      const task = schedules.tasks.find(task => task.id === saved.target.itemId && task.status === 'pending');
+      if (task) await openScheduledEdit(task);
+      else if (!$('prompt').value) { $('prompt').value = saved.draft.text; saveComposerDraft(); }
     }
   } else {
     if (saved) projects.selected = saved.target.projectId;
@@ -314,7 +318,7 @@ function settingsConnectionOptions() {
   const providerOptions = { ...state.options?.providerOptions };
   const paths = new Map([...document.querySelectorAll('input[data-provider-path]')].map(input => [input.dataset.providerPath, local ? input.value : providerPreference(current, input.dataset.providerPath).executablePath]));
   for (const input of $('provider-settings').querySelectorAll('input[data-provider]')) providerOptions[input.dataset.provider] = { ...providerOptions[input.dataset.provider], enabled: input.checked, executablePath: paths.get(input.dataset.provider) ?? providerPreference(current, input.dataset.provider).executablePath };
-  return { provider: 'codex', mode: $('connection-mode').value, ...Object.fromEntries(['host', 'port', 'key', 'cwd'].map(key => [key, local ? current[key] : $(key === 'cwd' ? 'default-cwd' : key).value])), localCwd: local ? $('local-cwd').value : current.localCwd, executablePath, ...(Object.keys(providerOptions).length ? { providerOptions } : {}) };
+  return { provider: 'codex', mode: $('connection-mode').value, sharedServer: local ? Boolean(current.sharedServer) : $('shared-server').checked, ...Object.fromEntries(['host', 'port', 'key', 'cwd'].map(key => [key, local ? current[key] : $(key === 'cwd' ? 'default-cwd' : key).value])), localCwd: local ? $('local-cwd').value : current.localCwd, executablePath, ...(Object.keys(providerOptions).length ? { providerOptions } : {}) };
 }
 function providerPreference(options, id) {
   const agent = options?.agents?.find(agent => agent.id === id) || agentMetadata(id);
@@ -327,7 +331,7 @@ function changedProviders(next) {
 function machineSettingsChanged(next) {
   const current = state.options || {};
   const fields = next.mode === 'local' ? ['localCwd'] : ['host', 'port', 'key', 'cwd'];
-  return next.mode !== (current.mode || 'ssh') || fields.some(key => key === 'port' ? Number(next[key] ?? 22) !== Number(current[key] ?? 22) : String(next[key] || '').trim() !== String(current[key] || '').trim());
+  return next.mode !== (current.mode || 'ssh') || next.mode === 'ssh' && Boolean(next.sharedServer) !== Boolean(current.sharedServer) || fields.some(key => key === 'port' ? Number(next[key] ?? 22) !== Number(current[key] ?? 22) : String(next[key] || '').trim() !== String(current[key] || '').trim());
 }
 function connectionSettingsChanged(next = settingsConnectionOptions()) {
   return machineSettingsChanged(next) || changedProviders(next).length > 0;
@@ -368,6 +372,7 @@ function fillSettings(options) {
   $('host').value = options.host;
   $('port').value = options.port;
   $('key').value = options.key;
+  $('shared-server').checked = Boolean(options.sharedServer);
   $('default-cwd').value = options.cwd;
   $('local-cwd').value = options.localCwd || '';
   for (const input of document.querySelectorAll('input[data-provider-path]')) input.value = providerPreference(options, input.dataset.providerPath).executablePath;
@@ -1079,7 +1084,18 @@ async function openThread(thread, allowBusy = false) {
   $('messages').replaceChildren();
   try {
     setThread(thread);
-    const result = await rpc('thread/read', { threadId: thread.id, includeTurns: false });
+    const shared = !isLocal() && state.options?.sharedServer && threadProvider(thread) === 'codex';
+    let result;
+    try {
+      result = await rpc(shared ? 'thread/resume' : 'thread/read', { threadId: thread.id, ...(shared ? { excludeTurns: true } : { includeTurns: false }) });
+      if (shared && selection === state.selection) { state.owned.add(thread.id); state.writerConflicts.delete(queueKey(thread.id)); }
+    } catch (error) {
+      if (!shared || !isWriterConflict(error)) throw error;
+      if (selection !== state.selection) return;
+      state.owned.delete(thread.id);
+      state.writerConflicts.add(queueKey(thread.id));
+      result = await rpc('thread/read', { threadId: thread.id, includeTurns: false });
+    }
     if (selection !== state.selection) return;
     setThread(result.thread);
     const history = await rpc('thread/turns/list', { threadId: thread.id, limit: 25, sortDirection: 'desc', itemsView: 'full' });
@@ -1252,18 +1268,31 @@ function moveDiffElement(parent, element, before) {
   parent.moveBefore(element, before);
   if (selected && anchorNode?.isConnected && focusNode?.isConnected) selection.setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset);
 }
-function updateFileDiff(entry, context) {
+function firstChangedLine(patches) {
+  let first = Infinity;
+  for (const patch of patches) {
+    let line = null, end = null;
+    for (const row of patch.split('\n')) {
+      const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(row);
+      if (hunk) {
+        line = Number(hunk[1]); end = line + Math.max(0, Number(hunk[2] ?? 1) - 1);
+        if (!Number.isSafeInteger(line) || !Number.isSafeInteger(end)) line = null;
+      } else if (row.startsWith('diff --git ') || row.startsWith('@@')) line = null;
+      else if (line !== null) {
+        if (row.startsWith('+') || row.startsWith('-')) first = Math.min(first, Math.max(1, Math.min(line, end)));
+        if (row.startsWith(' ') || row.startsWith('+')) line++;
+      }
+    }
+  }
+  return Number.isFinite(first) ? first : 1;
+}
+function updateFileDiff(entry) {
   const file = entry.file;
   let body = entry.querySelector('.changed-file-content');
   if (!body) {
     body = document.createElement('div'); body.className = 'changed-file-content';
     const diff = document.createElement('div'); diff.className = 'changed-file-diff'; diff.tabIndex = 0;
-    const open = document.createElement('button'); open.type = 'button'; open.className = 'subtle open-changed-file'; open.textContent = 'Open in editor';
-    open.onclick = async () => {
-      const href = entry.file.path.replace(/\\/g, '/').split('/').map(encodeURIComponent).join('/');
-      try { await api.openLink(href, context); } catch (error) { showError(error); }
-    };
-    body.append(diff, open); entry.append(body);
+    body.append(diff); entry.append(body);
   }
   const diff = body.firstElementChild;
   const top = diff.scrollTop, left = diff.scrollLeft;
@@ -1276,7 +1305,6 @@ function updateFileDiff(entry, context) {
   while (diff.children.length > patches.length) diff.lastElementChild.remove();
   entry.renderedDiffs = patches;
   diff.setAttribute('aria-label', `Changes in ${file.path}`);
-  body.lastElementChild.disabled = file.kind === 'delete';
   diff.scrollTop = top; diff.scrollLeft = left;
 }
 function isTestFile(filePath) {
@@ -1328,7 +1356,7 @@ function renderFileSummary(turnId) {
   const rows = card.lastElementChild;
   const entries = new Map([...rows.children].map(entry => [entry.dataset.fileId, entry]));
   let next = rows.firstElementChild;
-  const context = { machine: accessKey(), cwd: state.thread?.cwd || $('workspace').value };
+  const context = { machine: accessKey(), cwd: state.thread?.cwd || $('workspace').value, provider: threadProvider(state.thread), clampLine: true };
   const shouldExpand = entry => preferences.skipTestDiffs === false || !isTestFile(entry.dataset.path);
   const updateToggleTitle = () => { card.firstElementChild.title = [...rows.children].some(entry => shouldExpand(entry) && !entry.open) || !card.querySelector('.changed-file-entry[open]') ? 'Expand all file diffs' : 'Collapse all file diffs'; };
   card.firstElementChild.onclick = event => {
@@ -1338,7 +1366,7 @@ function renderFileSummary(turnId) {
     card.open = true; card.expandAll = expand;
     for (const entry of entries) {
       if (!expand || shouldExpand(entry)) entry.open = expand;
-      if (entry.open) updateFileDiff(entry, context);
+      if (entry.open) updateFileDiff(entry);
     }
     setTimelineFollowing(false, expand ? card : null);
     updateToggleTitle();
@@ -1349,27 +1377,39 @@ function renderFileSummary(turnId) {
     if (!entry) {
       entry = document.createElement('details'); entry.className = 'changed-file-entry'; entry.dataset.fileId = file.id;
       const summary = document.createElement('summary'); summary.className = 'changed-file'; entry.append(summary);
+      const name = document.createElement('span'); name.className = 'changed-file-name';
+      const open = document.createElement('button'); open.type = 'button'; open.className = 'icon-button open-changed-file';
+      open.title = 'Open in editor at first change'; open.setAttribute('aria-label', 'Open in editor');
+      open.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6M10 14 21 3M21 14v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h6"/></svg>';
+      open.onclick = async event => {
+        event?.preventDefault(); event?.stopPropagation();
+        const href = entry.file.path.replace(/\\/g, '/').split('/').map(encodeURIComponent).join('/') + '#L' + firstChangedLine(entry.file.diffs);
+        try { await api.openLink(href, context); } catch (error) { showError(error); }
+      };
+      summary.append(name, open, document.createElement('small'));
       summary.onclick = () => { card.expandAll = false; };
       entry.open = Boolean(card.expandAll) && (preferences.skipTestDiffs === false || !isTestFile(file.path));
       entry.ontoggle = () => {
         if (!entry.isConnected) return;
-        if (entry.open) { setTimelineFollowing(false, card.expandAll ? card : entry); updateFileDiff(entry, context); }
+        if (entry.open) { setTimelineFollowing(false, card.expandAll ? card : entry); updateFileDiff(entry); }
         else if (timelineView.reading === entry) timelineView.reading = null;
         updateToggleTitle();
       };
     }
     entry.file = file; entry.dataset.path = file.path;
     const fileSummary = entry.firstElementChild; fileSummary.title = file.path;
-    const name = document.createElement('span'); name.className = 'changed-file-name';
+    const name = fileSummary.querySelector('.changed-file-name');
     const prefix = (context.cwd || '').replace(/\\/g, '/').replace(/\/$/, '') + '/';
     const path = file.path.replace(/\\/g, '/'); name.textContent = path.startsWith(prefix) ? path.slice(prefix.length) : path;
-    const kind = document.createElement('small'); kind.textContent = file.kind === 'add' ? 'Added' : file.kind === 'delete' ? 'Deleted' : file.kind === 'rename' ? 'Renamed' : 'Modified';
-    fileSummary.replaceChildren(name, kind, counts(file.added, file.removed));
+    const kind = fileSummary.querySelector('small'); kind.textContent = file.kind === 'add' ? 'Added' : file.kind === 'delete' ? 'Deleted' : file.kind === 'rename' ? 'Renamed' : 'Modified';
+    fileSummary.querySelector('.open-changed-file').disabled = file.kind === 'delete';
+    const previousCounts = fileSummary.querySelector('.change-counts');
+    if (previousCounts) previousCounts.replaceWith(counts(file.added, file.removed)); else fileSummary.append(counts(file.added, file.removed));
     if (entry !== next) {
       if (entry.parentNode === rows) moveDiffElement(rows, entry, next); else rows.insertBefore(entry, next);
     }
     next = entry.nextElementSibling;
-    if (entry.open) updateFileDiff(entry, context);
+    if (entry.open) updateFileDiff(entry);
   }
   for (const entry of entries.values()) entry.remove();
   updateToggleTitle();
@@ -1712,11 +1752,82 @@ async function refreshSchedules() {
   const generation = ++schedules.generation;
   const tasks = await api.scheduledTasks();
   if (generation !== schedules.generation) return;
+  if (JSON.stringify(tasks) === JSON.stringify(schedules.tasks)) return;
   schedules.tasks = tasks; renderSchedules(); renderThreadIndicators();
 }
 function scheduledFor(threadId) {
-  return schedules.tasks.filter(task => (task.machine || 'access:local') === accessKey() && task.threadId === threadId && ['pending', 'sending', 'unconfirmed'].includes(task.status)).sort((a, b) => a.runAt.localeCompare(b.runAt));
+  return schedules.tasks.filter(task => (task.machine || 'access:local') === accessKey() && task.threadId === threadId && (['pending', 'claimed', 'sending', 'unconfirmed'].includes(task.status) || task.needsReview)).sort((a, b) => a.runAt.localeCompare(b.runAt));
 }
+async function openScheduledEdit(task) {
+  if (task.status !== 'pending' || schedules.editing || !state.connected || task.threadId !== state.thread?.id) return;
+  const target = { task, options: state.options, selection: state.selection };
+  let opened = false;
+  schedules.editing = target;
+  try {
+    target.lock = await api.editLock(task.threadId);
+    const saved = await api.scheduledTask(task.id, target.lock);
+    if (schedules.editing !== target || state.options !== target.options || state.selection !== target.selection) return;
+    target.task = saved;
+    target.draftTarget = editorTarget('edit-schedule', state.thread, task.id);
+    const draft = api.draft?.(target.draftTarget);
+    const date = new Date(saved.runAt);
+    const pad = value => String(value).padStart(2, '0');
+    target.time = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    $('scheduled-text').value = draft?.text ?? saved.message?.text ?? saved.prompt;
+    $('scheduled-time').value = draft?.runAt ?? target.time;
+    for (const id of ['scheduled-text', 'scheduled-time', 'save-schedule-edit', 'cancel-schedule-edit']) $(id).disabled = false;
+    const images = saved.message?.images || [];
+    $('scheduled-attachments').textContent = images.length ? `${images.map(image => image.name).join(', ')} will be kept.` : '';
+    $('edit-schedule-error').hidden = true;
+    const dialog = $('edit-schedule-dialog');
+    dialog.onclose = () => { if (schedules.editing === target && !dialog.open) closeScheduledEditor(); };
+    dialog.showModal(); opened = true; $('scheduled-text').focus();
+  } catch (error) { showError(error); }
+  finally {
+    if (!opened) {
+      if (schedules.editing === target) schedules.editing = null;
+      if (target.lock) await api.editLock(task.threadId, target.lock).catch(showError);
+    }
+  }
+}
+function saveScheduledDraft() {
+  const target = schedules.editing;
+  if (!target?.draftTarget || !api.saveDraft) return;
+  try { api.saveDraft(target.draftTarget, { text: $('scheduled-text').value, runAt: $('scheduled-time').value }); }
+  catch (error) { showError(`Could not save scheduled editor draft: ${error.message}`); }
+}
+$('scheduled-text').oninput = saveScheduledDraft;
+$('scheduled-time').oninput = saveScheduledDraft;
+$('edit-schedule-form').onsubmit = async event => {
+  event.preventDefault();
+  const target = schedules.editing;
+  if (!target || target.saving || state.options !== target.options || state.selection !== target.selection) return;
+  target.saving = true;
+  for (const id of ['scheduled-text', 'scheduled-time', 'save-schedule-edit', 'cancel-schedule-edit']) $(id).disabled = true;
+  try {
+    const value = $('scheduled-time').value;
+    if (!value || !Number.isFinite(new Date(value).getTime())) throw new Error('Choose a send date and time.');
+    const text = $('scheduled-text').value.trim();
+    const available = promptSkillNames(text).length ? await resolvePromptSkills(text) : [];
+    if (schedules.editing !== target || state.options !== target.options || state.selection !== target.selection || !state.connected) return;
+    const skills = skillInputs(text, [...(target.task.message?.input.filter(part => part.type === 'skill') || []), ...available], target.task.cwd);
+    await api.editScheduledTask(target.task.id, { text, runAt: value === target.time ? target.task.runAt : new Date(value).toISOString(), skills }, target.lock);
+    clearDraft(target.draftTarget);
+    if (schedules.editing !== target || state.options !== target.options) return;
+    closeScheduledEditor(); await refreshSchedules();
+  } catch (error) { if (schedules.editing === target) { $('edit-schedule-error').textContent = error.message; $('edit-schedule-error').hidden = false; } }
+  finally {
+    target.saving = false;
+    if (!schedules.editing || schedules.editing === target) for (const id of ['scheduled-text', 'scheduled-time', 'save-schedule-edit', 'cancel-schedule-edit']) $(id).disabled = false;
+  }
+};
+function closeScheduledEditor() {
+  const target = schedules.editing; schedules.editing = null;
+  $('edit-schedule-dialog').close();
+  if (target?.lock) api.editLock(target.task.threadId, target.lock).catch(showError);
+}
+$('cancel-schedule-edit').onclick = () => { clearDraft(schedules.editing?.draftTarget); closeScheduledEditor(); };
+$('edit-schedule-dialog').oncancel = event => { event.preventDefault(); if (!schedules.editing?.saving) { clearDraft(schedules.editing?.draftTarget); closeScheduledEditor(); } };
 function renderSchedules() {
   const container = $('scheduled-messages');
   container.replaceChildren();
@@ -1726,11 +1837,13 @@ function renderSchedules() {
     const row = document.createElement('div'); row.className = 'scheduled-message';
     const label = document.createElement('span'); label.className = 'scheduled-copy';
     const date = new Date(task.runAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    const status = task.status === 'sending' ? 'Sending scheduled message' : task.status === 'unconfirmed' ? 'Unconfirmed; check history' : `Scheduled · ${date}`;
+    const status = task.needsReview ? 'Run status unknown; check sending computer' : task.status === 'claimed' ? 'Preparing scheduled message' : task.status === 'sending' ? 'Sending scheduled message' : task.status === 'unconfirmed' ? 'Unconfirmed; check history' : `Scheduled · ${date}${task.sharedTo && !task.sharedImported && !task.shared ? ' · Waiting to sync' : ''}`;
     label.textContent = `${status} · ${task.prompt}`;
     label.title = `${new Date(task.runAt).toLocaleString()}\n${task.prompt}${task.error ? '\n' + task.error : ''}`;
     row.append(label);
     if (task.status === 'pending') {
+      const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'subtle'; edit.textContent = 'Edit';
+      edit.title = 'Edit scheduled message'; edit.setAttribute('aria-label', edit.title); edit.onclick = () => openScheduledEdit(task);
       const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'subtle'; cancel.textContent = '×';
       cancel.title = 'Cancel scheduled message'; cancel.setAttribute('aria-label', cancel.title);
       cancel.onclick = async () => {
@@ -1738,7 +1851,17 @@ function renderSchedules() {
         try { await api.cancelScheduledTask(task.id); await refreshSchedules(); }
         catch (error) { showError(error); renderSchedules(); }
       };
-      row.append(cancel);
+      row.append(edit, cancel);
+    }
+    if (task.shared && (task.status === 'unconfirmed' || task.needsReview)) {
+      const dismiss = document.createElement('button'); dismiss.type = 'button'; dismiss.className = 'subtle'; dismiss.textContent = 'Check delivery';
+      dismiss.onclick = async () => {
+        dismiss.disabled = true;
+        try { await api.dismissScheduledTask(task.id); await refreshSchedules(); }
+        catch (error) { showError(error); renderSchedules(); }
+        finally { dismiss.disabled = false; }
+      };
+      row.append(dismiss);
     }
     container.append(row);
   }
@@ -2353,6 +2476,7 @@ async function connect(options) {
   state.names.clear(); state.titling.clear(); state.newThreads.clear();
   slash.generation++; slash.skills = []; slash.cwd = null; slash.loading = false; modes.catalog = []; modes.threads.clear(); state.models = [];
   $('edit-queue-dialog').close();
+  closeScheduledEditor();
   $('thread-menu').hidden = true; $('rename-dialog').close(); $('edit-message-dialog').close();
   restoreAccess();
   restoreUnread();
@@ -2980,7 +3104,47 @@ $('move-project-form').onsubmit = async event => {
   } catch (error) { if (target.options === state.options) $('move-project-error').textContent = error.message; }
   finally { $('save-move-project').disabled = false; }
 };
-function openSettings() { fillSettings(state.options); $('settings-error').textContent = ''; $('settings-dialog').showModal(); }
+async function fillScheduleSharing() {
+  if (!api.scheduleSharing) return;
+  const generation = schedules.settingsGeneration = (schedules.settingsGeneration || 0) + 1;
+  const value = await api.scheduleSharing();
+  if (schedules.settingsGeneration !== generation) return;
+  $('share-schedules').checked = value.enabled;
+  $('schedule-host').value = value.host; $('schedule-port').value = value.port; $('schedule-key').value = value.key;
+  $('schedule-folder').value = value.folder || '~/.local/share/remote-codex/schedule-sync';
+  $('sync-schedules').disabled = !value.enabled;
+  $('schedule-sync-status').textContent = !value.enabled ? 'Sharing off' : value.error ? `Waiting to sync · ${value.error}` : value.connected ? `Connected · ${value.host}` : 'Connecting to schedule storage…';
+  $('schedule-resolved-folder').hidden = true;
+  $('schedule-folder-size').textContent = value.enabled ? 'Checking…' : '—';
+  if (!value.enabled || !api.scheduleStorage) return;
+  try {
+    const info = await api.scheduleStorage();
+    if (schedules.settingsGeneration !== generation) return;
+    $('schedule-folder-size').textContent = (info.complete ? '' : 'At least ') + formatStorageSize(info.bytes);
+    $('schedule-resolved-folder').textContent = info.directory; $('schedule-resolved-folder').hidden = false;
+  } catch (error) { if (schedules.settingsGeneration === generation) $('schedule-folder-size').textContent = `Unavailable · ${error.message}`; }
+}
+function formatStorageSize(bytes) {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('Invalid folder size reported by server.');
+  const unit = Math.min(4, Math.floor(Math.log(Math.max(bytes, 1)) / Math.log(1024)));
+  return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(bytes / 1024 ** unit)} ${['B', 'KB', 'MB', 'GB', 'TB'][unit]}`;
+}
+function openSettings() { fillSettings(state.options); $('settings-error').textContent = ''; fillScheduleSharing().catch(showError); $('settings-dialog').showModal(); }
+$('schedule-sharing-form').onsubmit = async event => {
+  event.preventDefault();
+  $('save-schedule-sharing').disabled = true;
+  try {
+    await api.saveScheduleSharing({ enabled: $('share-schedules').checked, host: $('schedule-host').value, port: Number($('schedule-port').value), key: $('schedule-key').value, folder: $('schedule-folder').value });
+    await fillScheduleSharing(); await refreshSchedules();
+  } catch (error) { $('schedule-sync-status').textContent = error.message; }
+  finally { $('save-schedule-sharing').disabled = false; }
+};
+$('sync-schedules').onclick = async () => {
+  $('sync-schedules').disabled = true;
+  try { await api.syncSchedules(); await fillScheduleSharing(); await refreshSchedules(); }
+  catch (error) { $('schedule-sync-status').textContent = error.message; }
+  finally { $('sync-schedules').disabled = !$('share-schedules').checked; }
+};
 $('connection-mode').onchange = settingsMode;
 $('open-settings').onclick = openSettings;
 $('close-settings').onclick = () => $('settings-dialog').close();
@@ -3069,6 +3233,7 @@ addEventListener('beforeunload', () => {
   saveComposerDraft();
   if ($('edit-queue-dialog').open) saveEditorDraft(state.queueEdit?.draftTarget, $('queued-text').value);
   if ($('edit-message-dialog').open) saveEditorDraft(state.messageEdit?.draftTarget, $('edited-message').value);
+  if ($('edit-schedule-dialog').open) saveScheduledDraft();
 });
 $('refresh').onclick = () => refreshProjects().catch(showError);
 $('more-threads').onclick = async () => {
@@ -3111,6 +3276,10 @@ document.addEventListener('keydown', event => {
 });
 globalThis.addEventListener('focus', acknowledgeVisibleThread);
 globalThis.addEventListener('focus', () => { if (usage.timer && state.connected && Date.now() - usage.updatedAt > 60000) refreshUsage(); });
+globalThis.addEventListener('focus', () => {
+  if (usage.timer) refreshSchedules().catch(showError);
+  if (usage.timer && state.connected && !isLocal() && state.options?.sharedServer && !state.connecting && !state.loading && !state.sending && !state.commandBusy) refreshProjects().catch(showError);
+});
 document.addEventListener('visibilitychange', acknowledgeVisibleThread);
 for (const event of ['online', 'offline']) globalThis.addEventListener(event, () => trace('network.' + event, { connected: state.connected }));
 document.addEventListener('close', acknowledgeVisibleThread, true);

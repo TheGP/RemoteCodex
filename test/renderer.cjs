@@ -44,6 +44,72 @@ async function checks() {
   const savedQueues = new Map();
   api.saveQueue = async queue => { const saved = structuredClone(queue); if (saved.messages.length) savedQueues.set(saved.key, saved); else savedQueues.delete(saved.key); };
   api.queues = async () => [...savedQueues.values()].map(queue => structuredClone(queue));
+  {
+    const methods = ['scheduleSharing', 'scheduleStorage', 'saveScheduleSharing', 'syncSchedules', 'scheduledTasks', 'dismissScheduledTask', 'connect', 'disconnect'];
+    const previousApi = Object.fromEntries(methods.map(method => [method, api[method]]));
+    const previousOptions = state.options, previousThread = state.thread, previousConnected = state.connected, previousTasks = schedules.tasks, previousPrompt = $('prompt').value;
+    const connection = { mode: 'local', host: 'agent-host', port: 22, cwd: '/root', localCwd: '/work/project', key: '' };
+    const thread = { id: 'sharing-live-chat', cwd: '/work/project', name: 'Keep this chat running' };
+    state.options = connection; state.thread = thread; state.connected = true;
+    state.active.set(thread.id, 'sharing-live-turn'); state.active.set('sharing-background-chat', 'sharing-background-turn');
+    $('prompt').value = 'Keep this unsent text';
+    let sharing = { enabled: false, host: 'schedule-host', port: 2222, key: '/keys/storage', folder: '/srv/sync storage', connected: false, error: null };
+    let sharedTasks = [], connects = 0, disconnects = 0, syncs = 0;
+    const saved = [], dismissed = [];
+    api.scheduleSharing = async () => ({ ...sharing });
+    api.scheduleStorage = async () => ({ directory: sharing.folder, bytes: 1572864, complete: true });
+    api.saveScheduleSharing = async value => { saved.push(structuredClone(value)); sharing = { ...value, connected: true, error: null }; return sharing; };
+    api.syncSchedules = async () => { syncs++; return []; };
+    api.scheduledTasks = async () => structuredClone(sharedTasks);
+    api.dismissScheduledTask = async id => { dismissed.push(id); sharedTasks = sharedTasks.filter(task => task.id !== id); };
+    api.connect = async () => { connects++; throw new Error('Agent connection must stay untouched'); };
+    api.disconnect = async () => { disconnects++; throw new Error('Agent connection must stay untouched'); };
+    const unchanged = () => state.options === connection && state.thread === thread && state.active.get(thread.id) === 'sharing-live-turn' && state.active.get('sharing-background-chat') === 'sharing-background-turn' && $('prompt').value === 'Keep this unsent text' && !connects && !disconnects;
+    openSettings(); await Promise.resolve();
+    check($('settings-dialog').open && !$('share-schedules').checked && $('schedule-host').value === 'schedule-host' && $('schedule-port').value === '2222' && $('schedule-key').value === '/keys/storage' && $('sync-schedules').disabled && $('schedule-sync-status').textContent === 'Sharing off' && !$('schedule-sharing-form').closest('#settings-form') && unchanged(), 'Opening schedule sharing changed the agent connection or omitted its independent storage settings');
+    check($('schedule-folder').value === '/srv/sync storage' && $('schedule-folder-size').textContent === '—' && ($('schedule-sharing-form').compareDocumentPosition($('completion-sound')) & Node.DOCUMENT_POSITION_FOLLOWING), 'Sync destination is missing or hidden below other settings');
+    $('share-schedules').checked = true; $('schedule-host').value = 'other-storage'; $('schedule-port').value = '2200'; $('schedule-key').value = '/keys/other-storage'; $('schedule-folder').value = '/srv/other folder';
+    await $('schedule-sharing-form').onsubmit({ preventDefault() {} });
+    check(saved.length === 1 && JSON.stringify(saved[0]) === JSON.stringify({ enabled: true, host: 'other-storage', port: 2200, key: '/keys/other-storage', folder: '/srv/other folder' }) && $('schedule-sync-status').textContent.includes('Connected') && !$('save-schedule-sharing').disabled && !$('sync-schedules').disabled && unchanged(), 'Saving sharing reconnected agents, changed running chats, or saved the wrong storage settings');
+    check($('schedule-folder-size').textContent === '1.5 MB' && $('schedule-resolved-folder').textContent === '/srv/other folder' && !$('schedule-resolved-folder').hidden, 'Folder size or resolved server path is missing');
+    api.scheduleStorage = async () => ({ directory: sharing.folder, bytes: 2048, complete: false }); await fillScheduleSharing();
+    check($('schedule-folder-size').textContent === 'At least 2 KB', 'A capped scan presented an incomplete size as exact');
+    api.scheduleStorage = async () => { throw new Error('Size is unavailable'); }; await fillScheduleSharing();
+    check($('schedule-folder-size').textContent.includes('Unavailable') && unchanged(), 'Folder size errors changed the agent connection or stayed invisible');
+    api.scheduleStorage = async () => ({ directory: sharing.folder, bytes: 1572864, complete: true });
+    await $('sync-schedules').onclick();
+    check(syncs === 1 && unchanged(), 'Syncing schedules restarted the agent connection or changed live chat state');
+    api.saveScheduleSharing = async () => { throw new Error('Schedule storage save failed'); };
+    await $('schedule-sharing-form').onsubmit({ preventDefault() {} });
+    check($('schedule-sync-status').textContent.includes('Schedule storage save failed') && !$('save-schedule-sharing').disabled && unchanged(), 'A sharing save failure disappeared or affected agent chats');
+    api.syncSchedules = async () => { throw new Error('Schedule storage is offline'); };
+    await $('sync-schedules').onclick();
+    check($('schedule-sync-status').textContent.includes('Schedule storage is offline') && !$('sync-schedules').disabled && unchanged(), 'A schedule sync failure disappeared, left sync disabled, or affected agent chats');
+    sharing.error = 'Waiting for network'; await fillScheduleSharing();
+    check($('schedule-sync-status').textContent.includes('Waiting to sync') && $('schedule-sync-status').textContent.includes('Waiting for network'), 'A schedule server status error was hidden');
+    const task = { machine: accessKey(), threadId: thread.id, cwd: thread.cwd, runAt: new Date(Date.now() + 3600000).toISOString(), shared: true };
+    sharedTasks = [
+      { ...task, id: 'sharing-pending', prompt: 'Pending shared message', status: 'pending' },
+      { ...task, id: 'sharing-claimed', prompt: 'Claimed shared message', status: 'claimed' },
+      { ...task, id: 'sharing-unconfirmed', prompt: 'Unconfirmed shared message', status: 'unconfirmed' },
+      { ...task, id: 'sharing-review', prompt: 'Review shared message', status: 'sent', needsReview: true }
+    ];
+    await refreshSchedules();
+    const row = prompt => [...$('scheduled-messages').children].find(element => element.textContent.includes(prompt));
+    check(row('Pending shared message').querySelector('button').textContent === 'Edit' && !row('Claimed shared message').querySelector('button') && row('Claimed shared message').textContent.includes('Preparing scheduled message'), 'Claimed shared work remained editable or pending shared editing disappeared');
+    for (const prompt of ['Unconfirmed shared message', 'Review shared message']) {
+      const button = row(prompt).querySelector('button');
+      check(button.textContent === 'Check delivery', 'Uncertain shared work omitted its delivery review action');
+      await button.onclick();
+      check(!row(prompt), 'Acknowledging uncertain shared work did not refresh its row');
+    }
+    check(dismissed.join() === 'sharing-unconfirmed,sharing-review' && unchanged(), 'Delivery review called the wrong API or changed the agent connection');
+    $('settings-dialog').close();
+    for (const method of methods) { if (previousApi[method] === undefined) delete api[method]; else api[method] = previousApi[method]; }
+    state.active.delete(thread.id); state.active.delete('sharing-background-chat'); state.options = previousOptions; state.thread = previousThread; state.connected = previousConnected;
+    schedules.tasks = previousTasks; $('prompt').value = previousPrompt; renderSchedules(); $('error').hidden = true;
+  }
+  results.push('shared schedule settings open, save and sync independently of agent connections; server errors stay visible, claimed tasks cannot be edited, and uncertain deliveries use the review API');
   const permissionControl = $('permissions');
   const promptControl = $('prompt');
   permissionControl.value = 'read-only';
@@ -392,11 +458,44 @@ async function checks() {
     $('connection-mode').value = 'ssh'; $('codex-path').value = '/ignored/codex'; $('zcode-path').value = '/ignored/zcode';
     const ssh = settingsConnectionOptions();
     check(ssh.providerOptions.codex.executablePath === '/tools/codex' && ssh.providerOptions.zcode.executablePath === '/tools/zcode.cjs', 'Hidden local executable fields changed saved paths while configuring SSH');
+    state.options = { ...state.options, ...ssh, mode: 'ssh', sharedServer: false };
+    fillSettings(state.options);
+    $('shared-server').checked = true;
+    check(settingsConnectionOptions().sharedServer && machineSettingsChanged(settingsConnectionOptions()), 'Shared server selection was not saved or treated as a connection change');
+    state.active.set('shared-setting-busy', 'running');
+    check(settingsBusy(), 'Shared server changes were allowed during running work');
+    state.active.delete('shared-setting-busy');
     state.options = previousOptions; state.thread = previousThread; $('model').innerHTML = modelOptions; $('model').value = model;
     $('permissions').value = permission; $('permissions').dataset.provider = permissionProvider; drafts.restoring = restoring;
     connectionLabels(); fillSettings(previousOptions);
   }
   results.push('agent executable paths save independently and stay unchanged for SSH; ZCode permissions use native labels, hide unsupported read-only access, and retain saved restricted drafts');
+
+  {
+    const previous = { options: state.options, rpc: api.rpc, thread: state.thread, owned: state.owned, active: state.active, queues: state.queues };
+    state.options = { mode: 'ssh', host: 'shared-test', port: 22, sharedServer: true };
+    state.owned = new Set(); state.active = new Map(); state.queues = new Map();
+    const shared = { id: 'shared-chat', cwd: '/tmp', name: 'Shared conversation', status: { type: 'active' } };
+    const calls = []; let conflict = false;
+    api.rpc = async (method, params) => {
+      calls.push({ method, params });
+      if (method === 'thread/resume' && conflict) throw new Error('thread already has an active writer');
+      if (method === 'thread/resume' || method === 'thread/read') return { thread: shared };
+      return { data: [{ id: 'shared-turn', status: 'inProgress', items: [{ id: 'shared-reply', type: 'agentMessage', text: 'Existing output' }] }], nextCursor: null, receivedSequence: 10 };
+    };
+    await openThread(shared);
+    check(calls[0].method === 'thread/resume' && calls[0].params.excludeTurns && !('sandbox' in calls[0].params) && !('approvalPolicy' in calls[0].params), 'Shared history did not subscribe or changed existing permissions');
+    check(state.owned.has(shared.id) && state.active.get(shared.id) === 'shared-turn' && canStopTurn(), 'Shared running chat did not expose its running state and Stop');
+    handleNotification({ method: 'item/agentMessage/delta', params: { threadId: shared.id, itemId: 'shared-reply', delta: ' and live output' } });
+    check(state.items.get('shared-reply').item.text === 'Existing output and live output', 'Shared history did not continue streaming');
+    calls.length = 0; conflict = true;
+    await openThread(shared);
+    check(calls.map(call => call.method).join(',') === 'thread/resume,thread/read,thread/turns/list' && !state.owned.has(shared.id) && state.items.has('shared-reply'), 'A separate writer prevented viewing shared history');
+    state.writerConflicts.delete(queueKey(shared.id));
+    resetThread(); Object.assign(state, { options: previous.options, owned: previous.owned, active: previous.active, queues: previous.queues }); api.rpc = previous.rpc;
+    if (previous.thread) setThread(previous.thread);
+  }
+  results.push('shared server settings retain active-task guards; opening subscribes to live history without changing permissions and separate writers remain readable');
 
   const recent = { id: 'recent', preview: 'Recent conversation', cwd: '/tmp', updatedAt: 20 };
   const older = { id: 'older', name: 'Older pinned conversation', cwd: '/older', updatedAt: 1 };
@@ -2524,6 +2623,87 @@ async function checks() {
   api.cancelScheduledTask = async id => { scheduledRecords.find(task => task.id === id).status = 'cancelled'; };
   await refreshSchedules();
   check(!$('scheduled-messages').hidden && $('scheduled-messages').children.length === 2 && !$('scheduled-messages').querySelector('img') && $('scheduled-messages').textContent.includes('Unconfirmed; check history'), 'Scheduled rows mixed chats, exposed markup, hid uncertainty, or retained delivered tasks');
+  {
+    const row = $('scheduled-messages').firstElementChild;
+    const edit = $('scheduled-messages').querySelector('[aria-label="Edit scheduled message"]'); edit.focus();
+    const originalSchedules = renderSchedules, originalIndicators = renderThreadIndicators;
+    let renders = 0, indicators = 0;
+    renderSchedules = () => { renders++; originalSchedules(); };
+    renderThreadIndicators = () => { indicators++; originalIndicators(); };
+    try {
+      for (let index = 0; index < 8; index++) await refreshSchedules();
+      check(renders === 0 && indicators === 0 && $('scheduled-messages').firstElementChild === row && document.activeElement === edit, 'Unchanged schedule snapshots rebuilt rows or lost keyboard focus');
+      scheduledRecords[0].prompt += ' updated'; await refreshSchedules();
+      check(renders === 1 && indicators === 1 && $('scheduled-messages').textContent.includes('updated'), 'A changed schedule did not update its row and sidebar');
+    } finally { renderSchedules = originalSchedules; renderThreadIndicators = originalIndicators; }
+  }
+  {
+    const task = scheduledRecords[0];
+    task.cwd = scheduleThread.cwd;
+    task.message = { text: task.prompt, images: [{ name: 'kept-scheduled.png' }], input: [{ type: 'text', text: task.prompt }, { type: 'skill', name: 'cr', path: '/skills/cr/SKILL.md' }] };
+    const locks = []; const priorLock = api.editLock;
+    api.editLock = async (threadId, token) => { locks.push({ threadId, token }); return token ? undefined : 'schedule-lock'; };
+    api.scheduledTask = async (id, token) => { check(id === task.id && token === 'schedule-lock', 'Scheduled editor read without its lock'); return structuredClone(task); };
+    let savedEdit;
+    api.editScheduledTask = async (id, patch, token) => { savedEdit = { id, patch, token }; Object.assign(task, { prompt: patch.text, runAt: patch.runAt }); };
+    state.active.set(scheduleThread.id, 'scheduled-edit-running');
+    await $('scheduled-messages').querySelector('[aria-label="Edit scheduled message"]').onclick();
+    check($('edit-schedule-dialog').open && $('scheduled-text').value === task.prompt && $('scheduled-attachments').textContent.includes('kept-scheduled.png'), 'Scheduled editor did not open while another turn was running or hid its attachments');
+    const originalTime = task.runAt;
+    $('scheduled-text').value = 'Edited scheduled $cr';
+    const newline = new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true, cancelable: true }); $('scheduled-text').dispatchEvent(newline);
+    check(!newline.defaultPrevented && !savedEdit, 'Shift+Enter submitted the scheduled editor');
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }); $('scheduled-text').dispatchEvent(enter); await settle();
+    check(enter.defaultPrevented && !$('edit-schedule-dialog').open && savedEdit?.patch.text === 'Edited scheduled $cr' && savedEdit.patch.runAt === originalTime && savedEdit.patch.skills[0]?.path === '/skills/cr/SKILL.md', 'Enter did not save the scheduled text/skills or changed its original exact send time');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    check(locks.some(lock => lock.token === 'schedule-lock'), 'Closing the scheduled editor kept delivery locked');
+    await openScheduledEdit(task);
+    const nextTime = new Date(Date.now() + 86400000); nextTime.setMinutes(nextTime.getMinutes() - nextTime.getTimezoneOffset());
+    $('scheduled-time').value = nextTime.toISOString().slice(0, 16);
+    await $('edit-schedule-form').onsubmit({ preventDefault() {} });
+    check(savedEdit.patch.runAt === new Date($('scheduled-time').value).toISOString() && task.runAt !== originalTime, 'Changing a scheduled send time did not save the local date correctly');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const previousSkillRpc = api.rpc;
+    slash.cwd = null; slash.skills = [];
+    task.message.input = task.message.input.filter(part => part.type !== 'skill');
+    api.rpc = async (method, params) => method === 'skills/list' ? { data: [{ skills: [{ name: 'cr', path: '/fresh/cr/SKILL.md' }] }] } : previousSkillRpc(method, params);
+    await openScheduledEdit(task); $('scheduled-text').value = 'Newly added $cr';
+    await $('edit-schedule-form').onsubmit({ preventDefault() {} });
+    check(savedEdit.patch.skills.some(skill => skill.name === 'cr' && skill.path === '/fresh/cr/SKILL.md'), 'Adding a skill to a scheduled message with an empty skill cache did not bind its installed skill');
+    api.rpc = previousSkillRpc;
+    const scheduledPrompt = task.prompt;
+    api.editScheduledTask = async () => { throw new Error('Schedule save failed'); };
+    await openScheduledEdit(task); $('scheduled-text').value = 'Keep this failed edit';
+    await $('edit-schedule-form').onsubmit({ preventDefault() {} });
+    check($('edit-schedule-dialog').open && $('scheduled-text').value === 'Keep this failed edit' && $('edit-schedule-error').textContent.includes('Schedule save failed') && task.prompt === scheduledPrompt, 'A failed scheduled edit closed the form, lost its text, or changed the saved task');
+    $('cancel-schedule-edit').click(); await new Promise(resolve => setTimeout(resolve, 0));
+    const normalLock = api.editLock, normalRead = api.scheduledTask;
+    await openScheduledEdit(task);
+    const closed = new Promise(resolve => $('edit-schedule-dialog').addEventListener('close', resolve, { once: true }));
+    closeScheduledEditor();
+    let finishLock;
+    const released = [];
+    api.editLock = (_id, token) => token ? (released.push(token), Promise.resolve()) : new Promise(resolve => { finishLock = resolve; });
+    api.scheduledTask = async () => structuredClone(task);
+    const reopening = openScheduledEdit(task), reopeningTarget = schedules.editing;
+    await closed;
+    check(schedules.editing === reopeningTarget, 'The previous close event cancelled the next editor while its lock was pending');
+    finishLock('reopened-schedule-lock'); await reopening;
+    check($('edit-schedule-dialog').open && schedules.editing === reopeningTarget && !released.length, 'Reopening the scheduled editor lost its dialog or released its new lock');
+    closeScheduledEditor();
+    check(released.join() === 'reopened-schedule-lock', 'Closing the reopened editor did not release its own lock');
+    api.editLock = normalLock;
+    for (const [runAt, localTime] of [['2026-03-08T07:30:00.000Z', '2026-03-08T03:30'], ['2026-11-01T06:30:00.000Z', '2026-11-01T01:30']]) {
+      api.scheduledTask = async () => ({ ...structuredClone(task), runAt });
+      await openScheduledEdit(task);
+      check($('scheduled-time').value === localTime, 'Scheduled time changed across a daylight-saving boundary: ' + runAt);
+      closeScheduledEditor();
+    }
+    api.scheduledTask = normalRead;
+    state.active.delete(scheduleThread.id); api.editLock = priorLock;
+  }
+  results.push('pending scheduled messages edit text and local send time while work runs; Enter saves, Shift+Enter stays multiline, skills and exact unchanged times remain, failures preserve edits, and closing releases delivery locks');
+  results.push('scheduled editors reopen while lock acquisition is pending without stale close events interfering, and show correct local times across spring and fall daylight-saving changes');
   state.threads = [scheduleThread]; renderThreads();
   check($('threads').querySelector('.thread-schedule')?.title.includes('scheduled message'), 'Conversation list did not show a scheduled-message clock');
   check(!canArchiveConversation(scheduleThread), 'A chat with pending scheduled work can be archived');
@@ -2534,10 +2714,10 @@ async function checks() {
   setThread(scheduleThread);
   const cancelScheduled = api.cancelScheduledTask;
   api.cancelScheduledTask = async () => { throw new Error('Schedule cancellation failed'); };
-  await $('scheduled-messages').querySelector('button').onclick();
+  await $('scheduled-messages').querySelector('[aria-label="Cancel scheduled message"]').onclick();
   check($('scheduled-messages').children.length === 2 && !$('error').hidden, 'A failed cancellation lost its scheduled prompt');
   api.cancelScheduledTask = cancelScheduled;
-  await $('scheduled-messages').querySelector('button').onclick();
+  await $('scheduled-messages').querySelector('[aria-label="Cancel scheduled message"]').onclick();
   check($('scheduled-messages').children.length === 1 && scheduledRecords[0].status === 'cancelled' && canArchiveConversation(scheduleThread), 'Scheduled cancellation did not update its row or release the archive guard');
   let finishSchedules;
   api.scheduledTasks = () => new Promise(resolve => { finishSchedules = resolve; });
@@ -2780,9 +2960,18 @@ async function checks() {
   state.active.clear(); state.queues.clear(); state.images = []; $('send-time').value = '0'; $('error').hidden = true;
   results.push('compact shortcuts send or queue exact prompts with resolved skills, preserve typed and image drafts, reject missing skills, and support persistent adding, editing, deleting, and failed-save recovery');
   resetThread(); state.thread = { id: 'changed-files-chat', cwd: '/work/project' };
+  for (const [patches, line] of [
+    [['@@ -64,5 +64,5 @@\n context64\n context65\n context66\n-old\n+new\n tail'], 67],
+    [['@@ -10,4 +10,3 @@\n line10\n line11\n line12\n-deleted last line'], 12],
+    [['@@ -5 +4,0 @@\n-deleted'], 4],
+    [['@@ -0,0 +1,2 @@\n+first\n+second'], 1],
+    [['@@ -100 +100 @@\n-old\n+new', '@@ -30,2 +30,2 @@\n context\n-old\n+new'], 31],
+    [['--- old.ts\n+++ new.ts'], 1],
+    [['@@ -1 +99999999999999999999 @@\n-old\n+new'], 1]
+  ]) check(firstChangedLine(patches) === line, 'Editor navigation chose the wrong changed line: ' + patches.join('\n'));
   const summaryTurn = 'changed-files-turn';
   const summaryPatch = { id: 'changed-files-patch', type: 'fileChange', status: 'inProgress', changes: [
-    { path: '/work/project/src/example.ts', kind: { type: 'update' }, diff: '--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1,2 @@\n-old\n+new\n+++literal added line' },
+    { path: '/work/project/src/example.ts', kind: { type: 'update' }, diff: '--- a/src/example.ts\n+++ b/src/example.ts\n@@ -64,5 +64,6 @@\n context64\n context65\n context66\n-old\n+new\n+++literal added line\n tail' },
     { path: '/work/project/new.ts', kind: { type: 'add' }, diff: '<img src=x onerror=alert(1)>\n' }
   ] };
   renderItem(summaryPatch, false, summaryTurn);
@@ -2798,12 +2987,16 @@ async function checks() {
   };
   const firstFile = summaryCard.querySelector('.changed-file-entry');
   check(!summaryCard.querySelector('pre'), 'Collapsed files eagerly rendered their diffs');
+  const summaryOpenLink = api.openLink; const summaryLinks = []; api.openLink = async (href, context) => summaryLinks.push({ href, context });
+  const headerIcon = firstFile.querySelector('.open-changed-file');
+  check(firstFile.firstElementChild.contains(headerIcon) && headerIcon.querySelector('svg') && !headerIcon.textContent.trim(), 'Editor action was not a small icon in the file header');
+  headerIcon.click(); await settle();
+  check(!firstFile.open && !firstFile.querySelector('.changed-file-content') && summaryLinks[0].href === '/work/project/src/example.ts#L67' && summaryLinks[0].context.clampLine === true && summaryLinks[0].context.provider === 'codex', 'Opening a collapsed file toggled its diff, eagerly rendered it, missed the first changed line, or omitted current-file bounds and provider');
   await toggleFile(firstFile);
   const inlineDiff = firstFile.querySelector('.changed-file-diff');
   check(firstFile.open && inlineDiff.textContent.includes('+++literal added line') && inlineDiff.querySelector('.diff-added') && !inlineDiff.querySelector('img') && !document.querySelector('dialog[open]'), 'The inline diff lost patch text, colors, safe HTML, or opened a dialog');
-  const summaryOpenLink = api.openLink; const summaryLinks = []; api.openLink = async (href, context) => summaryLinks.push({ href, context });
-  await firstFile.querySelector('.open-changed-file').onclick();
-  check(summaryLinks[0].href === '/work/project/src/example.ts' && summaryLinks[0].context.cwd === '/work/project' && summaryLinks[0].context.machine === accessKey(), 'The diff opened a file on the wrong machine or in the wrong folder');
+  headerIcon.click(); await settle();
+  check(firstFile.open && !firstFile.querySelector('.changed-file-content button') && summaryLinks[1].href === '/work/project/src/example.ts#L67' && summaryLinks[1].context.cwd === '/work/project' && summaryLinks[1].context.machine === accessKey(), 'The header icon collapsed the open diff, retained the footer button, or opened the wrong target');
   await toggleFile(firstFile);
   check(!firstFile.open && !inlineDiff.checkVisibility(), 'Clicking a file again did not collapse its diff');
   await toggleFile(firstFile);
@@ -2927,7 +3120,7 @@ async function checks() {
   check(reusedCard.firstElementChild.textContent === '2 files changed+7−7' && reusedEntry.dataset.path === '/work/project/final.ts' && reusedEntry.querySelector('.change-counts').textContent === '+5−5' && reusedPane.children.length === 5 && reusedPane.firstElementChild === originalPre, 'Rename chains lost or duplicated previous patches and counts');
   const reuseOpenLink = api.openLink; const openedRename = []; api.openLink = async (href, context) => openedRename.push({ href, context });
   await editorButton.onclick(); api.openLink = reuseOpenLink;
-  check(openedRename[0].href === '/work/project/final.ts' && openedRename[0].context.cwd === '/work/project', 'The reused editor button still opened the source of a rename');
+  check(openedRename[0].href === '/work/project/final.ts#L1' && openedRename[0].context.cwd === '/work/project', 'The reused editor button still opened the source of a rename');
   renderItem({ id: 'reuse-source-name', type: 'fileChange', status: 'completed', changes: [{ path: '/work/project/original.ts', kind: { type: 'add' }, diff: 'a different file\n' }] }, false, reuseTurn);
   check(reusedCard.querySelectorAll('.changed-file-entry').length === 3 && reusedEntry.dataset.path === '/work/project/final.ts' && reusedCard.lastElementChild.lastElementChild !== reusedEntry, 'Creating a new file at the old path merged it with the renamed file');
   renderItem({ ...appliedPatch('reuse-failed-rename', '/work/project/final.ts', '-finished\n+bad', '/work/project/failed.ts'), status: 'failed' }, false, reuseTurn);
@@ -3496,9 +3689,13 @@ module.exports = async () => {
   try {
     testWindow.webContents.session.webRequest.onBeforeRequest({ urls: ['file://*/*renderer.js'] }, (_details, callback) => callback({ cancel: true }));
     await testWindow.loadFile(path.join(__dirname, '..', 'index.html'));
+    testWindow.webContents.debugger.attach('1.3');
+    await testWindow.webContents.debugger.sendCommand('Emulation.setTimezoneOverride', { timezoneId: 'America/New_York' });
     const source = fs.readFileSync(path.join(__dirname, '..', 'renderer.js'), 'utf8').replace('init().catch(showError);', '');
     const results = await testWindow.webContents.executeJavaScript(`(async () => { const window = { agent: {} }; ${source}\nreturn (${checks.toString()})().catch(error => ({ error: error.stack })); })()`);
     if (results.error) throw new Error(results.error);
+    await testWindow.webContents.debugger.sendCommand('Emulation.setTimezoneOverride', { timezoneId: '' });
+    testWindow.webContents.debugger.detach();
     const artifacts = path.join(__dirname, '..', 'artifacts', 'branches-ui');
     fs.mkdirSync(artifacts, { recursive: true });
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -3550,6 +3747,11 @@ module.exports = async () => {
       globalThis.previewProviders = () => {
         state.options.agents = [{ id: 'codex', name: 'Codex', enabled: true, available: true, connected: true }, { id: 'zcode', name: 'ZCode', available: false, defaultEnabled: false, enabled: false, connected: false }];
         fillSettings(state.options);
+      };
+      globalThis.previewSync = async () => {
+        api.scheduleSharing = async () => ({ enabled: true, host: 'root@warmer', port: 22, key: '', folder: '~/.local/share/remote-codex/schedule-sync', connected: true });
+        api.scheduleStorage = async () => ({ directory: '/root/.local/share/remote-codex/schedule-sync', bytes: 123456, complete: true });
+        await fillScheduleSharing(); $('settings-dialog').scrollTop = 0;
       };
     })()`);
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -3619,8 +3821,14 @@ module.exports = async () => {
     await new Promise(resolve => setTimeout(resolve, 100));
     await testWindow.webContents.executeJavaScript("document.querySelector('.changed-file').click(); document.getElementById('open-settings').click()");
     await new Promise(resolve => setTimeout(resolve, 100));
+    await testWindow.webContents.executeJavaScript('previewSync()');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (!await testWindow.webContents.executeJavaScript("document.getElementById('share-schedules').checked && document.getElementById('schedule-folder-size').textContent === '120.6 KB' && !document.getElementById('schedule-resolved-folder').hidden")) throw new Error('Sync preview omitted its enabled destination or folder size');
+    fs.writeFileSync(path.join(artifacts, 'sync-settings.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript("document.getElementById('completion-sound').scrollIntoView({block:'center'})");
     fs.writeFileSync(path.join(artifacts, 'completion-sound-settings.png'), (await testWindow.webContents.capturePage()).toPNG());
     await testWindow.webContents.executeJavaScript('previewProviders()');
+    await testWindow.webContents.executeJavaScript("document.getElementById('provider-settings').scrollIntoView({block:'center'})");
     fs.writeFileSync(path.join(artifacts, 'provider-settings.png'), (await testWindow.webContents.capturePage()).toPNG());
     await testWindow.webContents.executeJavaScript("document.getElementById('settings-dialog').close(); previewQuestion()");
     await new Promise(resolve => setTimeout(resolve, 100));

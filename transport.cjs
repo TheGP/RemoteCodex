@@ -1,5 +1,7 @@
 const { spawn } = require('node:child_process');
 const { StringDecoder } = require('node:string_decoder');
+const { Duplex } = require('node:stream');
+const WebSocket = require('ws');
 const { EventEmitter } = require('node:events');
 const os = require('node:os');
 const fs = require('node:fs');
@@ -16,6 +18,8 @@ function connectionOptions(value = {}) {
   const cwd = String(value.cwd || '/root').trim();
   const localCwd = String(value.localCwd || os.homedir()).trim();
   const codexPath = String(value.executablePath ?? value.codexPath ?? '').trim();
+  if (value.sharedServer !== undefined && typeof value.sharedServer !== 'boolean') throw new Error('Invalid shared server setting.');
+  const sharedServer = value.sharedServer ?? false;
   if (mode === 'ssh') {
     if (!/^[a-zA-Z0-9_][a-zA-Z0-9_.@:\[\]-]*$/.test(host)) throw new Error('Enter an SSH host such as root@warmer.');
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('SSH port must be between 1 and 65535.');
@@ -25,7 +29,7 @@ function connectionOptions(value = {}) {
     if (!path.isAbsolute(localCwd) || localCwd.includes('\0')) throw new Error('Use an absolute local workspace folder.');
     if (codexPath && (!path.isAbsolute(codexPath) || codexPath.includes('\0'))) throw new Error('Use an absolute path to the Codex executable.');
   }
-  return { mode, host, port, key, cwd, localCwd, codexPath };
+  return { mode, host, port, key, cwd, localCwd, codexPath, sharedServer };
 }
 
 function localLaunch(options) {
@@ -66,6 +70,7 @@ class CodexConnection extends EventEmitter {
     this.sequence = 0;
     this.receivedSequence = 0;
     this.child = null;
+    this.socket = null;
     this.ready = false;
     this.spawnProcess = spawnProcess;
   }
@@ -87,7 +92,7 @@ class CodexConnection extends EventEmitter {
       command = process.platform === 'win32' ? 'ssh.exe' : '/usr/bin/ssh';
       args = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=12', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', '-p', String(options.port)];
       if (options.key) args.push('-i', options.key.replace(/^~(?=[/\\])/, os.homedir()));
-      args.push(options.host, 'exec codex app-server --listen stdio://');
+      args.push(options.host, options.sharedServer ? 'codex app-server daemon start >/dev/null && exec codex app-server proxy' : 'exec codex app-server --listen stdio://');
     }
     const child = this.spawnProcess(command, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], ...(env ? { env, cwd } : {}) });
     this.child = child;
@@ -147,19 +152,33 @@ class CodexConnection extends EventEmitter {
         else request.resolve(request.method === 'thread/turns/list' ? { ...message.result, receivedSequence } : message.result);
       }
     };
-    const decoder = new StringDecoder('utf8');
-    let fragments = [];
-    child.stdout.on('data', chunk => {
-      const parts = decoder.write(chunk).split('\n');
-      for (let index = 0; index < parts.length - 1; index++) {
-        fragments.push(parts[index]); const line = fragments.join(''); fragments = []; receive(line);
-      }
-      if (parts.at(-1)) fragments.push(parts.at(-1));
-    });
-    child.stdout.on('end', () => {
-      fragments.push(decoder.end()); receive(fragments.join('')); fragments = [];
-    });
     try {
+      if (options.mode === 'ssh' && options.sharedServer) {
+        const stream = Duplex.from({ readable: child.stdout, writable: child.stdin });
+        const socket = new WebSocket('ws://localhost/', { createConnection: () => stream, handshakeTimeout: 15000, perMessageDeflate: false });
+        this.socket = socket;
+        socket.on('message', data => receive(data.toString()));
+        socket.on('error', fail);
+        socket.on('close', () => fail(new Error('Shared server connection closed. Running tasks remain on the server.')));
+        await new Promise((resolve, reject) => {
+          const closed = () => reject(new Error('Shared server disconnected before initialization.'));
+          socket.once('open', resolve); socket.once('error', reject); socket.once('close', closed);
+        });
+        if (this.child !== child) throw new Error('The shared server connection changed.');
+      } else {
+        const decoder = new StringDecoder('utf8');
+        let fragments = [];
+        child.stdout.on('data', chunk => {
+          const parts = decoder.write(chunk).split('\n');
+          for (let index = 0; index < parts.length - 1; index++) {
+            fragments.push(parts[index]); const line = fragments.join(''); fragments = []; receive(line);
+          }
+          if (parts.at(-1)) fragments.push(parts.at(-1));
+        });
+        child.stdout.on('end', () => {
+          fragments.push(decoder.end()); receive(fragments.join('')); fragments = [];
+        });
+      }
       const result = await this.call('initialize', { clientInfo: { name: 'remote_codex', title: 'Remote Codex', version }, capabilities: { experimentalApi: true } });
       this.write({ method: 'initialized', params: {} });
       this.ready = true;
@@ -172,7 +191,8 @@ class CodexConnection extends EventEmitter {
 
   write(message) {
     if (!this.child || this.child.stdin.destroyed) throw new Error('Connect to Codex first.');
-    this.child.stdin.write(JSON.stringify(message) + '\n');
+    if (this.socket) this.socket.send(JSON.stringify(message));
+    else this.child.stdin.write(JSON.stringify(message) + '\n');
   }
 
   call(method, params = {}, timeout = 90000) {
@@ -212,8 +232,11 @@ class CodexConnection extends EventEmitter {
 
   disconnect() {
     const child = this.child;
+    const socket = this.socket;
     this.child = null;
+    this.socket = null;
     this.ready = false;
+    socket?.terminate();
     if (child) { child.stdin.end(); child.kill(); }
     for (const request of this.pending.values()) {
       clearTimeout(request.timer);

@@ -5,6 +5,7 @@ const path = require('node:path');
 const assert = require('node:assert/strict');
 const { pathToFileURL } = require('node:url');
 const { DraftStore, registerDraftIpc } = require('../drafts.cjs');
+const { ScheduleStore } = require('../scheduler.cjs');
 const { AgentConnection, connectionOptions, connectionKey } = require('../providers.cjs');
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-drafts-desktop-'));
@@ -12,6 +13,7 @@ app.setPath('userData', path.join(directory, 'profile'));
 app.on('window-all-closed', () => {});
 app.whenReady().then(async () => {
   const store = new DraftStore(path.join(directory, 'drafts'));
+  const scheduled = new ScheduleStore(path.join(directory, 'schedules.json'));
   const index = path.resolve(__dirname, '..', 'index.html'); const page = pathToFileURL(index).href;
   const thread = { id: 'desktop-draft-chat', cwd: directory, name: 'Draft conversation', historyMode: 'paginated', status: { type: 'idle' } };
   const calls = []; let window, finishSend, settingsError = null, connections = 0;
@@ -22,7 +24,10 @@ app.whenReady().then(async () => {
   ipcMain.handle('settings', publicSettings);
   ipcMain.handle('providers', () => providers);
   ipcMain.handle('preferences', () => ({ theme: 'system', startupProjects: {}, conversationStates: {}, threadOrders: {} }));
-  for (const name of ['queues', 'pins', 'scheduled-tasks']) ipcMain.handle(name, () => []);
+  for (const name of ['queues', 'pins']) ipcMain.handle(name, () => []);
+  ipcMain.handle('scheduled-tasks', () => scheduled.summaries());
+  ipcMain.handle('scheduled-task', (_event, id) => scheduled.get(id));
+  ipcMain.handle('edit-lock', (_event, _threadId, token) => token ? undefined : 'desktop-schedule-lock');
   ipcMain.handle('connect', () => { connections++; settingsError = null; return { options: publicSettings() }; });
   ipcMain.on('save-conversation-state', event => { event.returnValue = { ok: true }; });
   ipcMain.on('diagnostic', () => {});
@@ -89,6 +94,20 @@ app.whenReady().then(async () => {
     assert.equal(await evaluate("document.getElementById('prompt').value"), 'Conversation draft');
     assert.ok(!calls.some(method => ['turn/start', 'turn/steer', 'thread/resume', 'thread/revert'].includes(method)));
     console.log('PASS real renderer restart restores the same conversation, composer and open editor independently without sending or rewriting history');
+    await evaluate("document.getElementById('cancel-message-edit').click();");
+    const task = scheduled.enqueue({ machine: 'access:local', thread, text: 'Original scheduled prompt', input: [{ type: 'text', text: 'Original scheduled prompt' }], images: [], access: { sandbox: 'read-only', approvalPolicy: 'never' }, mode: 'default', turnSettings: { threadId: thread.id } }, 1);
+    await evaluate(`(async () => { await refreshSchedules(); await openScheduledEdit(schedules.tasks.find(task => task.id === ${JSON.stringify(task.id)})); })()`);
+    const editedTime = new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 16);
+    await evaluate(`document.getElementById('scheduled-text').value = 'Unfinished scheduled edit'; document.getElementById('scheduled-time').value = ${JSON.stringify(editedTime)}; document.getElementById('scheduled-text').dispatchEvent(new Event('input', { bubbles: true }));`);
+    await close();
+    assert.equal(new DraftStore(store.directory).last('access:local').target.kind, 'edit-schedule');
+    await open();
+    assert.equal(await evaluate("document.getElementById('edit-schedule-dialog').open"), true);
+    assert.equal(await evaluate("document.getElementById('scheduled-text').value"), 'Unfinished scheduled edit');
+    assert.equal(await evaluate("document.getElementById('scheduled-time').value"), editedTime);
+    assert.equal(scheduled.get(task.id).prompt, 'Original scheduled prompt');
+    await evaluate("document.getElementById('cancel-schedule-edit').click();");
+    console.log('PASS scheduled editor text and local send-time drafts reopen after a real restart without changing the original scheduled task');
     await evaluate("document.getElementById('cancel-message-edit').click(); document.getElementById('prompt').value = 'Keep until send is acknowledged'; document.getElementById('send-time').value = '0'; document.getElementById('prompt').dispatchEvent(new Event('input', { bubbles: true })); send(); undefined;");
     for (let attempt = 0; attempt < 100 && !finishSend; attempt++) await new Promise(resolve => setTimeout(resolve, 25));
     assert.ok(finishSend);

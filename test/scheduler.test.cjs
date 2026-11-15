@@ -71,6 +71,54 @@ test('composer schedules preserve attachments, skills, settings, and machine ide
   assert.equal(restored.list().find(task => task.id === remoteTask.id).status, 'sent');
 });
 
+test('editing a pending schedule retains its identity, attachments and turn settings, survives reload and sends once at the new time', async t => {
+  const f = fixture(t);
+  const image = { name: 'preview.png', url: 'data:image/png;base64,AA==' };
+  const skill = { type: 'skill', name: 'cr', path: '/skills/cr/SKILL.md' };
+  const message = { machine: 'access:local', thread, text: 'Original $cr', images: [image], input: [{ type: 'text', text: 'Original $cr' }, { type: 'image', url: image.url }, skill], access: { sandbox: 'read-only', approvalPolicy: 'on-request' }, mode: 'plan', model: 'saved-model', effort: 'high', turnSettings: { threadId: thread.id, model: 'saved-model', effort: 'high' } };
+  const task = f.store.enqueue(message, 1, f.now);
+  f.store.update(task.id, { error: 'Earlier error', retryAt: f.now + 500000 });
+  const runAt = new Date(f.now + 7200000).toISOString();
+  const edited = f.store.edit(task.id, { text: 'Edited $cr', runAt, skills: [skill] }, f.now);
+  assert.equal(edited.id, task.id); assert.equal(edited.createdAt, task.createdAt);
+  assert.equal(edited.prompt, 'Edited $cr'); assert.equal(edited.error, null); assert.equal(edited.retryAt, null);
+  assert.deepEqual(edited.message, { ...message, text: 'Edited $cr', input: [{ type: 'text', text: 'Edited $cr', text_elements: [] }, { type: 'image', url: image.url }, skill] });
+  const restored = new ScheduleStore(f.store.file);
+  assert.deepEqual(restored.get(task.id), edited);
+  f.scheduler.store = restored;
+  await f.scheduler.tick(f.now + 3600001); assert.equal(f.calls.length, 0);
+  await f.scheduler.tick(f.now + 7200001);
+  assert.deepEqual(f.calls.at(-1).params, { ...message.turnSettings, input: edited.message.input });
+  await f.scheduler.tick(f.now + 9000000);
+  assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 1);
+  assert.throws(() => restored.edit(task.id, { text: 'Too late', runAt }), /no longer pending/);
+});
+
+test('scheduled edits reject invalid content, dates and status changes while keeping an overdue time or image-only message valid', t => {
+  const f = fixture(t), task = f.add();
+  for (const patch of [{ text: '', runAt: task.runAt }, { text: 'x', runAt: 'invalid' }, { text: 'x', runAt: new Date(f.now - 1).toISOString() }, { text: 'x', runAt: new Date(f.now + 367 * 86400000).toISOString() }, { text: 'x', runAt: task.runAt, status: 'sent' }, { text: 'x', runAt: task.runAt, skills: [{ type: 'text' }] }]) assert.throws(() => f.store.edit(task.id, patch, f.now));
+  assert.deepEqual(f.store.get(task.id), task);
+  const overdue = f.store.edit(task.id, { text: 'Updated overdue', runAt: task.runAt }, f.now + 10000);
+  assert.equal(overdue.runAt, task.runAt);
+  f.store.cancel(task.id);
+  assert.throws(() => f.store.edit(task.id, { text: 'Cancelled', runAt: task.runAt }), /no longer pending/);
+  const message = { machine: 'access:local', thread, text: 'Image', images: [{ name: 'a.png' }], input: [{ type: 'text', text: 'Image' }, { type: 'image', url: 'data:image/png;base64,AA==' }, { type: 'skill', name: 'cr', path: '/cr' }], access: { sandbox: 'read-only', approvalPolicy: 'never' }, mode: 'default', turnSettings: { threadId: thread.id } };
+  const imageTask = f.store.enqueue(message, 1, f.now);
+  const imageOnly = f.store.edit(imageTask.id, { text: ' ', runAt: imageTask.runAt, skills: [] }, f.now);
+  assert.equal(imageOnly.prompt, '1 image(s)'); assert.deepEqual(imageOnly.message.input, [{ type: 'image', url: 'data:image/png;base64,AA==' }]);
+});
+
+test('rescheduling during delivery preflight cannot send an old due snapshot', async t => {
+  const f = fixture(t), task = f.add();
+  let finishRead;
+  f.connection.call = () => new Promise(resolve => { finishRead = resolve; });
+  const tick = f.scheduler.tick(f.now + 2000);
+  f.store.edit(task.id, { text: 'Send later', runAt: new Date(f.now + 3600000).toISOString() }, f.now);
+  finishRead({ thread }); await tick;
+  assert.equal(f.store.get(task.id).status, 'pending');
+  assert.equal(f.scheduler.dispatching.size, 0);
+});
+
 test('disconnected, other-machine, active, and queued chats defer scheduled delivery', async t => {
   const f = fixture(t); f.add();
   f.connection.ready = false; await f.scheduler.tick(f.now + 2000);

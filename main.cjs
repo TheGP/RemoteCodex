@@ -12,6 +12,7 @@ const { readImage } = require('./images.cjs');
 const { openWebLink, openFileLink, parseFileLink } = require('./links.cjs');
 const { generateTitle, titleKey, readThreadForTitle } = require('./titles.cjs');
 const { ScheduleStore, Scheduler } = require('./scheduler.cjs');
+const { SharedSchedules } = require('./shared-schedules.cjs');
 const { DiagnosticLog, TurnDiagnostics } = require('./diagnostics.cjs');
 const { DraftStore, registerDraftIpc } = require('./drafts.cjs');
 const { AgentWakeLock } = require('./wake-lock.cjs');
@@ -70,10 +71,23 @@ app.whenReady().then(async () => {
   ipcMain.handle('edit-lock', (event, threadId, token) => {
     checkSender(event);
     if (typeof threadId !== 'string' || !threadId || threadId.length > 200) throw new Error('Invalid conversation.');
-    if (token) { if (editLocks.get(threadId) === token) editLocks.delete(threadId); return; }
+    if (token) {
+      if (editLocks.get(threadId) === token) { editLocks.delete(threadId); if (shared.enabled) return shared.unlock(token); }
+      return;
+    }
     if (!connection.ready) throw new Error('Connect to a coding agent first.');
     if (editLocks.has(threadId) || scheduler.dispatching.has(threadId)) throw new Error('This conversation is busy; try editing after the task finishes.');
-    const lock = randomUUID(); editLocks.set(threadId, lock); return lock;
+    if (!shared.enabled) { const lock = randomUUID(); editLocks.set(threadId, lock); return lock; }
+    const session = connection.session, machine = scheduleMachine();
+    // Reserve locally before waiting on SSH, so a second editor cannot enter during the request.
+    const reservation = randomUUID(); editLocks.set(threadId, reservation);
+    return shared.lock(threadId).then(async lock => {
+      if (connection.session !== session || scheduleMachine() !== machine || editLocks.get(threadId) !== reservation) {
+        if (shared.enabled) await shared.unlock(lock);
+        throw new Error('The conversation connection changed. Reopen the editor.');
+      }
+      editLocks.set(threadId, lock); return lock;
+    }).catch(error => { if (editLocks.get(threadId) === reservation) editLocks.delete(threadId); throw error; });
   });
   const schedulesChanged = () => { if (window && !window.isDestroyed()) window.webContents.send('notification', { method: 'scheduler/updated', params: {} }); };
   const scheduleMachine = () => connectionKey(settings);
@@ -89,22 +103,80 @@ app.whenReady().then(async () => {
     blocked: threadId => editLocks.has(threadId) || queues.hasMessages(scheduleMachine() + ':' + threadId),
     changed: schedulesChanged
   });
-  const tickSchedules = () => scheduler.tick().catch(error => {
+  const shared = new SharedSchedules({
+    file: path.join(app.getPath('userData'), 'shared-schedules.json'), store: schedules, connection,
+    available: () => Boolean(window), machine: scheduleMachine, blocked: scheduler.blocked,
+    dispatching: scheduler.dispatching, changed: schedulesChanged, log: (event, details) => diagnostic.write(event, details)
+  });
+  const releaseEditors = provider => {
+    for (const [threadId, token] of editLocks) if (!provider || agentTarget(threadId, 'thread').provider === provider) {
+      editLocks.delete(threadId);
+      if (shared.enabled) shared.unlock(token).catch(error => diagnostic.write('schedule.unlock.failed', { error: error.message }));
+    }
+  };
+  const tickSchedules = () => (shared.enabled ? shared.tick() : scheduler.tick()).catch(error => {
     console.error('Scheduled task error:', error.message);
     if (window && !window.isDestroyed()) window.webContents.send('notification', { method: 'error', params: { message: `Scheduled task error: ${error.message}` } });
   });
   const recoverAgents = () => { if (connection.ready) connection.recover().catch(error => diagnostic.write('provider.recovery.failed', { error: error.message })); };
   const scheduleTimer = setInterval(() => { tickSchedules(); recoverAgents(); }, 15000); scheduleTimer.unref();
-  powerMonitor.on('resume', tickSchedules);
-  app.on('before-quit', () => clearInterval(scheduleTimer));
-  ipcMain.handle('scheduled-tasks', event => { checkSender(event); return schedules.summaries(); });
+  powerMonitor.on('resume', () => { shared.receiptChecks.clear(); tickSchedules(); });
+  app.on('before-quit', () => { clearInterval(scheduleTimer); shared.close(); });
+  ipcMain.handle('schedule-sharing', event => { checkSender(event); return shared.settings(); });
+  ipcMain.handle('schedule-storage', event => { checkSender(event); return shared.storageInfo(); });
+  ipcMain.handle('save-schedule-sharing', async (event, value) => {
+    checkSender(event);
+    if (scheduler.running || editLocks.size) throw new Error('Close message editors and wait for scheduled delivery before changing sharing.');
+    const result = await shared.configure(value); setImmediate(tickSchedules); return result;
+  });
+  ipcMain.handle('sync-schedules', async event => { checkSender(event); await shared.tick(); return shared.settings(); });
+  ipcMain.handle('scheduled-tasks', event => { checkSender(event); return shared.summaries(); });
   ipcMain.handle('schedule-message', (event, message, hours) => {
     checkSender(event);
     if (!connection.ready || message?.machine !== scheduleMachine()) throw new Error('Connect to the message’s machine before scheduling it.');
+    if (shared.enabled) return shared.create(message, hours);
     const task = schedules.enqueue(message, hours);
     schedulesChanged(); return task;
   });
-  ipcMain.handle('cancel-scheduled-task', (event, id) => { checkSender(event); const task = schedules.cancel(id); schedulesChanged(); return task; });
+  ipcMain.handle('cancel-scheduled-task', (event, id) => {
+    checkSender(event);
+    if (shared.owns(id)) return shared.mutation('cancel', { id });
+    const task = schedules.cancel(id); schedulesChanged(); return task;
+  });
+  ipcMain.handle('dismiss-scheduled-task', async (event, id) => {
+    checkSender(event);
+    if (!shared.enabled || !shared.owns(id)) throw new Error('Reconnect shared schedules before dismissing a delivery.');
+    const result = await dialog.showMessageBox(window, {
+      type: 'warning', title: 'Check scheduled delivery', message: 'Have you checked this conversation on the sending computer?',
+      detail: 'Dismiss only after checking whether the message was sent and its run finished. This will not resend it. Later scheduled messages can then run.',
+      buttons: ['Cancel', 'Dismiss after checking'], defaultId: 0, cancelId: 0
+    });
+    checkSender(event);
+    if (result.response === 1) return shared.mutation('dismiss', { id });
+  });
+  const scheduledEdit = (id, token) => {
+    const task = schedules.get(id);
+    if (!task || task.status !== 'pending') throw new Error('This scheduled message is no longer pending.');
+    if ((task.machine || 'access:local') !== scheduleMachine()) throw new Error('Open this scheduled message on its original machine.');
+    if (!token || editLocks.get(task.threadId) !== token) throw new Error('Reopen the scheduled message editor before saving.');
+    return task;
+  };
+  const sharedEdit = async (id, token) => {
+    const threadId = [...editLocks].find(([, value]) => value === token)?.[0];
+    if (!threadId) throw new Error('Reopen the scheduled message editor before saving.');
+    await shared.verify(token);
+    const task = await shared.bridge.call('get', { id, token });
+    if (task.machine !== scheduleMachine() || task.threadId !== threadId) throw new Error('Open this scheduled message in its original conversation.');
+    return task;
+  };
+  ipcMain.handle('scheduled-task', (event, id, token) => { checkSender(event); return shared.owns(id) ? sharedEdit(id, token) : scheduledEdit(id, token); });
+  ipcMain.handle('edit-scheduled-task', (event, id, patch, token) => {
+    checkSender(event);
+    if (shared.owns(id)) return sharedEdit(id, token).then(() => shared.mutation('edit', { id, patch, token }));
+    scheduledEdit(id, token);
+    const task = schedules.edit(id, patch);
+    schedulesChanged(); return task;
+  });
   ipcMain.handle('preferences', event => { checkSender(event); return preferences.read(); });
   ipcMain.handle('save-preferences', (event, patch) => { checkSender(event); return preferences.update(patch); });
   ipcMain.on('save-conversation-state', (event, conversationState) => {
@@ -139,7 +211,15 @@ app.whenReady().then(async () => {
     current();
     const opener = preferences.read().fileOpener || 'vscode';
     const opening = fileOpens.then(() => openFileLink(href, {
-      cwd: context?.cwd, settings: options, opener, current,
+      cwd: context?.cwd, settings: options, opener, current, clampLine: context?.clampLine === true,
+      readFile: async file => {
+        current();
+        const result = await connection.connectionFor(connection.providerFor({}, context)).call('fs/readFile', { path: file });
+        current();
+        const data = result.dataBase64;
+        if (typeof data !== 'string' || data.length % 4 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) throw new Error('Could not read the current file to locate its changed line.');
+        return Buffer.from(data, 'base64').toString('utf8');
+      },
       openExternal: url => shell.openExternal(url), reveal: file => shell.showItemInFolder(file), application: url => app.getApplicationNameForProtocol(url)
     }));
     fileOpens = opening.catch(() => {});
@@ -168,7 +248,7 @@ app.whenReady().then(async () => {
       return { ...result, connected: connection.ready, options: publicSettings() };
     }
     if ([...agents.values()].some(agent => agent.wakeLock.id !== null)) throw new Error('Finish or stop running tasks before changing the connection.');
-    editLocks.clear();
+    releaseEditors();
     try {
       const result = await connection.connect(next);
       saveSettings(next);
@@ -189,7 +269,8 @@ app.whenReady().then(async () => {
       throw new Error('A scheduled message is being sent to this chat; try again shortly.');
     }
     if (method === 'thread/archive') {
-      if (schedules.list(params.threadId).some(task => (task.machine || 'access:local') === scheduleMachine() && task.status === 'pending')) throw new Error('Cancel scheduled messages before archiving this chat.');
+      if (shared.enabled) await shared.refresh();
+      if (shared.summaries().some(task => task.threadId === params.threadId && (task.machine || 'access:local') === scheduleMachine() && (['pending', 'claimed', 'sending', 'unconfirmed'].includes(task.status) || task.active))) throw new Error('Cancel or check scheduled messages before archiving this chat.');
       const options = settings;
       const pinned = pins.get(options).includes(params.threadId);
       if (pinned) pins.set(options, params.threadId, false);
@@ -201,6 +282,11 @@ app.whenReady().then(async () => {
         }
         throw error;
       }
+    }
+    if (method === 'thread/revert' && shared.enabled) {
+      const token = editLocks.get(params.threadId);
+      if (!token) throw new Error('Reopen the message editor before editing history.');
+      await shared.verify(token);
     }
     if (method === 'thread/name/set') manualNames.add(JSON.stringify([settings.provider, settings.mode, settings.host, settings.port, params.threadId]));
     return connection.call(method, params, undefined, context);
@@ -230,8 +316,10 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('respond', (event, id, result) => { checkSender(event); return connection.respond(id, result); });
   connection.on('notification', message => {
-    if (message.method === 'connection/closed') editLocks.clear();
-    if (message.method === 'provider/closed') for (const threadId of editLocks.keys()) if (agentTarget(threadId, 'thread').provider === message.provider) editLocks.delete(threadId);
+    if (['connection/closed', 'provider/closed'].includes(message.method)) shared.receiptChecks.clear();
+    if (message.method === 'connection/closed') releaseEditors();
+    if (message.method === 'provider/closed') releaseEditors(message.provider);
+    if (message.method === 'turn/completed' && shared.enabled) { shared.completed(message.params); setImmediate(tickSchedules); }
     if (['turn/started', 'turn/completed', 'thread/status/changed', 'error', 'connection/closed'].includes(message.method)) {
       const params = message.params || {};
       diagnostic.write('native.' + message.method, { provider: message.provider, threadId: params.threadId, turnId: params.turn?.id || params.turnId, status: params.turn?.status || params.status?.type, willRetry: params.willRetry, error: params.turn?.error?.message || params.error?.message || params.message });
@@ -248,9 +336,9 @@ app.whenReady().then(async () => {
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     window.webContents.on('will-navigate', event => event.preventDefault());
     window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-    window.webContents.on('render-process-gone', () => editLocks.clear());
+    window.webContents.on('render-process-gone', () => releaseEditors());
     window.loadFile(path.join(__dirname, 'index.html'));
-    window.on('closed', () => { editLocks.clear(); connection.disconnect(); window = null; });
+    window.on('closed', () => { releaseEditors(); connection.disconnect(); window = null; });
   };
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     ...(process.platform === 'darwin' ? [{ label: 'Remote Codex', submenu: [{ role: 'about' }, { type: 'separator' }, { role: 'hide' }, { role: 'quit' }] }] : []),

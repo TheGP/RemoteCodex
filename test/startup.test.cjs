@@ -9,15 +9,16 @@ const { EventEmitter } = require('node:events');
 const { pathToFileURL } = require('node:url');
 const providers = require('../providers.cjs');
 const pool = require('../agent-pool.cjs');
+const links = require('../links.cjs');
 
 async function fixture(t, saved, ids = ['codex']) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-startup-'));
   const file = path.join(directory, 'connection.json');
   if (saved !== undefined) fs.writeFileSync(file, saved);
   const app = new EventEmitter(), ipcMain = new EventEmitter();
-  const windows = [], exits = [], attempts = [], errors = [], notifications = [], intervals = [], adapters = new Map(), handlers = new Map(), connectErrors = new Map();
+  const windows = [], exits = [], attempts = [], errors = [], notifications = [], intervals = [], openedURLs = [], adapters = new Map(), handlers = new Map(), connectErrors = new Map();
   let connection;
-  Object.assign(app, { requestSingleInstanceLock: () => true, whenReady: () => Promise.resolve(), getPath: () => directory, getVersion: () => 'test', exit: code => exits.push(code), dock: { setIcon() {} } });
+  Object.assign(app, { requestSingleInstanceLock: () => true, whenReady: () => Promise.resolve(), getPath: () => directory, getVersion: () => 'test', getApplicationNameForProtocol: () => 'Test editor', exit: code => exits.push(code), dock: { setIcon() {} } });
   ipcMain.handle = (name, handler) => handlers.set(name, handler);
   class BrowserWindow extends EventEmitter {
     constructor() {
@@ -33,7 +34,7 @@ async function fixture(t, saved, ids = ['codex']) {
   class Connection extends pool.AgentPool {
     constructor() {
       super(Object.fromEntries(ids.map(id => [id, {
-        id, name: id, methods: providers.rendererMethods,
+        id, name: id, methods: [...providers.rendererMethods, 'fs/readFile'],
         options: value => providers.connectionOptions({ ...value, provider: 'codex' }),
         create() {
           const adapter = new EventEmitter();
@@ -48,19 +49,56 @@ async function fixture(t, saved, ids = ['codex']) {
       }]))); connection = this;
     }
   }
-  const electron = { app, ipcMain, BrowserWindow, Menu: { buildFromTemplate: value => value, setApplicationMenu() {} }, powerMonitor: new EventEmitter(), powerSaveBlocker: { start: () => 1, stop() {} } };
+  const electron = { app, ipcMain, BrowserWindow, Menu: { buildFromTemplate: value => value, setApplicationMenu() {} }, shell: { openExternal: async url => { openedURLs.push(url); } }, powerMonitor: new EventEmitter(), powerSaveBlocker: { start: () => 1, stop() {} } };
   const main = path.resolve(__dirname, '../main.cjs'), realRequire = createRequire(main);
   t.after(() => { app.emit('before-quit'); fs.rmSync(directory, { recursive: true, force: true }); });
   vm.runInNewContext(fs.readFileSync(main, 'utf8'), {
-    require: name => name === 'electron' ? electron : name === './agent-pool.cjs' ? { ...pool, AgentPool: Connection } : realRequire(name),
+    require: name => name === 'electron' ? electron : name === './agent-pool.cjs' ? { ...pool, AgentPool: Connection } : name === './links.cjs' ? { ...links, openFileLink: (value, options) => links.openFileLink(value, { ...options, sshHost: async settings => settings.host }) } : realRequire(name),
     __dirname: path.dirname(main), process: { platform: process.platform, argv: [] },
-    console: { error: error => errors.push(String(error)) }, setInterval: (...args) => { intervals.push(args[0]); return setInterval(...args); }, clearInterval, setImmediate
+    console: { error: error => errors.push(String(error)) }, Buffer, setInterval: (...args) => { intervals.push(args[0]); return setInterval(...args); }, clearInterval, setImmediate
   }, { filename: main });
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(errors, []); assert.deepEqual(exits, []); assert.equal(windows.length, 1);
   const event = { sender: windows[0].webContents, senderFrame: { url: pathToFileURL(windows[0].file).href } };
-  return { file, directory, attempts, adapters, connection, notifications, intervals, connectErrors, request: (name, ...args) => handlers.get(name)(event, ...args) };
+  return { file, directory, attempts, adapters, connection, notifications, intervals, openedURLs, connectErrors, request: (name, ...args) => handlers.get(name)(event, ...args) };
 }
+
+test('changed-file link IPC clamps remote lines through the owning provider and blocks malformed or stale reads', async t => {
+  const f = await fixture(t, undefined, ['codex', 'sample']);
+  const options = { mode: 'ssh', host: 'user@fixture-host', port: 22, cwd: '/srv/project' };
+  await f.request('connect', options);
+  const context = { machine: 'access:user@fixture-host:22', provider: 'sample', cwd: '/srv/project', clampLine: true };
+  const reads = [];
+  let dataBase64 = Buffer.from('first\r\nsecond\rthird').toString('base64');
+  f.adapters.get('codex').call = async () => { throw new Error('The file read reached the wrong provider'); };
+  f.adapters.get('sample').call = async (method, params) => { reads.push({ method, params: { ...params } }); return { dataBase64 }; };
+  await f.request('open-link', 'changed.ts:99:17', context);
+  assert.deepEqual(reads, [{ method: 'fs/readFile', params: { path: '/srv/project/changed.ts' } }]);
+  assert.equal(f.openedURLs[0], 'vscode://vscode-remote/ssh-remote+user%40fixture-host/srv/project/changed.ts:3:1');
+  dataBase64 = '';
+  await f.request('open-link', 'empty.ts:99:17', context);
+  assert.equal(f.openedURLs[1], 'vscode://vscode-remote/ssh-remote+user%40fixture-host/srv/project/empty.ts:1:1');
+  await f.request('open-link', 'explicit.ts:99:17', { ...context, clampLine: 'true' });
+  assert.equal(reads.length, 2);
+  assert.equal(f.openedURLs[2], 'vscode://vscode-remote/ssh-remote+user%40fixture-host/srv/project/explicit.ts:99:17');
+  dataBase64 = 'not-valid-base64';
+  await assert.rejects(f.request('open-link', 'malformed.ts:99', context), /Could not read the current file/);
+  assert.equal(f.openedURLs.length, 3);
+  const beforeStale = reads.length;
+  await assert.rejects(async () => f.request('open-link', 'stale.ts:99', { ...context, machine: 'access:other-host:22' }), /machine changed/);
+  assert.equal(reads.length, beforeStale);
+  assert.equal(f.openedURLs.length, 3);
+
+  let resolveRead;
+  f.adapters.get('sample').call = (_method, _params) => new Promise(resolve => { resolveRead = resolve; });
+  const pending = f.request('open-link', 'pending.ts:99', context);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof resolveRead, 'function');
+  await f.request('connect', { ...options, host: 'other-host' });
+  resolveRead({ dataBase64: Buffer.from('first\nsecond').toString('base64') });
+  await assert.rejects(pending, /connection changed|machine changed/i);
+  assert.equal(f.openedURLs.length, 3);
+});
 
 for (const [label, saved] of [
   ['malformed JSON', '{invalid-json'],
@@ -83,6 +121,28 @@ test('first startup without a saved connection has no repair error or premature 
   const f = await fixture(t);
   assert.equal(f.request('settings').settingsError, null);
   assert.equal(fs.existsSync(f.file), false);
+});
+
+test('scheduled editors require a matching edit lock and machine, preserve settings, and reject stale saves', async t => {
+  const f = await fixture(t);
+  await f.request('connect', { mode: 'local', localCwd: f.directory });
+  const thread = { id: 'edit-scheduled-chat', cwd: f.directory };
+  const message = { machine: 'access:local', thread, text: 'Original', images: [], input: [{ type: 'text', text: 'Original' }], access: { sandbox: 'read-only', approvalPolicy: 'on-request' }, mode: 'default', turnSettings: { threadId: thread.id, model: 'original-model' } };
+  const task = f.request('schedule-message', message, 1);
+  assert.throws(() => f.request('scheduled-task', task.id), /Reopen/);
+  const lock = f.request('edit-lock', thread.id);
+  const saved = f.request('scheduled-task', task.id, lock);
+  assert.deepEqual(saved.message.turnSettings, message.turnSettings);
+  const patch = { text: 'Edited', runAt: new Date(Date.now() + 7200000).toISOString(), skills: [] };
+  assert.throws(() => f.request('edit-scheduled-task', task.id, patch, 'wrong-lock'), /Reopen/);
+  const updated = f.request('edit-scheduled-task', task.id, patch, lock);
+  assert.equal(updated.id, task.id); assert.equal(updated.prompt, 'Edited');
+  assert.deepEqual(updated.message.turnSettings, message.turnSettings);
+  f.request('edit-lock', thread.id, lock);
+  assert.throws(() => f.request('edit-scheduled-task', task.id, patch, lock), /Reopen/);
+  const anotherLock = f.request('edit-lock', thread.id);
+  await f.request('connect', { mode: 'ssh', host: 'another-test-server' });
+  assert.throws(() => f.request('scheduled-task', task.id, anotherLock), /original machine/);
 });
 
 test('a failed machine switch clears its launch settings before connecting the original saved machine', async t => {

@@ -72,6 +72,51 @@ test('SSH file links target the remote editor and never open a matching local pa
   assert.equal(opened.length, 4);
 });
 
+test('diff-derived positions follow the current local file length after shortening without changing explicit links', async t => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-diff-link-'));
+  t.after(() => fs.rmSync(folder, { recursive: true, force: true }));
+  const file = path.join(folder, 'rewritten #file.ts');
+  const link = file.split('/').map(encodeURIComponent).join('/') + '#L67';
+  const opened = [];
+  const options = { settings: { mode: 'local' }, opener: 'gitferry', clampLine: true, application: () => 'Editor', openExternal: async url => opened.push(new URL(url)) };
+  fs.writeFileSync(file, Array.from({ length: 70 }, (_, index) => `line ${index + 1}`).join('\n'));
+  await openFileLink(link, options); assert.equal(opened.at(-1).searchParams.get('line'), '67');
+  for (const content of ['first\nsecond', 'first\r\nsecond', 'first\rsecond']) {
+    fs.writeFileSync(file, content);
+    await openFileLink(link, options);
+    assert.equal(opened.at(-1).searchParams.get('file'), file);
+    assert.equal(opened.at(-1).searchParams.get('line'), '2');
+    assert.equal(opened.at(-1).searchParams.get('column'), '1');
+  }
+  await openFileLink(link, { ...options, clampLine: false }); assert.equal(opened.at(-1).searchParams.get('line'), '67');
+  for (const opener of ['vscode', 'antigravity']) {
+    await openFileLink(link, { ...options, opener });
+    assert.ok(opened.at(-1).href.endsWith(':2:1'));
+  }
+  fs.writeFileSync(file, '');
+  await openFileLink(link, options); assert.equal(opened.at(-1).searchParams.get('line'), '1');
+});
+
+test('remote diff positions read the remote file, preserve explicit positions and fail safely on read or machine errors', async () => {
+  const opened = [], reads = [];
+  const options = { settings: { mode: 'ssh', host: 'test-alias', port: 22 }, cwd: '/remote/project', opener: 'gitferry', clampLine: true, application: () => 'Editor', sshHost: async settings => settings.host, openExternal: async url => opened.push(new URL(url)), readFile: async file => { reads.push(file); return 'first\r\nsecond'; } };
+  await openFileLink('rewritten.ts#L67', options);
+  assert.deepEqual(reads, ['/remote/project/rewritten.ts']);
+  assert.equal(opened[0].searchParams.get('file'), 'ssh://test-alias/remote/project/rewritten.ts');
+  assert.equal(opened[0].searchParams.get('line'), '2');
+  await openFileLink('rewritten.ts:67:3', { ...options, clampLine: false });
+  assert.equal(reads.length, 1); assert.equal(opened[1].searchParams.get('line'), '67'); assert.equal(opened[1].searchParams.get('column'), '3');
+  await openFileLink('rewritten.ts#L1', options); assert.equal(reads.length, 1);
+  await openFileLink('rewritten.ts#L67', { ...options, readFile: async () => '' });
+  assert.equal(opened.at(-1).searchParams.get('line'), '1');
+  const before = opened.length;
+  await assert.rejects(openFileLink('rewritten.ts#L67', { ...options, readFile: async () => { throw new Error('Remote file unavailable'); } }), /Remote file unavailable/);
+  await assert.rejects(openFileLink('rewritten.ts#L67', { ...options, readFile: async () => null }), /Could not read/);
+  let changed = false;
+  await assert.rejects(openFileLink('rewritten.ts#L67', { ...options, readFile: async () => { changed = true; return 'new file'; }, current: () => { if (changed) throw new Error('Machine changed'); } }), /Machine changed/);
+  assert.equal(opened.length, before);
+});
+
 test('remote editors validate the SSH alias port without connecting or ignoring the chat’s port', async () => {
   const calls = [];
   const settings = { mode: 'ssh', host: 'user@my-ssh-alias', port: 2222 };

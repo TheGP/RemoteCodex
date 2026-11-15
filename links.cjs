@@ -47,7 +47,7 @@ async function editorSshHost(settings, run = execute) {
   return settings.host;
 }
 
-async function openFileLink(value, { cwd, settings, opener = 'vscode', openExternal, reveal, application, sshHost = editorSshHost, current = () => {} }) {
+async function openFileLink(value, { cwd, settings, opener = 'vscode', openExternal, reveal, application, sshHost = editorSshHost, current = () => {}, clampLine = false, readFile }) {
   const target = parseFileLink(value, cwd);
   const local = settings.mode === 'local';
   if (!['vscode', 'antigravity', 'gitferry', 'reveal'].includes(opener)) throw new Error('Choose a file opener in Settings.');
@@ -58,6 +58,16 @@ async function openFileLink(value, { cwd, settings, opener = 'vscode', openExter
     return reveal(target.file);
   }
   if (!local && opener === 'antigravity') throw new Error('Choose VS Code or GitFerry to open files on an SSH machine.');
+  if (clampLine && target.line > 1) {
+    const content = local ? await fs.readFile(target.file, 'utf8') : await readFile(target.file);
+    current();
+    if (typeof content !== 'string') throw new Error('Could not read the current file to locate its changed line.');
+    let lines = 1;
+    const breaks = /\r\n|\r|\n/g;
+    while (lines < target.line && breaks.exec(content)) lines++;
+    target.line = lines;
+    target.column = 1;
+  }
   const host = local ? null : await sshHost(settings);
   let url;
   if (opener === 'gitferry') {

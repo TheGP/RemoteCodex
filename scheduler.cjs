@@ -11,6 +11,7 @@ class ScheduleStore {
   constructor(file) {
     this.file = file;
     this.tasks = [];
+    if (!file) return;
     try {
       const data = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (data.version !== 1 || !Array.isArray(data.tasks) || data.tasks.some(task => !task || typeof task.id !== 'string' || typeof task.threadId !== 'string' || typeof task.prompt !== 'string' || !Number.isFinite(Date.parse(task.runAt)) || !statuses.has(task.status))) throw new Error('Invalid saved scheduled tasks.');
@@ -23,16 +24,38 @@ class ScheduleStore {
   }
 
   save(tasks) {
-    fs.mkdirSync(path.dirname(this.file), { recursive: true });
-    fs.writeFileSync(this.file + '.tmp', JSON.stringify({ version: 1, tasks }), { mode: 0o600 });
-    fs.renameSync(this.file + '.tmp', this.file);
+    if (this.file) {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      const descriptor = fs.openSync(this.file + '.tmp', 'w', 0o600);
+      try { fs.writeFileSync(descriptor, JSON.stringify({ version: 1, tasks })); fs.fsyncSync(descriptor); }
+      finally { fs.closeSync(descriptor); }
+      fs.renameSync(this.file + '.tmp', this.file);
+      if (process.platform !== 'win32') {
+        const directory = fs.openSync(path.dirname(this.file), 'r');
+        try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+      }
+    }
     this.tasks = tasks;
   }
 
   list(threadId) { return structuredClone(this.tasks.filter(task => !threadId || task.threadId === threadId)); }
+  get(id) { return structuredClone(this.tasks.find(task => task.id === id)); }
   summaries() { return this.tasks.map(({ message, ...task }) => structuredClone(task)); }
 
-  add(thread, args, sourceId, now = Date.now(), message = null) {
+  edit(id, patch, now = Date.now()) {
+    const task = this.tasks.find(task => task.id === id);
+    if (!task || task.status !== 'pending') throw new Error('This scheduled message is no longer pending.');
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch) || Object.keys(patch).some(key => !['text', 'runAt', 'skills'].includes(key)) || typeof patch.text !== 'string' || patch.text.length > 50000 || !patch.text.trim() && !task.message?.images?.length) throw new Error('Enter a message or keep an attachment.');
+    const due = typeof patch.runAt === 'string' ? Date.parse(patch.runAt) : NaN;
+    if (!Number.isFinite(due) || patch.runAt !== task.runAt && (due <= now || due > now + 366 * 86400000)) throw new Error('Choose a future time within one year.');
+    const skills = patch.skills ?? task.message?.input.filter(part => part.type === 'skill') ?? [];
+    if (!Array.isArray(skills) || skills.some(skill => skill?.type !== 'skill' || typeof skill.name !== 'string' || !skill.name || skill.name.length > 200 || typeof skill.path !== 'string' || !skill.path || skill.path.length > 4096 || skill.path.includes('\0'))) throw new Error('Invalid scheduled message skills.');
+    const text = patch.text.trim();
+    const message = task.message ? { ...task.message, text, input: [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...task.message.input.filter(part => part.type !== 'text' && part.type !== 'skill'), ...skills.map(({ type, name, path }) => ({ type, name, path }))] } : null;
+    return this.update(id, { prompt: text || `${message.images.length} image(s)`, message, runAt: new Date(due).toISOString(), error: null, retryAt: null });
+  }
+
+  add(thread, args, sourceId, now = Date.now(), message = null, sharedTo = null) {
     if (!args || typeof args !== 'object' || Object.keys(args).some(key => !['prompt', 'delay_seconds', 'run_at'].includes(key)) || typeof args.prompt !== 'string' || !args.prompt.trim() || args.prompt.length > 50000 || (args.delay_seconds !== undefined) === (args.run_at !== undefined)) throw new Error('Provide a prompt and exactly one of delay_seconds or run_at.');
     if (args.delay_seconds !== undefined && (typeof args.delay_seconds !== 'number' || !Number.isFinite(args.delay_seconds) || args.delay_seconds <= 0)) throw new Error('delay_seconds must be positive.');
     if (args.run_at !== undefined && (typeof args.run_at !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?:Z|[+-]\d\d:\d\d)$/.test(args.run_at))) throw new Error('run_at must be an ISO timestamp with a timezone.');
@@ -41,16 +64,16 @@ class ScheduleStore {
     const existing = sourceId && this.tasks.find(task => task.threadId === thread.id && task.sourceId === sourceId);
     if (existing) return structuredClone(existing);
     if (this.tasks.filter(task => task.status === 'pending').length >= 1000) throw new Error('Cancel pending tasks before scheduling more.');
-    const task = { id: randomUUID(), threadId: thread.id, cwd: thread.cwd, title: thread.name || thread.preview || 'Conversation', prompt: args.prompt.trim(), runAt: new Date(due).toISOString(), createdAt: new Date(now).toISOString(), status: 'pending', machine: message?.machine || 'access:local', ...(message ? { message: structuredClone(message) } : {}), ...(sourceId ? { sourceId } : {}) };
+    const task = { id: randomUUID(), threadId: thread.id, cwd: thread.cwd, title: thread.name || thread.preview || 'Conversation', prompt: args.prompt.trim(), runAt: new Date(due).toISOString(), createdAt: new Date(now).toISOString(), status: 'pending', machine: message?.machine || 'access:local', ...(message ? { message: structuredClone(message) } : {}), ...(sourceId ? { sourceId } : {}), ...(sharedTo ? { sharedTo } : {}) };
     this.save([...this.tasks, task]);
     return structuredClone(task);
   }
 
-  enqueue(message, hours, now = Date.now()) {
+  enqueue(message, hours, now = Date.now(), sharedTo = null) {
     if (!Number.isInteger(hours) || !(hours >= 1 && hours <= 24 || [48, 72, 96, 120, 144, 168].includes(hours))) throw new Error('Choose a delay from one hour to seven days.');
     validateQueue({ key: message?.machine + ':' + message?.thread?.id, machine: message?.machine, thread: message?.thread, messages: [message] });
     if (!message.input.length || message.review || !['default', 'plan'].includes(message.mode) || !message.turnSettings || message.turnSettings.threadId !== message.thread.id) throw new Error('Invalid scheduled message.');
-    return this.add(message.thread, { prompt: message.text || `${message.images.length} image(s)`, delay_seconds: hours * 3600 }, null, now, message);
+    return this.add(message.thread, { prompt: message.text || `${message.images.length} image(s)`, delay_seconds: hours * 3600 }, null, now, message, sharedTo);
   }
 
   update(id, patch) {
@@ -85,7 +108,7 @@ class Scheduler {
     const machine = this.machine();
     const current = () => this.connection.ready && this.connection.session === session && this.available() && this.machine() === machine;
     try {
-      const due = this.store.summaries().filter(task => (task.machine || 'access:local') === machine && task.status === 'pending' && Date.parse(task.runAt) <= now && (!task.retryAt || task.retryAt <= now)).sort((a, b) => a.runAt.localeCompare(b.runAt));
+      const due = this.store.summaries().filter(task => !task.sharedTo && (task.machine || 'access:local') === machine && task.status === 'pending' && Date.parse(task.runAt) <= now && (!task.retryAt || task.retryAt <= now)).sort((a, b) => a.runAt.localeCompare(b.runAt));
       for (const task of due) {
         if (!current()) break;
         if (this.blocked(task.threadId)) continue;
@@ -97,7 +120,7 @@ class Scheduler {
           const resumed = before.thread.status?.type === 'idle' ? before : await this.connection.call('thread/resume', { threadId: task.threadId, excludeTurns: true });
           if (!current()) break;
           const saved = this.store.tasks.find(entry => entry.id === task.id);
-          if (resumed.thread.status?.type === 'active' || this.blocked(task.threadId) || saved?.status !== 'pending') continue;
+          if (resumed.thread.status?.type === 'active' || this.blocked(task.threadId) || saved?.status !== 'pending' || Date.parse(saved.runAt) > now) continue;
           this.store.update(task.id, { status: 'sending', error: null });
           this.changed();
           try {

@@ -1,7 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { PassThrough } = require('node:stream');
+const { PassThrough, Duplex } = require('node:stream');
+const http = require('node:http');
+const { WebSocketServer } = require('ws');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -103,6 +105,53 @@ test('SSH requires a trusted host and key-based auth without local shell interpo
   assert.equal(options.shell, undefined);
   assert.equal(f.writes[1].method, 'initialized');
   f.connection.disconnect();
+});
+test('shared SSH attaches a WebSocket to the daemon through stdio without opening a local port', async t => {
+  const server = http.createServer();
+  const sockets = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+  server.on('upgrade', (request, stream, head) => sockets.handleUpgrade(request, stream, head, socket => sockets.emit('connection', socket)));
+  t.after(() => { for (const socket of sockets.clients) socket.terminate(); sockets.close(); server.close(); });
+  let invocation, remote;
+  const child = new EventEmitter();
+  child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+  const stream = Duplex.from({ readable: child.stdin, writable: child.stdout });
+  child.kill = () => { child.killed = true; stream.destroy(); };
+  const writes = [];
+  sockets.on('connection', socket => {
+    remote = socket;
+    socket.on('message', data => {
+      const message = JSON.parse(data); writes.push(message);
+      if (message.id !== undefined) socket.send(JSON.stringify({ id: message.id, result: message.method === 'initialize' ? { userAgent: 'shared-test' } : { data: ['shared-history'] } }));
+    });
+  });
+  const connection = new CodexConnection((...args) => { invocation = args; server.emit('connection', stream); return child; });
+  t.after(() => connection.disconnect());
+  await connection.connect({ host: 'root@warmer', sharedServer: true });
+  assert.equal(connection.ready, true);
+  assert.equal(server.listening, false);
+  assert.equal(invocation[1].at(-1), 'codex app-server daemon start >/dev/null && exec codex app-server proxy');
+  assert.ok(invocation[1].includes('StrictHostKeyChecking=yes'));
+  assert.deepEqual(await connection.call('thread/list'), { data: ['shared-history'] });
+  assert.equal(writes[1].method, 'initialized');
+  const notification = new Promise(resolve => connection.once('notification', resolve));
+  remote.send(JSON.stringify({ method: 'turn/completed', params: { threadId: 'shared-thread' } }));
+  assert.equal((await notification).params.threadId, 'shared-thread');
+  connection.disconnect();
+  assert.ok(child.killed);
+  assert.equal(connection.socket, null);
+  assert.ok(!invocation[1].join(' ').includes('daemon stop'));
+});
+test('shared SSH startup errors reject initialization without silently starting a private server', async () => {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.kill = () => {};
+  const connection = new CodexConnection(() => {
+    queueMicrotask(() => { child.stderr.write('error: unrecognized subcommand proxy'); child.emit('close', 1); });
+    return child;
+  });
+  await assert.rejects(connection.connect({ host: 'root@warmer', sharedServer: true }), /unrecognized subcommand proxy/);
+  assert.equal(connection.ready, false);
+  assert.equal(connection.child, null);
+  assert.throws(() => connectionOptions({ sharedServer: 'true' }), /Invalid shared server/);
 });
 test('split and coalesced JSON lines match concurrent responses by ID', async () => {
   const f = fixture(); await f.connection.connect();

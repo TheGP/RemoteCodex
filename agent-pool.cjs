@@ -56,7 +56,7 @@ class AgentPool extends EventEmitter {
   }
   changes(value) {
     const next = poolOptions(value, this.registry);
-    const machineChanged = !this.configuration || ['mode', 'host', 'port', 'key', 'cwd', 'localCwd'].some(key => next[key] !== this.configuration[key]);
+    const machineChanged = !this.configuration || ['mode', 'host', 'port', 'key', 'cwd', 'localCwd'].some(key => next[key] !== this.configuration[key]) || next.mode === 'ssh' && next.sharedServer !== this.configuration.sharedServer;
     const launch = this.launchSettings(next);
     const providers = this.listProviders(next).filter(provider => {
       const before = this.describe(provider.id);

@@ -46,12 +46,17 @@ test('draft markers read metadata without loading images and stay separate by ch
 
 test('drafts stay separate across chats, machines, projects, folders and editor types', t => {
   const store = fixture(t);
-  const targets = [target, { ...target, threadId: 'other-chat' }, { ...target, machine: 'access:user@server:22' }, { ...target, threadId: null }, { ...target, threadId: null, projectId: 'project-two' }, { ...target, threadId: null, cwd: '/other-folder' }, { ...target, kind: 'edit-message', itemId: 'turn-one' }, { ...target, kind: 'edit-queue', itemId: 'queued-one' }];
+  const targets = [target, { ...target, threadId: 'other-chat' }, { ...target, machine: 'access:user@server:22' }, { ...target, threadId: null }, { ...target, threadId: null, projectId: 'project-two' }, { ...target, threadId: null, cwd: '/other-folder' }, { ...target, kind: 'edit-message', itemId: 'turn-one' }, { ...target, kind: 'edit-queue', itemId: 'queued-one' }, { ...target, kind: 'edit-schedule', itemId: 'scheduled-one' }];
   for (const [index, value] of targets.entries()) store.save(value, { text: 'Draft ' + index });
   for (const [index, value] of targets.entries()) assert.equal(new DraftStore(store.directory).read(value).text, 'Draft ' + index);
   assert.equal(draftKey(target), draftKey({ ...target, cwd: '/moved', projectId: 'moved-project' }));
   const emptyEditor = targets[6]; store.save(emptyEditor, { text: '' });
   assert.equal(store.read(emptyEditor).text, '', 'An intentionally empty edit reverted to the original message');
+  const scheduled = targets.at(-1);
+  store.save(scheduled, { text: 'Unfinished scheduled edit', runAt: '2026-12-01T12:30' });
+  const restored = new DraftStore(store.directory).last(target.machine);
+  assert.equal(restored.target.kind, 'edit-schedule'); assert.equal(restored.draft.runAt, '2026-12-01T12:30');
+  assert.throws(() => store.save(scheduled, { runAt: 'not a date' }));
 });
 
 test('moving a new-chat draft preserves its contents and images before removing its old copy', t => {

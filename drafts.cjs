@@ -7,7 +7,7 @@ const hours = new Set([0, ...Array.from({ length: 24 }, (_, index) => index + 1)
 const hash = value => createHash('sha256').update(value).digest('hex');
 
 function normalizeTarget(target) {
-  if (!target || typeof target.machine !== 'string' || !target.machine.startsWith('access:') || target.machine.length > 500 || !['composer', 'edit-message', 'edit-queue'].includes(target.kind) || typeof target.cwd !== 'string' || target.cwd.length > 4096 || target.cwd.includes('\0')) throw new Error('Invalid draft target.');
+  if (!target || typeof target.machine !== 'string' || !target.machine.startsWith('access:') || target.machine.length > 500 || !['composer', 'edit-message', 'edit-queue', 'edit-schedule'].includes(target.kind) || typeof target.cwd !== 'string' || target.cwd.length > 4096 || target.cwd.includes('\0')) throw new Error('Invalid draft target.');
   for (const key of ['threadId', 'projectId', 'itemId']) if (target[key] != null && (typeof target[key] !== 'string' || !target[key] || target[key].length > 200)) throw new Error('Invalid draft target.');
   if (target.kind !== 'composer' && (!target.threadId || !target.itemId)) throw new Error('Invalid editor draft target.');
   return { machine: target.machine, kind: target.kind, cwd: target.cwd, threadId: target.threadId || null, projectId: target.projectId || null, itemId: target.itemId || null };
@@ -58,7 +58,8 @@ class DraftStore {
   }
   save(target, patch) {
     target = normalizeTarget(target);
-    if (!patch || typeof patch !== 'object' || Array.isArray(patch) || Object.keys(patch).some(key => !['text', 'images', 'hours', 'model', 'effort', 'mode', 'access'].includes(key))) throw new Error('Invalid draft change.');
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch) || Object.keys(patch).some(key => !['text', 'images', 'hours', 'model', 'effort', 'mode', 'access', 'runAt'].includes(key))) throw new Error('Invalid draft change.');
+    if ('runAt' in patch && (typeof patch.runAt !== 'string' || patch.runAt.length > 40 || patch.runAt && !Number.isFinite(Date.parse(patch.runAt)))) throw new Error('Invalid draft date.');
     if ('text' in patch && typeof patch.text !== 'string' || 'hours' in patch && !hours.has(patch.hours) || 'mode' in patch && !['default', 'plan'].includes(patch.mode) || 'access' in patch && !['read-only', 'workspace-write', 'danger-full-access'].includes(patch.access)) throw new Error('Invalid draft settings.');
     for (const key of ['model', 'effort']) if (key in patch && (typeof patch[key] !== 'string' || patch[key].length > 200)) throw new Error('Invalid draft settings.');
     const previous = this.metadata(target) || { version: 1, target, text: '', images: [] };
