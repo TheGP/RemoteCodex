@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
 const { AgentConnection, connectionOptions, connectionKey, rendererMethods, providerSettings } = require('../providers.cjs');
-const { CodexConnection } = require('../transport.cjs');
+const { CodexConnection, connectionOptions: transportOptions } = require('../transport.cjs');
 const { AgentWakeLock } = require('../wake-lock.cjs');
 
 function fixture() {
@@ -189,6 +189,7 @@ test('the native Codex adapter streams normalized events through the provider bo
   });
   const f = fixture();
   f.registry.codex.create = () => new CodexConnection(() => child);
+  f.registry.codex.options = transportOptions;
   const notifications = []; f.connection.on('notification', value => notifications.push(value));
   const wakeLock = new AgentWakeLock({ start: () => 12, stop() {} }, f.connection);
   await f.connection.connect({ provider: 'codex', mode: 'local', codexPath: process.execPath });
