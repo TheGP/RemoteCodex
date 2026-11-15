@@ -11,8 +11,11 @@ const completionSound = { audio: null, lastAt: -Infinity };
 const messageDateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
 const schedules = { tasks: [], generation: 0 };
 const drafts = { target: null, snapshot: null, images: [], suspended: false, restoring: false, pending: new Map() };
+const editorDrafts = new Map();
 const timelineView = { following: true, reading: null };
 const pinnedMessages = { saving: false, jumping: null };
+const conversationSync = { refreshing: false, again: false };
+const observedTurns = new Map();
 const pinIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 9V3H8v6l-3 3v2h14v-2l-3-3M12 14v7"/></svg>';
 for (let hours = 1; hours < 24; hours++) $('send-time').add(new Option(`${hours} hour${hours === 1 ? '' : 's'}`, String(hours)));
 for (let days = 1; days <= 7; days++) $('send-time').add(new Option(`${days} day${days === 1 ? '' : 's'}`, String(days * 24)));
@@ -119,6 +122,7 @@ function selectSavedModel(model) {
 }
 function trace(event, details) { try { api.log?.(event, details); } catch {} }
 function composerTarget() { return { machine: accessKey(), kind: 'composer', threadId: state.thread?.id || null, cwd: state.thread?.cwd || $('workspace').value.trim(), projectId: state.thread?.projectId || projects.selected || null }; }
+const composerExpected = saved => Object.fromEntries(['text', 'hours', 'model', 'effort', 'mode', 'access'].map(key => [key, saved?.[key] ?? null]));
 function composerSnapshot() { return { text: $('prompt').value, hours: Number($('send-time').value), model: $('model').value, effort: $('effort').value, mode: modes.plan ? 'plan' : 'default', access: $('permissions').value }; }
 function saveComposerDraft() {
   if (!api.saveDraft || !drafts.target || drafts.suspended || drafts.restoring || state.sending || state.loading) return false;
@@ -126,15 +130,16 @@ function saveComposerDraft() {
   const changedImages = images.length !== drafts.images.length || images.some((image, index) => image !== drafts.images[index]?.image || image.url !== drafts.images[index]?.url);
   if (!changedImages && drafts.snapshot && Object.keys(snapshot).every(key => snapshot[key] === drafts.snapshot[key])) return true;
   try {
-    api.saveDraft(drafts.target, { ...snapshot, ...(changedImages ? { images } : {}) });
+    api.saveDraft(drafts.target, { ...snapshot, ...(changedImages ? { images } : {}) }, drafts.expected);
+    drafts.expected = composerExpected(snapshot.text || images.length ? snapshot : null);
     drafts.snapshot = snapshot; drafts.images = images.map(image => ({ image, url: image.url }));
     cacheDraftIndicator(drafts.target, Boolean(snapshot.text.trim() || images.length));
     return true;
   } catch (error) { trace('draft.save.failed', { threadId: drafts.target.threadId, error: error.message }); showError(`Could not save unsent draft: ${error.message}`); return false; }
 }
-function clearDraft(target) {
+function clearDraft(target, expected = target && editorDrafts.get(JSON.stringify(target))?.expected) {
   if (!api.clearDraft || !target) return;
-  try { api.clearDraft(target); cacheDraftIndicator(target, false); } catch (error) { showError(`Could not clear saved draft: ${error.message}`); }
+  try { api.clearDraft(target, expected); editorDrafts.delete(JSON.stringify(target)); cacheDraftIndicator(target, false); } catch (error) { showError(`Could not clear saved draft: ${error.message}`); }
 }
 function cacheDraftIndicator(target, pending) {
   if (target?.kind !== 'composer' || !target.threadId) return;
@@ -144,11 +149,35 @@ function cacheDraftIndicator(target, pending) {
 }
 function editorTarget(kind, thread, itemId) { return { machine: accessKey(), kind, threadId: thread.id, cwd: thread.cwd, projectId: thread.projectId || null, itemId }; }
 function editorText(target, text) {
-  try { return api.draft?.(target)?.text ?? text; } catch (error) { showError(`Could not restore editor draft: ${error.message}`); return text; }
+  try {
+    const saved = api.draft?.(target);
+    editorDrafts.set(JSON.stringify(target), { fallback: text, expected: { text: saved?.text ?? null, ...(target.kind === 'edit-schedule' ? { runAt: saved?.runAt ?? null } : {}) } });
+    return saved?.text ?? text;
+  } catch (error) { showError(`Could not restore editor draft: ${error.message}`); return text; }
 }
-function saveEditorDraft(target, text) {
+function saveEditorDraft(target, text, settings = {}) {
   if (!target || !api.saveDraft) return;
-  try { api.saveDraft(target, { text }); } catch (error) { showError(`Could not save editor draft: ${error.message}`); }
+  try {
+    const key = JSON.stringify(target), previous = editorDrafts.get(key);
+    api.saveDraft(target, { text, ...settings }, previous?.expected);
+    editorDrafts.set(key, { fallback: previous?.fallback ?? text, expected: { text, ...settings } });
+  } catch (error) { showError(`Could not save editor draft: ${error.message}`); }
+}
+function refreshEditorDrafts(before) {
+  const editors = [['edit-message-dialog', 'edited-message', state.messageEdit], ['edit-queue-dialog', 'queued-text', state.queueEdit], ['edit-schedule-dialog', 'scheduled-text', schedules.editing]];
+  for (const [dialog, input, editor] of editors) {
+    if (!$(dialog).open || !editor?.draftTarget || editor.saving) continue;
+    const key = JSON.stringify(editor.draftTarget), previous = editorDrafts.get(key);
+    if (!previous || previous !== before.get(key)) continue;
+    const saved = api.draft(editor.draftTarget), value = saved?.text ?? previous.fallback, control = $(input);
+    if (control.value !== value) {
+      const { selectionStart, selectionEnd, selectionDirection, scrollTop } = control;
+      control.value = value; control.setSelectionRange(Math.min(selectionStart, value.length), Math.min(selectionEnd, value.length), selectionDirection); control.scrollTop = scrollTop;
+    }
+    const expected = { text: saved?.text ?? null };
+    if (editor.draftTarget.kind === 'edit-schedule') { $('scheduled-time').value = saved?.runAt ?? editor.time; expected.runAt = saved?.runAt ?? null; }
+    editorDrafts.set(key, { fallback: previous.fallback, expected });
+  }
 }
 function activateComposerDraft() {
   if (!api.draft || drafts.suspended || drafts.target) return;
@@ -156,6 +185,7 @@ function activateComposerDraft() {
   try {
     const saved = api.draft(target);
     drafts.target = target;
+    drafts.expected = composerExpected(saved);
     if (saved) {
       $('prompt').value = saved.text; state.images = saved.images; $('send-time').value = String(saved.hours ?? 0);
       if (typeof saved.model === 'string') selectSavedModel(saved.model);
@@ -709,9 +739,9 @@ function renderThreads() {
     if (!hiddenBySearch) hasProjectGroups = true;
     const group = document.createElement('section'); group.className = 'project-group'; group.dataset.projectId = project.id;
     if (hiddenBySearch) { group.dataset.searchHidden = 'true'; group.hidden = !threadDrag.source; }
-    bindThreadDrop(group, project.id);
+    if (!project.needsFolder) bindThreadDrop(group, project.id);
     const header = document.createElement('div'); header.className = 'project-heading';
-    bindProjectDrag(group, header, project);
+    if (!project.needsFolder) bindProjectDrag(group, header, project);
     header.oncontextmenu = event => { event.preventDefault(); showProjectMenu(project, event.clientX, event.clientY); };
     const toggle = document.createElement('button'); toggle.className = 'project-toggle'; toggle.title = project.roots.map(root => root.path).join('\n');
     const collapsed = !search && projects.collapsed.has(project.id);
@@ -732,7 +762,11 @@ function renderThreads() {
     header.append(toggle, menu, create); group.append(header);
     const conversations = document.createElement('div'); conversations.className = 'project-threads'; conversations.hidden = collapsed;
     members.forEach(thread => row(thread, conversations));
-    if (!members.length && !search) { const empty = document.createElement('p'); empty.className = 'project-empty'; empty.textContent = 'No conversations yet'; conversations.append(empty); }
+    if (project.needsFolder) {
+      const map = document.createElement('button'); map.className = 'project-more'; map.textContent = 'Choose folder on this computer…';
+      map.onclick = () => chooseSharedProjectFolder(project).catch(showError); conversations.prepend(map);
+    }
+    if (!members.length && !search && !project.needsFolder) { const empty = document.createElement('p'); empty.className = 'project-empty'; empty.textContent = 'No conversations yet'; conversations.append(empty); }
     if (projects.cursors.get(project.id)) {
       const more = document.createElement('button'); more.className = 'project-more'; more.textContent = 'Load more conversations';
       more.onclick = async () => { more.disabled = true; try { await loadThreads(true, project.id); } catch (error) { showError(error); } finally { more.disabled = false; } };
@@ -778,6 +812,7 @@ async function loadProjects() {
 }
 async function refreshProjects() { if (state.connected && await loadProjects()) await loadThreads(); }
 async function expandProject(project, load = true) {
+  if (project.needsFolder) return chooseSharedProjectFolder(project);
   if (!state.connected || state.sending || state.commandBusy || state.loading || !projects.data.some(entry => entry.id === project.id) || !project.roots[0]?.path) return;
   projects.expanded.add(project.id); projects.collapsed.delete(project.id);
   renderThreads();
@@ -785,7 +820,7 @@ async function expandProject(project, load = true) {
 }
 async function restoreStartupProject() {
   const project = projects.data.find(entry => entry.id === preferences.startupProjects[accessKey()]);
-  if (project) {
+  if (project?.roots[0]?.path) {
     projects.selected = project.id; $('workspace').value = project.roots[0].path;
     await expandProject(project, false);
   }
@@ -795,6 +830,7 @@ function projectAtPath(path, provider = selectedProvider()) {
   return projects.data.find(project => identityProvider(project.id) === provider && project.roots.some(root => normalizedFolder(root.path) === normalizedFolder(path)));
 }
 function startProject(project) {
+  if (project.needsFolder) { chooseSharedProjectFolder(project).catch(showError); return; }
   if (!state.connected || state.sending || state.commandBusy || !project.roots[0]?.path) return;
   projects.selected = project.id;
   $('workspace').value = project.roots[0].path;
@@ -865,8 +901,8 @@ function restoreUnread() {
     for (const [id, status] of Object.entries(saved.completions)) state.completions.set(prefix + id, status);
   } catch (error) { showError(`Could not load unread markers: ${error.message}`); }
 }
-function saveConversationMarkers(value) {
-  api.saveConversationState(value);
+function saveConversationMarkers(value, change) {
+  api.saveConversationState(value, change);
   preferences.conversationStates[value.machine] = { unread: [...value.unread], completions: { ...value.completions } };
 }
 function conversationMarkers(unread = state.unread, completions = state.completions) {
@@ -879,7 +915,7 @@ function setUnread(threadId, unread) {
   const next = new Set(state.unread);
   if (unread) next.add(key); else next.delete(key);
   try {
-    saveConversationMarkers(conversationMarkers(next));
+    saveConversationMarkers(conversationMarkers(next), { threadId, field: 'unread', value: unread });
     state.unread = next; renderThreadIndicators(); return true;
   } catch (error) { showError(`Could not save unread markers: ${error.message}`); return false; }
 }
@@ -889,7 +925,7 @@ function setCompletion(threadId, status = null) {
   const next = new Map(state.completions);
   if (status) next.set(key, status); else next.delete(key);
   try {
-    saveConversationMarkers(conversationMarkers(state.unread, next));
+    saveConversationMarkers(conversationMarkers(state.unread, next), { threadId, field: 'completion', value: status, turnId: observedTurns.get(queueKey(threadId)) });
     state.completions = next; return true;
   } catch (error) { showError(`Could not save conversation markers: ${error.message}`); return false; }
 }
@@ -1071,6 +1107,10 @@ function setThread(thread) {
 }
 async function openThread(thread, allowBusy = false) {
   if (!state.connected || state.sending || state.commandBusy && !allowBusy) return;
+  if (thread.needsFolder) {
+    const project = projects.data.find(project => project.id === thread.projectId);
+    if (project) return chooseSharedProjectFolder(project);
+  }
   setTimelineFollowing(true);
   pinnedMessages.jumping = null; state.olderHistory = null; $('older-turns').disabled = false;
   if (state.thread?.id !== thread.id) { saveComposerDraft(); drafts.target = null; }
@@ -1101,6 +1141,7 @@ async function openThread(thread, allowBusy = false) {
     const history = await rpc('thread/turns/list', { threadId: thread.id, limit: 25, sortDirection: 'desc', itemsView: 'full' });
     if (selection !== state.selection) return;
     state.turnCursor = history.nextCursor;
+    if (history.data[0]?.id) observedTurns.set(queueKey(thread.id), history.data[0].id);
     $('older-turns').hidden = !state.turnCursor;
     state.active.delete(thread.id);
     compacting.delete(thread.id);
@@ -1727,10 +1768,11 @@ $('edit-queue-form').onsubmit = async event => {
   event.preventDefault();
   const target = state.queueEdit; const text = $('queued-text').value.trim();
   if (!target || target.queue.saving || (!text && !target.message.images.length)) return;
+  const expected = editorDrafts.get(JSON.stringify(target.draftTarget))?.expected;
   const previous = { text: target.message.text, input: target.message.input };
   target.message.text = text;
   target.message.input = [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...target.message.input.filter(part => part.type !== 'text' && part.type !== 'skill'), ...skillInputs(text, target.message.input.filter(part => part.type === 'skill'), target.queue.thread.cwd)];
-  try { await persistQueue(target.queue); clearDraft(target.draftTarget); target.queue.editing = false; $('edit-queue-dialog').close(); renderQueue(); if (target.queue.machine === accessKey()) await flushQueue(target.queue.thread.id); }
+  try { await persistQueue(target.queue); clearDraft(target.draftTarget, expected); target.queue.editing = false; $('edit-queue-dialog').close(); renderQueue(); if (target.queue.machine === accessKey()) await flushQueue(target.queue.thread.id); }
   catch (error) { Object.assign(target.message, previous); showError(error); }
 };
 $('cancel-queue-edit').onclick = () => { clearDraft(state.queueEdit?.draftTarget); $('edit-queue-dialog').close(); };
@@ -1746,6 +1788,61 @@ function policy() {
   const sandbox = $('permissions').value;
   if (!['read-only', 'workspace-write', 'danger-full-access'].includes(sandbox)) throw new Error('Choose a valid access mode.');
   return { approvalPolicy: sandbox === 'danger-full-access' ? 'never' : 'on-request', sandbox };
+}
+async function refreshConversationSync() {
+  if (!api.conversationSync || !state.options) return;
+  if (conversationSync.refreshing) { conversationSync.again = true; return; }
+  conversationSync.refreshing = true;
+  try {
+    do {
+      conversationSync.again = false;
+      const options = state.options, snapshot = drafts.snapshot, target = drafts.target, editors = new Map(editorDrafts);
+      const [saved, pins, sync] = await Promise.all([api.preferences(), api.pins(), api.conversationSync()]);
+      if (options !== state.options) continue;
+      refreshEditorDrafts(editors);
+      preferences.conversationStates = saved.conversationStates || {};
+      preferences.messagePins = saved.messagePins || {};
+      preferences.shortcuts = saved.shortcuts;
+      const pinsChanged = JSON.stringify([...state.pinnedIds].sort()) !== JSON.stringify([...pins].sort());
+      restoreUnread(); state.pinnedIds = new Set(pins);
+      for (const id of state.pinnedThreads.keys()) if (!state.pinnedIds.has(id)) state.pinnedThreads.delete(id);
+      for (const thread of state.threads) if (state.pinnedIds.has(thread.id)) state.pinnedThreads.set(thread.id, thread);
+      drafts.pending.clear(); renderThreads(); renderMessagePins(); renderShortcuts();
+      const notice = $('conversation-sync-notice');
+      const conflict = sync.conflicts[0];
+      notice.hidden = !sync.error && !conflict;
+      const signature = JSON.stringify([sync.error, sync.conflicts]);
+      if (notice.dataset.signature !== signature) {
+        notice.dataset.signature = signature; notice.replaceChildren();
+        if (sync.error) { const error = document.createElement('span'); error.textContent = 'Sync: ' + sync.error; notice.append(error); }
+        if (conflict) {
+          const details = document.createElement('details'), summary = document.createElement('summary'), preview = document.createElement('pre');
+          summary.textContent = conflict.kind === 'shortcuts' ? 'Shortcuts changed on both computers' : 'Draft changed on both computers';
+          preview.textContent = `This computer:\n${conflict.local || '(empty)'}\n\nOther computer:\n${conflict.remote || '(empty)'}`;
+          details.append(summary, preview); notice.append(details);
+          for (const [label, choice] of [['Keep this version', 'local'], ['Use other version', 'remote']]) {
+            const button = document.createElement('button'); button.type = 'button'; button.className = 'subtle'; button.textContent = label;
+            button.onclick = async () => {
+              button.disabled = true;
+              try { await api.resolveSyncConflict(conflict.key, choice, conflict.version); await refreshConversationSync(); }
+              catch (error) { showError(error); await refreshConversationSync(); }
+              finally { button.disabled = false; }
+            };
+            notice.append(button);
+          }
+        }
+      }
+      if (!state.loading && !state.sending && !drafts.suspended && target && target === drafts.target && snapshot === drafts.snapshot) {
+        const value = api.draft(target);
+        if ((value?.text || '') !== $('prompt').value || JSON.stringify(value?.images || []) !== JSON.stringify(state.images)) {
+          drafts.target = null; activateComposerDraft(); updateBusy();
+        }
+      }
+      if (state.connected && !state.connecting && sync.catalog !== conversationSync.catalog) {
+        conversationSync.catalog = sync.catalog; await refreshProjects();
+      } else if (state.connected && !state.connecting && pinsChanged) await loadThreads();
+    } while (conversationSync.again);
+  } finally { conversationSync.refreshing = false; }
 }
 async function refreshSchedules() {
   if (!api.scheduledTasks) return;
@@ -1773,7 +1870,7 @@ async function openScheduledEdit(task) {
     const date = new Date(saved.runAt);
     const pad = value => String(value).padStart(2, '0');
     target.time = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
-    $('scheduled-text').value = draft?.text ?? saved.message?.text ?? saved.prompt;
+    $('scheduled-text').value = editorText(target.draftTarget, saved.message?.text ?? saved.prompt);
     $('scheduled-time').value = draft?.runAt ?? target.time;
     for (const id of ['scheduled-text', 'scheduled-time', 'save-schedule-edit', 'cancel-schedule-edit']) $(id).disabled = false;
     const images = saved.message?.images || [];
@@ -1793,8 +1890,7 @@ async function openScheduledEdit(task) {
 function saveScheduledDraft() {
   const target = schedules.editing;
   if (!target?.draftTarget || !api.saveDraft) return;
-  try { api.saveDraft(target.draftTarget, { text: $('scheduled-text').value, runAt: $('scheduled-time').value }); }
-  catch (error) { showError(`Could not save scheduled editor draft: ${error.message}`); }
+  saveEditorDraft(target.draftTarget, $('scheduled-text').value, { runAt: $('scheduled-time').value });
 }
 $('scheduled-text').oninput = saveScheduledDraft;
 $('scheduled-time').oninput = saveScheduledDraft;
@@ -1802,6 +1898,7 @@ $('edit-schedule-form').onsubmit = async event => {
   event.preventDefault();
   const target = schedules.editing;
   if (!target || target.saving || state.options !== target.options || state.selection !== target.selection) return;
+  const expected = editorDrafts.get(JSON.stringify(target.draftTarget))?.expected;
   target.saving = true;
   for (const id of ['scheduled-text', 'scheduled-time', 'save-schedule-edit', 'cancel-schedule-edit']) $(id).disabled = true;
   try {
@@ -1812,7 +1909,7 @@ $('edit-schedule-form').onsubmit = async event => {
     if (schedules.editing !== target || state.options !== target.options || state.selection !== target.selection || !state.connected) return;
     const skills = skillInputs(text, [...(target.task.message?.input.filter(part => part.type === 'skill') || []), ...available], target.task.cwd);
     await api.editScheduledTask(target.task.id, { text, runAt: value === target.time ? target.task.runAt : new Date(value).toISOString(), skills }, target.lock);
-    clearDraft(target.draftTarget);
+    clearDraft(target.draftTarget, expected);
     if (schedules.editing !== target || state.options !== target.options) return;
     closeScheduledEditor(); await refreshSchedules();
   } catch (error) { if (schedules.editing === target) { $('edit-schedule-error').textContent = error.message; $('edit-schedule-error').hidden = false; } }
@@ -2335,6 +2432,7 @@ function openMessageEdit(record) {
 }
 async function resendMessage(target, text) {
   if (!target || !state.connected || state.sending || state.commandBusy || state.loading || target.options !== state.options || target.thread.id !== state.thread?.id) return;
+  const expected = editorDrafts.get(JSON.stringify(target.draftTarget))?.expected;
   const thread = target.thread; const machine = accessKey(); const key = queueKey(thread.id);
   const operation = {}; state.resending = operation; state.commandBusy = true; updateBusy();
   const current = () => state.resending === operation && state.options === target.options && state.connected && state.thread?.id === thread.id;
@@ -2364,7 +2462,7 @@ async function resendMessage(target, text) {
     await persistQueue(queue);
     saved = true;
     if (!current()) return;
-    clearDraft(target.draftTarget);
+    clearDraft(target.draftTarget, expected);
     $('edit-message-dialog').close();
     await openThread(result.thread, true);
     if (!current()) return;
@@ -2531,6 +2629,7 @@ async function connect(options) {
 function handleNotification(message) {
   if (message.machine && message.machine !== accessKey()) return;
   if (message.method === 'scheduler/updated') { refreshSchedules().catch(showError); return; }
+  if (message.method === 'conversations/synced') { refreshConversationSync().catch(showError); return; }
   const { method, params = {}, id } = message;
   if (method === 'provider/queue/updated') {
     if (params.queue?.items?.length) state.nativeQueues.set(params.threadId, params.queue);
@@ -2633,6 +2732,7 @@ function handleNotification(message) {
     state.active.set(params.threadId, params.turn.id); updateBusy();
   }
   if (method === 'turn/completed') {
+    observedTurns.set(queueKey(params.threadId), params.turn.id);
     finishCompaction(params.threadId, params.turn.id);
     const activeTurn = state.active.get(params.threadId);
     if (!state.finished.has(params.turn.id) && (!activeTurn || activeTurn === params.turn.id)) {
@@ -2801,11 +2901,16 @@ function folderActionLabel(path) {
 }
 async function openProjectPicker(purpose = 'conversation') {
   if (!state.connected || state.sending) return;
-  state.folderPurpose = purpose === 'project' ? 'project' : 'conversation';
+  state.folderPurpose = purpose === 'project' || purpose === 'sync-project' ? purpose : 'conversation';
   $('folder-host').textContent = $('server-host').textContent;
   $('use-folder').textContent = folderActionLabel(state.thread?.cwd || $('workspace').value);
   $('folder-dialog').showModal();
   await browseFolders(state.thread?.cwd || $('workspace').value || '/');
+}
+async function chooseSharedProjectFolder(project) {
+  state.syncProject = { project, options: state.options };
+  await openProjectPicker('sync-project');
+  $('use-folder').textContent = `Use folder for ${project.name}`;
 }
 $('browse-workspace').onclick = openProjectPicker;
 $('choose-project').onclick = openProjectPicker;
@@ -2816,6 +2921,20 @@ $('folder-location').oninput = () => { state.folderGeneration++; state.folderPat
 $('parent-folder').onclick = () => browseFolders(($('folder-location').value.replace(/\/+$/, '').replace(/\/[^/]*$/, '')) || '/');
 $('use-folder').onclick = async () => {
   if (!state.folderPath || !state.connected || $('use-folder').disabled) return;
+  if (state.folderPurpose === 'sync-project') {
+    const target = state.syncProject, options = state.options, root = state.folderPath;
+    if (!target || target.options !== options) return;
+    $('use-folder').disabled = true;
+    try {
+      const project = await api.mapSyncProject(target.project.sharedId, root);
+      if (options !== state.options) return;
+      $('folder-dialog').close();
+      await refreshProjects();
+      startProject(project); await refreshConversationSync();
+    } catch (error) { $('folder-error').textContent = error.message; }
+    finally { $('use-folder').disabled = !state.folderPath || !state.connected; }
+    return;
+  }
   if (state.folderPurpose === 'project') {
     state.projectDraft = { path: state.folderPath, options: state.options, idempotencyKey: crypto.randomUUID() };
     $('save-project').disabled = false;
@@ -2888,9 +3007,9 @@ function showProjectMenu(project, x, y) {
   const index = projects.data.findIndex(entry => entry.id === project.id);
   $('open-project').disabled = !state.connected || state.sending || state.commandBusy || state.loading;
   $('open-project').textContent = projects.expanded.has(project.id) ? 'Show fewer conversations' : 'Expand conversations';
-  $('rename-project').disabled = !state.connected;
-  $('move-project-up').disabled = !state.connected || projectDrag.pending === state.options || index <= 0;
-  $('move-project-down').disabled = !state.connected || projectDrag.pending === state.options || index < 0 || index === projects.data.length - 1;
+  $('rename-project').disabled = !state.connected || project.needsFolder;
+  $('move-project-up').disabled = project.needsFolder || !state.connected || projectDrag.pending === state.options || index <= 0;
+  $('move-project-down').disabled = project.needsFolder || !state.connected || projectDrag.pending === state.options || index < 0 || index === projects.data.length - 1;
   menu.style.left = Math.max(0, Math.min(x, innerWidth - menu.offsetWidth)) + 'px';
   menu.style.top = Math.max(0, Math.min(y, innerHeight - menu.offsetHeight)) + 'px';
   $('rename-project').focus();
@@ -2908,12 +3027,18 @@ $('project-settings').onclick = () => {
   if (!target || target.options !== state.options) return;
   state.projectView = target;
   $('project-view-name').textContent = target.project.name;
-  $('project-view-path').textContent = target.project.roots.map(root => root.path).join('\n');
+  $('project-view-path').textContent = target.project.needsFolder ? 'Choose this project’s folder on this computer.' : target.project.roots.map(root => root.path).join('\n');
+  $('map-project-folder').hidden = !target.project.sharedId;
   $('startup-project').checked = preferences.startupProjects[accessKey()] === target.project.id;
-  $('startup-project').disabled = false; $('project-view-error').textContent = '';
+  $('startup-project').disabled = Boolean(target.project.needsFolder); $('project-view-error').textContent = '';
   $('project-view-dialog').showModal();
 };
 $('close-project-view').onclick = () => $('project-view-dialog').close();
+$('map-project-folder').onclick = () => {
+  const target = state.projectView;
+  if (target?.options !== state.options) return;
+  $('project-view-dialog').close(); chooseSharedProjectFolder(target.project).catch(showError);
+};
 $('startup-project').onchange = async () => {
   const target = state.projectView;
   if (!target || target.options !== state.options) return;

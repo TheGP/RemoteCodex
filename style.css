@@ -95,3 +95,7 @@ fieldset{border:0;padding:0;margin:0;min-width:0}dialog select#connection-mode{w
 .changed-files>summary{list-style:none}.changed-files>summary::-webkit-details-marker{display:none}.changed-files>summary::before{content:"▶";display:inline-block;width:14px}.changed-files:has(.changed-file-entry[open])>summary::before{content:"▼"}
 
 .provider-settings legend{font-size:11px;font-weight:600;margin-top:16px}.provider-setting{display:flex;align-items:center;gap:9px}.provider-setting input{width:auto;margin:0;flex-shrink:0}.provider-setting small{display:block;color:var(--muted);font-size:10px;font-weight:400;margin-top:3px}
+
+#conversation-sync-notice { margin-bottom: 6px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; color: var(--muted); }
+#conversation-sync-notice pre { white-space: pre-wrap; max-height: 160px; overflow: auto; }
+#conversation-sync-notice button { margin: 4px 6px 0 0; padding: 3px 8px; font-size: inherit; }

@@ -13,6 +13,8 @@ const { openWebLink, openFileLink, parseFileLink } = require('./links.cjs');
 const { generateTitle, titleKey, readThreadForTitle } = require('./titles.cjs');
 const { ScheduleStore, Scheduler } = require('./scheduler.cjs');
 const { SharedSchedules } = require('./shared-schedules.cjs');
+const { serverKey, sharingOptions } = require('./shared-schedules.cjs');
+const { ConversationState } = require('./conversation-state.cjs');
 const { DiagnosticLog, TurnDiagnostics } = require('./diagnostics.cjs');
 const { DraftStore, registerDraftIpc } = require('./drafts.cjs');
 const { AgentWakeLock } = require('./wake-lock.cjs');
@@ -64,7 +66,6 @@ app.whenReady().then(async () => {
   const pins = new PinStore(path.join(app.getPath('userData'), 'pins.json'));
   const queues = new QueueStore(path.join(app.getPath('userData'), 'queues'));
   const drafts = new DraftStore(path.join(app.getPath('userData'), 'drafts'));
-  registerDraftIpc(ipcMain, drafts, checkSender, error => diagnostic.write('draft.failed', { error: error.message }));
   const preferences = new PreferencesStore(path.join(app.getPath('userData'), 'preferences.json'));
   const schedules = new ScheduleStore(path.join(app.getPath('userData'), 'schedules.json'));
   const editLocks = new Map();
@@ -108,28 +109,47 @@ app.whenReady().then(async () => {
     available: () => Boolean(window), machine: scheduleMachine, blocked: scheduler.blocked,
     dispatching: scheduler.dispatching, changed: schedulesChanged, log: (event, details) => diagnostic.write(event, details)
   });
+  const conversationsChanged = () => {
+    if (window && !window.isDestroyed()) window.webContents.send('notification', { method: 'conversations/synced', params: {} });
+  };
+  const conversations = new ConversationState({
+    directory: path.join(app.getPath('userData'), 'conversation-sync'), shared, pins, drafts, preferences,
+    machine: scheduleMachine, options: () => settings, connection, changed: conversationsChanged,
+    log: (event, details) => diagnostic.write(event, details)
+  });
+  shared.resolveTask = task => conversations.scheduledTask(task);
+  registerDraftIpc(ipcMain, drafts, checkSender, error => diagnostic.write('draft.failed', { error: error.message }), (target, stale) => conversations.captureDraft(target, false, stale));
   const releaseEditors = provider => {
     for (const [threadId, token] of editLocks) if (!provider || agentTarget(threadId, 'thread').provider === provider) {
       editLocks.delete(threadId);
       if (shared.enabled) shared.unlock(token).catch(error => diagnostic.write('schedule.unlock.failed', { error: error.message }));
     }
   };
-  const tickSchedules = () => (shared.enabled ? shared.tick() : scheduler.tick()).catch(error => {
+  const tickSchedules = () => Promise.all([shared.enabled ? shared.tick() : scheduler.tick(), conversations.tick().catch(error => conversations.sync.failed(error))]).catch(error => {
     console.error('Scheduled task error:', error.message);
     if (window && !window.isDestroyed()) window.webContents.send('notification', { method: 'error', params: { message: `Scheduled task error: ${error.message}` } });
   });
   const recoverAgents = () => { if (connection.ready) connection.recover().catch(error => diagnostic.write('provider.recovery.failed', { error: error.message })); };
   const scheduleTimer = setInterval(() => { tickSchedules(); recoverAgents(); }, 15000); scheduleTimer.unref();
   powerMonitor.on('resume', () => { shared.receiptChecks.clear(); tickSchedules(); });
-  app.on('before-quit', () => { clearInterval(scheduleTimer); shared.close(); });
+  app.on('before-quit', () => { clearInterval(scheduleTimer); conversations.sync.close(); shared.close(); });
+  ipcMain.handle('conversation-sync', event => { checkSender(event); return conversations.status(); });
+  ipcMain.handle('resolve-sync-conflict', async (event, key, choice, version) => { checkSender(event); await conversations.sync.resolve(key, choice, version); return conversations.status(); });
+  ipcMain.handle('map-sync-project', (event, id, root) => {
+    checkSender(event);
+    const binding = conversations.binding(id);
+    if (binding && binding.root !== root && (shared.running || editLocks.size || [...agents.values()].some(agent => agent.wakeLock.id !== null))) throw new Error('Finish running tasks and close message editors before changing an existing project folder.');
+    return conversations.bind(id, root);
+  });
   ipcMain.handle('schedule-sharing', event => { checkSender(event); return shared.settings(); });
   ipcMain.handle('schedule-storage', event => { checkSender(event); return shared.storageInfo(); });
   ipcMain.handle('save-schedule-sharing', async (event, value) => {
     checkSender(event);
     if (scheduler.running || editLocks.size) throw new Error('Close message editors and wait for scheduled delivery before changing sharing.');
+    if (conversations.sync.running || serverKey(sharingOptions(value)) !== shared.key && conversations.sync.pending()) throw new Error('Finish syncing conversation changes before changing the sync destination.');
     const result = await shared.configure(value); setImmediate(tickSchedules); return result;
   });
-  ipcMain.handle('sync-schedules', async event => { checkSender(event); await shared.tick(); return shared.settings(); });
+  ipcMain.handle('sync-schedules', async event => { checkSender(event); await Promise.all([shared.tick(), conversations.tick()]); return shared.settings(); });
   ipcMain.handle('scheduled-tasks', event => { checkSender(event); return shared.summaries(); });
   ipcMain.handle('schedule-message', (event, message, hours) => {
     checkSender(event);
@@ -178,9 +198,30 @@ app.whenReady().then(async () => {
     schedulesChanged(); return task;
   });
   ipcMain.handle('preferences', event => { checkSender(event); return preferences.read(); });
-  ipcMain.handle('save-preferences', (event, patch) => { checkSender(event); return preferences.update(patch); });
-  ipcMain.on('save-conversation-state', (event, conversationState) => {
-    try { checkSender(event); preferences.update({ conversationState }); event.returnValue = { ok: true }; }
+  ipcMain.handle('save-preferences', (event, patch) => {
+    checkSender(event); const result = preferences.update(patch);
+    if (patch.messagePin) { const { machine, threadId, itemId, pinned, ...pin } = patch.messagePin; conversations.sync.capture('messagePin', machine, JSON.stringify([threadId, itemId]), pinned ? { itemId, ...pin } : null); }
+    if (patch.shortcuts !== undefined) conversations.sync.capture('shortcuts', 'access:local', 'shortcuts', result.shortcuts);
+    return result;
+  });
+  ipcMain.on('save-conversation-state', (event, conversationState, change) => {
+    try {
+      checkSender(event);
+      if (change) {
+        if (!['unread', 'completion'].includes(change.field) || typeof change.threadId !== 'string' || !change.threadId || change.threadId.length > 200 || change.field === 'unread' && typeof change.value !== 'boolean' || change.field === 'completion' && change.value !== null && !['completed', 'failed'].includes(change.value)) throw new Error('Invalid conversation marker change.');
+        const saved = preferences.read().conversationStates?.[conversationState.machine] || { unread: [], completions: {} };
+        const unread = new Set(saved.unread), completions = { ...saved.completions };
+        if (change.field === 'unread') { if (change.value) unread.add(change.threadId); else unread.delete(change.threadId); }
+        else { if (change.value) completions[change.threadId] = change.value; else delete completions[change.threadId]; }
+        conversationState = { machine: conversationState.machine, unread: [...unread], completions };
+      }
+      preferences.update({ conversationState });
+      if (change) {
+        const value = change.field === 'completion' && change.value && typeof change.turnId === 'string' ? { status: change.value, turnId: change.turnId } : change.value;
+        conversations.sync.capture(change.field, conversationState.machine, change.threadId, value, false, change.turnId);
+      }
+      event.returnValue = { ok: true };
+    }
     catch (error) { event.returnValue = { error: error.message }; }
   });
   ipcMain.handle('queues', event => { checkSender(event); return queues.list(); });
@@ -229,7 +270,8 @@ app.whenReady().then(async () => {
   ipcMain.handle('set-pin', (event, threadId, pinned) => {
     checkSender(event);
     if (!connection.ready) throw new Error('Connect to a coding agent first.');
-    return pins.set(settings, threadId, pinned);
+    const result = pins.set(settings, threadId, pinned);
+    conversations.sync.capture('pin', scheduleMachine(), threadId, pinned); return result;
   });
   ipcMain.handle('choose-key', async event => {
     checkSender(event);
@@ -264,6 +306,15 @@ app.whenReady().then(async () => {
     checkSender(event);
     if (!methods.has(method)) throw new Error('Unsupported agent operation.');
     if (!connection.ready) throw new Error('Connect to a coding agent first.');
+    const rpcMachine = scheduleMachine(), rpcSession = connection.session, rpcSyncKey = shared.key;
+    if (shared.enabled && method === 'thread/list' && params?.projectId?.includes('sync-project:')) return { data: conversations.threads([], params.projectId, params.searchTerm), nextCursor: null };
+    if (shared.enabled && ['thread/resume', 'turn/start', 'turn/steer', 'thread/revert', 'review/start'].includes(method) && params?.threadId) {
+      const binding = conversations.threadBinding(params.threadId);
+      if (binding && ['thread/resume', 'turn/start'].includes(method)) {
+        params = { ...params, cwd: binding.root };
+        if (params.sandboxPolicy?.type === 'workspaceWrite') params.sandboxPolicy = { ...params.sandboxPolicy, writableRoots: [binding.root] };
+      }
+    }
     if (scheduler.dispatching.has(params?.threadId) && ['turn/start', 'thread/resume', 'thread/archive', 'thread/revert'].includes(method)) {
       diagnostic.write('rpc.scheduler.busy', { method, threadId: params.threadId });
       throw new Error('A scheduled message is being sent to this chat; try again shortly.');
@@ -274,7 +325,8 @@ app.whenReady().then(async () => {
       const options = settings;
       const pinned = pins.get(options).includes(params.threadId);
       if (pinned) pins.set(options, params.threadId, false);
-      try { return await connection.call(method, params, undefined, context); }
+      let result;
+      try { result = await connection.call(method, params, undefined, context); }
       catch (error) {
         if (pinned) {
           try { pins.set(options, params.threadId, true); }
@@ -282,6 +334,13 @@ app.whenReady().then(async () => {
         }
         throw error;
       }
+      if (shared.enabled && shared.key === rpcSyncKey) {
+        try {
+          if (pinned) conversations.sync.capture('pin', rpcMachine, params.threadId, false);
+          conversations.sync.capture('thread', rpcMachine, params.threadId, null);
+        } catch (error) { conversations.sync.failed(error); }
+      }
+      return result;
     }
     if (method === 'thread/revert' && shared.enabled) {
       const token = editLocks.get(params.threadId);
@@ -289,7 +348,29 @@ app.whenReady().then(async () => {
       await shared.verify(token);
     }
     if (method === 'thread/name/set') manualNames.add(JSON.stringify([settings.provider, settings.mode, settings.host, settings.port, params.threadId]));
-    return connection.call(method, params, undefined, context);
+    if (shared.enabled && method === 'project/list' && !params?.cursor) conversations.nativeProjects.clear();
+    let result;
+    try { result = await connection.call(method, params, undefined, context); }
+    catch (error) {
+      if (shared.enabled && params?.threadId && conversations.catalog('thread', params.threadId) && /not found|does not exist|no such|unknown thread/i.test(error.message)) throw new Error('This conversation’s history is on another computer. Connect to its shared coding-agent server to continue it; syncing status does not copy native history.');
+      throw error;
+    }
+    if (shared.enabled && shared.key === rpcSyncKey && scheduleMachine() === rpcMachine && connection.session === rpcSession) {
+      try {
+        if (method === 'project/list') result.data = result.nextCursor ? result.data.map(project => conversations.captureProject(project)) : conversations.projects(result.data);
+        if (result.project) result.project = conversations.captureProject(result.project, true);
+        if (method === 'thread/list') result.data = conversations.threads(result.data, params?.projectId, params?.searchTerm);
+        if (result.thread) {
+          conversations.captureThread(result.thread);
+          const record = conversations.catalog('thread', result.thread.id), binding = record?.project && conversations.binding(record.project);
+          if (binding) result.thread = { ...result.thread, cwd: binding.root, projectId: binding.nativeId };
+        }
+      } catch (error) { conversations.sync.failed(error); }
+    } else if (shared.key === rpcSyncKey && scheduleMachine() === rpcMachine && connection.session === rpcSession && ['project/create', 'project/update'].includes(method) && result?.project) {
+      try { result.project = conversations.captureProject(result.project, true); }
+      catch (error) { conversations.sync.failed(error); }
+    }
+    return result;
   });
   ipcMain.handle('title', (event, threadId, prompt) => {
     checkSender(event);

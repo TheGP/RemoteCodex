@@ -101,3 +101,35 @@ test('corrupt metadata and unsafe asset paths fail without reading outside draft
   data.version = 2; fs.writeFileSync(file, JSON.stringify(data));
   assert.throws(() => store.read(target), /Invalid saved draft/);
 });
+
+test('editor IPC keeps stale typed text locally and flags conflicting text or schedule baselines before mutation', t => {
+  const { EventEmitter } = require('node:events');
+  const { registerDraftIpc } = require('../drafts.cjs');
+  const store = fixture(t), ipc = new EventEmitter(), captures = [];
+  registerDraftIpc(ipc, store, () => {}, () => {}, (target, stale) => captures.push({ target, stale }));
+  const editor = { ...target, kind: 'edit-message', itemId: 'turn' };
+  store.save(editor, { text: 'Peer edited this' });
+  const event = {}; ipc.emit('save-draft', event, editor, { text: 'Original plus local typing' }, { text: 'Original' });
+  assert.equal(event.returnValue.error, undefined);
+  assert.equal(store.read(editor).text, 'Original plus local typing'); assert.equal(captures.at(-1).stale, true);
+  ipc.emit('save-draft', {}, editor, { text: 'More typing' }, { text: 'Original plus local typing' });
+  assert.equal(captures.at(-1).stale, false);
+  const scheduled = { ...editor, kind: 'edit-schedule' };
+  store.save(scheduled, { text: 'Same text', runAt: '2026-12-01T15:00' });
+  ipc.emit('save-draft', {}, scheduled, { text: 'Same text', runAt: '2026-12-02T15:00' }, { text: 'Same text', runAt: '2026-12-01T14:00' });
+  assert.equal(captures.at(-1).stale, true);
+  const invalid = {}; ipc.emit('save-draft', invalid, editor, { text: 'Must not save' }, { unknown: 'bad baseline' });
+  assert.match(invalid.returnValue.error, /baseline/); assert.equal(store.read(editor).text, 'More typing');
+});
+
+
+test('editor Cancel uses the same stale baseline check before clearing a newer shared draft', t => {
+  const { EventEmitter } = require('node:events');
+  const { registerDraftIpc } = require('../drafts.cjs');
+  const store = fixture(t), ipc = new EventEmitter(), captured = [];
+  registerDraftIpc(ipc, store, () => {}, () => {}, (target, stale) => captured.push(stale));
+  const editor = { ...target, kind: 'edit-message', itemId: 'cancel-turn' };
+  store.save(editor, { text: 'New peer draft' });
+  const event = {}; ipc.emit('clear-draft', event, editor, undefined, { text: 'Old visible draft' });
+  assert.equal(event.returnValue.error, undefined); assert.equal(store.read(editor), null); assert.equal(captured.at(-1), true);
+});

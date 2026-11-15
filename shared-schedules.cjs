@@ -52,8 +52,8 @@ class ScheduleBridge {
   }
   async open(options, generation) {
     // Only these app-owned helpers are installed; credentials and histories stay on the client.
-    const files = Object.fromEntries(['shared-schedules-host.cjs', 'scheduler.cjs', 'queues.cjs'].map(name => [name, fs.readFileSync(path.join(__dirname, name), 'utf8')]));
-    const install = `const fs=require("node:fs"),path=require("node:path"),os=require("node:os");process.umask(63);let input="";process.stdin.on("data",c=>input+=c);process.stdin.on("end",()=>{const files=JSON.parse(input),dir=path.join(os.homedir(),".local/share/remote-codex/schedule-sync");fs.mkdirSync(dir,{recursive:true,mode:448});for(const name of ["shared-schedules-host.cjs","scheduler.cjs","queues.cjs"]){if(typeof files[name]!=="string")throw Error("Missing schedule helper");const file=path.join(dir,name);if(fs.existsSync(file)&&fs.readFileSync(file,"utf8")===files[name])continue;const temp=file+"."+process.pid+".tmp";fs.writeFileSync(temp,files[name],{mode:384});fs.renameSync(temp,file);}});`;
+    const files = Object.fromEntries(['shared-schedules-host.cjs', 'scheduler.cjs', 'queues.cjs', 'sync-state.cjs'].map(name => [name, fs.readFileSync(path.join(__dirname, name), 'utf8')]));
+    const install = `const fs=require("node:fs"),path=require("node:path"),os=require("node:os");process.umask(63);let input="";process.stdin.on("data",c=>input+=c);process.stdin.on("end",()=>{const files=JSON.parse(input),dir=path.join(os.homedir(),".local/share/remote-codex/schedule-sync/state-v1");fs.mkdirSync(dir,{recursive:true,mode:448});for(const name of ["shared-schedules-host.cjs","scheduler.cjs","queues.cjs","sync-state.cjs"]){if(typeof files[name]!=="string")throw Error("Missing schedule helper");const file=path.join(dir,name);if(fs.existsSync(file)&&fs.readFileSync(file,"utf8")===files[name])continue;const temp=file+"."+process.pid+".tmp";fs.writeFileSync(temp,files[name],{mode:384});fs.renameSync(temp,file);}});`;
     const child = this.spawn(options, "node -e '" + install + "'");
     this.installing = child;
     await new Promise((resolve, reject) => {
@@ -69,7 +69,7 @@ class ScheduleBridge {
     if (this.generation !== generation) throw new Error('Schedule storage connection changed.');
     const file = options.folder !== defaultFolder ? path.posix.join(options.folder, 'schedules.sqlite') : null;
     const argument = file ? " '" + file.replace(/'/g, "'\\''") + "'" : '';
-    const process = this.spawn(options, 'exec node --no-warnings "$HOME/.local/share/remote-codex/schedule-sync/shared-schedules-host.cjs"' + argument);
+    const process = this.spawn(options, 'exec node --no-warnings "$HOME/.local/share/remote-codex/schedule-sync/state-v1/shared-schedules-host.cjs"' + argument);
     this.child = process;
     let buffer = '', stderr = '';
     const decoder = new StringDecoder('utf8');
@@ -277,8 +277,8 @@ class SharedSchedules {
       this.state.receipts = this.state.receipts.filter(entry => entry !== receipt); this.save();
     }
   }
-  matches(task, thread) {
-    return thread?.id === task.threadId && typeof task.cwd === 'string' && thread.cwd === task.cwd && (!task.message?.thread.createdAt || task.message.thread.createdAt === thread.createdAt);
+  matches(task, thread, before = false) {
+    return thread?.id === task.threadId && typeof task.cwd === 'string' && (thread.cwd === task.cwd || before && thread.cwd === task.sourceCwd) && (!task.message?.thread.createdAt || task.message.thread.createdAt === thread.createdAt);
   }
   completed({ threadId, turn } = {}) {
     if (!threadId || !turn?.id || !['completed', 'failed', 'interrupted'].includes(turn.status)) return;
@@ -305,13 +305,16 @@ class SharedSchedules {
         this.dispatching.add(task.threadId);
         let claim, begun = false;
         try {
+          const local = this.resolveTask ? await this.resolveTask(task) : task;
+          if (!local) continue;
           const before = await this.connection.call('thread/read', { threadId: task.threadId, includeTurns: false }, 5000);
-          if (!current() || !this.matches(task, before.thread) || before.thread.status?.type === 'active') continue;
+          if (!current() || !this.matches(local, before.thread, true) || before.thread.status?.type === 'active') continue;
           refreshNeeded = true;
           claim = await this.bridge.call('claim', { id: task.id });
           if (!claim) continue;
           this.locks.set(claim.token, { ...claim, threadId: task.threadId, kind: 'delivery' });
-          const resumed = await this.connection.call('thread/resume', { threadId: task.threadId, excludeTurns: true });
+          if (this.resolveTask) { claim.task = await this.resolveTask(claim.task); if (!claim.task) continue; }
+          const resumed = await this.connection.call('thread/resume', { threadId: task.threadId, excludeTurns: true, ...(claim.task.sourceCwd ? { cwd: claim.task.cwd } : {}) });
           if (!current() || !this.matches(claim.task, resumed.thread) || resumed.thread.status?.type === 'active' || this.blocked(task.threadId)) continue;
           await this.bridge.call('begin', { id: task.id, token: claim.token }); begun = true;
           let receipt;

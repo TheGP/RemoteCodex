@@ -19,6 +19,17 @@ function draftKey(target) {
 
 class DraftStore {
   constructor(directory) { this.directory = directory; this.lastTargets = new Map(); }
+  list() {
+    let files;
+    try { files = fs.readdirSync(this.directory); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+    return files.filter(file => /^[a-f0-9]{64}$/.test(file)).map(file => {
+      let value;
+      try { value = JSON.parse(fs.readFileSync(path.join(this.directory, file, 'draft.json'), 'utf8')); }
+      catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+      if (hash(draftKey(value.target)) !== file) throw new Error('Invalid saved draft identity.');
+      return this.metadata(value.target);
+    }).filter(Boolean);
+  }
   folder(target) { return path.join(this.directory, hash(draftKey(target))); }
   write(file, value) {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -101,17 +112,26 @@ class DraftStore {
   }
 }
 
-function registerDraftIpc(ipcMain, drafts, checkSender, onError = () => {}) {
-  for (const operation of ['read-draft', 'has-draft', 'save-draft', 'clear-draft', 'last-draft', 'move-draft']) ipcMain.on(operation, (event, target, patch) => {
+function registerDraftIpc(ipcMain, drafts, checkSender, onError = () => {}, changed = () => {}) {
+  for (const operation of ['read-draft', 'has-draft', 'save-draft', 'clear-draft', 'last-draft', 'move-draft']) ipcMain.on(operation, (event, target, patch, expected) => {
     try {
       checkSender(event);
-      let value;
+      let value, stale = false;
+      if (['save-draft', 'clear-draft'].includes(operation) && expected !== undefined) {
+        if (!expected || typeof expected !== 'object' || Array.isArray(expected) || Object.keys(expected).some(key => !['text', 'runAt', 'hours', 'model', 'effort', 'mode', 'access'].includes(key)) || !Object.hasOwn(expected, 'text') || Object.entries(expected).some(([key, value]) => value !== null && (key === 'hours' ? !hours.has(value) : typeof value !== 'string'))) throw new Error('Invalid editor draft baseline.');
+        const previous = drafts.metadata(target);
+        stale = Object.entries(expected).some(([key, value]) => (previous?.[key] ?? null) !== value);
+      }
       if (operation === 'read-draft') { value = drafts.read(target); if (target.kind === 'composer') drafts.remember(target); }
       else if (operation === 'has-draft') value = drafts.hasContent(target);
       else if (operation === 'save-draft') drafts.save(target, patch);
       else if (operation === 'clear-draft') { drafts.clear(target); if (target.kind !== 'composer') drafts.remember({ ...target, kind: 'composer', itemId: null }); }
       else if (operation === 'move-draft') drafts.move(target, patch);
       else value = drafts.last(target);
+      if (['save-draft', 'clear-draft', 'move-draft'].includes(operation)) {
+        if (operation === 'move-draft') changed(patch);
+        changed(target, stale);
+      }
       event.returnValue = { value };
     } catch (error) { onError(error); event.returnValue = { error: error.message }; }
   });

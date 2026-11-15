@@ -4,6 +4,7 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { ScheduleStore } = require('./scheduler.cjs');
+const { StateDatabase } = require('./sync-state.cjs');
 
 const leaseMs = 60000;
 const validId = value => typeof value === 'string' && value.length > 0 && value.length <= 200;
@@ -23,6 +24,7 @@ class SharedScheduleDatabase {
       CREATE INDEX IF NOT EXISTS due_tasks ON tasks(machine,thread_id,status,run_at);
       CREATE TABLE IF NOT EXISTS tombstones(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS leases(resource TEXT PRIMARY KEY, token TEXT UNIQUE NOT NULL, owner TEXT NOT NULL, kind TEXT NOT NULL, task_id TEXT, expires_at INTEGER NOT NULL);`);
+    this.state = new StateDatabase(this.db);
   }
   close() { this.db.close(); }
   get(id) { const row = this.db.prepare('SELECT payload FROM tasks WHERE id=? UNION ALL SELECT payload FROM tombstones WHERE id=? LIMIT 1').get(id, id); return row ? JSON.parse(row.payload) : null; }
@@ -67,6 +69,7 @@ class SharedScheduleDatabase {
   }
   perform(method, args, owner, now) {
     if (method === 'hello') return { protocol: 1, leaseMs };
+    if (method.startsWith('state-') || method.startsWith('blob-')) return this.state.request(method, args, owner, now);
     if (method === 'storage-info') {
       const directory = path.dirname(this.file);
       let bytes = 0, remaining = 10000, complete = true;
