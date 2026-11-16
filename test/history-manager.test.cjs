@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { HistoryManager } = require('../history-manager.cjs');
+const { exportCodexHistory } = require('../codex-history.cjs');
 const { ConversationState } = require('../conversation-state.cjs');
 const { SharedScheduleDatabase } = require('../shared-schedules-host.cjs');
 const { PinStore } = require('../pins.cjs');
@@ -32,7 +33,7 @@ function fixture(t) {
     const profile = path.join(directory, 'computer-' + index), root = path.join(profile, 'own project');
     fs.mkdirSync(root, { recursive: true });
     let options = { mode: 'local', localCwd: root }, selectedMachine = machine;
-    const calls = [], bridgeCalls = [], native = new Map();
+    const calls = [], bridgeCalls = [], logs = [], native = new Map();
     const connection = {
       ready: true, session: {}, before: null,
       supports: (method, provider = 'codex') => provider === 'codex' && method === 'thread/list',
@@ -57,9 +58,9 @@ function fixture(t) {
         return server(namespace)[index].request(method, structuredClone(args), shared.state.device).result;
       } }
     };
-    const state = new ConversationState({ directory: path.join(profile, 'sync'), shared, pins: new PinStore(path.join(profile, 'pins.json')), drafts: new DraftStore(path.join(profile, 'drafts')), preferences: new PreferencesStore(path.join(profile, 'preferences.json')), machine: () => selectedMachine, options: () => options, connection, changed() {}, log() {} });
+    const state = new ConversationState({ directory: path.join(profile, 'sync'), shared, pins: new PinStore(path.join(profile, 'pins.json')), drafts: new DraftStore(path.join(profile, 'drafts')), preferences: new PreferencesStore(path.join(profile, 'preferences.json')), machine: () => selectedMachine, options: () => options, connection, changed() {}, log: (event, details) => logs.push({ event, details }) });
     state.sync.soon = () => {};
-    return { index, state, shared, root, calls, bridgeCalls, native, connection, get options() { return options; }, setOptions: value => { options = value; }, switchMachine: value => { selectedMachine = value; }, history: state.history };
+    return { index, state, shared, root, calls, bridgeCalls, logs, native, connection, get options() { return options; }, setOptions: value => { options = value; }, switchMachine: value => { selectedMachine = value; }, history: state.history };
   });
   t.after(() => {
     for (const client of clients) client.state.sync.close();
@@ -74,6 +75,22 @@ function fixture(t) {
     client.native.set(id, thread); return thread;
   };
   return { directory, home, a: clients[0], b: clients[1], create, server };
+}
+
+async function pendingHistoryChain(f) {
+  const { a } = f, thread = f.create(a), original = fs.readFileSync(thread.path);
+  await a.history.tick();
+  const key = stateKey('history', machine, thread.id), entry = structuredClone(a.state.sync.state.entries[key]), owner = a.history.owners.get(thread.id);
+  fs.appendFileSync(thread.path, encode([question(2, 'First pending snapshot')]));
+  await a.history.export(thread, owner);
+  const root = a.state.sync.state.pending.findLast(op => op.key === key);
+  root.sent = true; a.state.sync.save();
+  fs.appendFileSync(thread.path, encode([question(3, 'Second pending snapshot')]));
+  await a.history.export(thread, owner);
+  const child = a.state.sync.state.pending.findLast(op => op.key === key);
+  assert.notEqual(child.opId, root.opId); assert.equal(child.parent, root.opId);
+  assert.equal(root.base, entry.revision); assert.equal(child.base, null, 'linked pending children must wait for their parent acknowledgment');
+  return { thread, key, entry, owner, root, child, original };
 }
 
 test('ConversationState owns HistoryManager and sharing-disabled, SSH and unsupported providers never access native history', async t => {
@@ -126,7 +143,7 @@ test('a newer trusted history import uses the current local workspace and safe r
   a.history.observe(source); await a.history.tick();
   assert.notEqual(a.state.catalog('history', source.id).digest, previousDigest);
   const originals = [source.path, local.path].map(file => fs.readFileSync(file));
-  await b.history.read(source.id);
+  await b.history.read(source.id, { refresh: true });
   const resumed = b.calls.findLast(call => call.method === 'thread/resume').params;
   assert.equal(resumed.threadId, source.id); assert.equal(resumed.cwd, b.root); assert.deepEqual(resumed.runtimeWorkspaceRoots, [b.root]);
   assert.equal(resumed.sandbox, 'read-only'); assert.equal(resumed.approvalPolicy, 'never'); assert.equal(resumed.excludeTurns, true);
@@ -152,7 +169,7 @@ test('a first import cannot replace existing native history without a trusted di
       b.connection.session = {}; b.history.context();
     }
     const savedAliases = structuredClone(aliases), savedRecord = structuredClone(b.history.record(source.id));
-    await assert.rejects(b.history.read(source.id), /unsynced conversation messages/);
+    await assert.rejects(b.history.read(source.id, { refresh: true }), /unsynced conversation messages/);
     assert.equal(b.native.get(source.id).path, local.path);
     assert.deepEqual(fs.readFileSync(local.path), bytes);
     assert.deepEqual(aliases, savedAliases); assert.deepEqual(b.history.record(source.id), savedRecord);
@@ -174,7 +191,7 @@ test('an identical existing native rollout can receive its first trusted import 
     const bytes = fs.readFileSync(local.path), rows = bytes.toString('utf8').trim().split('\n').map(JSON.parse);
     b.history.context(); assert.equal(b.history.record(source.id), undefined);
     if (previous === 'workspace-only') { b.state.sync.state.localHistory[source.id] = { workspace: b.root }; b.state.sync.save(); }
-    await b.history.read(source.id);
+    await b.history.read(source.id, { refresh: true });
     const record = b.history.record(source.id), imported = fs.readFileSync(record.path, 'utf8').trim().split('\n').map(JSON.parse);
     assert.equal(record.digest, a.state.catalog('history', source.id).digest);
     assert.notEqual(record.path, local.path); assert.equal(record.previousPath, local.path);
@@ -305,7 +322,7 @@ test('concurrent history reads share one native import and do not resume a worki
   const waiting = gate(); b.shared.before = async method => { if (method === 'blob-get') { waiting.begin(); await waiting.held; } };
   const first = b.history.read(source.id), second = b.history.read(source.id); await waiting.started; waiting.release();
   await Promise.all([first, second]);
-  assert.equal(b.calls.filter(call => call.method === 'thread/read').length, 1); assert.equal(b.calls.filter(call => call.method === 'thread/resume').length, 1);
+  assert.equal(b.calls.filter(call => call.method === 'thread/read').length, 2); assert.equal(b.calls.filter(call => call.method === 'thread/resume').length, 1);
   assert.equal(b.history.importing.size, 0); assert.ok(b.history.record(source.id));
 });
 
@@ -325,6 +342,134 @@ test('a startup read of the current server digest preserves newly appended unsyn
   assert.equal(a.history.owners.size, 0, 'opening the existing local digest must not require ownership refresh');
 });
 
+test('cached and uncached local conversations open without waiting for another conversation’s blocked upload', async t => {
+  const f = fixture(t), { a } = f, cached = f.create(a);
+  await a.history.tick();
+  const uncached = f.create(a, 'Local original not captured yet'), uploading = f.create(a, 'Another conversation waiting for upload');
+  await a.history.verify(uploading.id); await a.history.export(uploading, a.history.owners.get(uploading.id));
+  const waiting = gate(); let uploadFinished = false;
+  a.shared.before = async method => { if (method === 'blob-put') { waiting.begin(); await waiting.held; } };
+  const upload = a.state.sync.tick().then(() => { uploadFinished = true; }); await waiting.started;
+  const bridgeCalls = a.bridgeCalls.length, sourceBytes = fs.readFileSync(uncached.path);
+  const originalTick = a.state.sync.tick.bind(a.state.sync); let syncAttempts = 0;
+  t.mock.method(a.state.sync, 'tick', async () => { syncAttempts++; return originalTick(); });
+  try {
+    for (const thread of [cached, uncached]) {
+      const opening = a.history.read(thread.id);
+      const opened = await Promise.race([opening.then(() => true), new Promise(resolve => setImmediate(() => resolve(false)))]);
+      assert.equal(opened, true, 'local history must open while the unrelated upload remains blocked');
+      assert.equal(uploadFinished, false);
+    }
+    assert.equal(syncAttempts, 0, 'local opens must not invoke the global upload coordinator');
+    assert.equal(a.bridgeCalls.length, bridgeCalls, 'local opens must not ask the shared server for history');
+    assert.equal(a.calls.filter(call => call.method === 'thread/read' && call.params.threadId === uncached.id).length, 1);
+    assert.equal(a.calls.some(call => call.method === 'thread/resume'), false);
+    assert.equal(a.history.record(uncached.id), undefined);
+    assert.deepEqual(fs.readFileSync(uncached.path), sourceBytes);
+  } finally { waiting.release(); await upload; }
+});
+
+test('pending current-epoch local history opens and verifies without uploading, while stale epochs and foreign ownership stay blocked', async t => {
+  const f = fixture(t), { a, b } = f, thread = f.create(a);
+  await a.history.tick(); await b.state.sync.tick();
+  const previousDigest = a.state.catalog('history', thread.id).digest;
+  fs.appendFileSync(thread.path, encode([question(2, 'Newest locally saved message awaiting upload')]));
+  await a.history.export(thread, a.history.owners.get(thread.id));
+  const record = structuredClone(a.history.record(thread.id));
+  const pending = a.state.sync.state.pending.find(op => op.kind === 'history' && op.id === thread.id);
+  assert.ok(pending); assert.notEqual(record.digest, previousDigest); assert.equal(pending.value.digest, record.digest);
+  t.mock.method(a.state.sync, 'tick', async () => { throw new Error('Local open must not wait for pending uploads'); });
+  await assert.doesNotReject(a.history.read(thread.id));
+  assert.deepEqual(a.history.record(thread.id), record);
+  assert.equal(a.calls.some(call => call.method === 'thread/resume'), false);
+  await assert.doesNotReject(a.history.verify(thread.id));
+  assert.equal(a.history.canRun(thread.id), true);
+  assert.equal(a.state.sync.state.pending.includes(pending), true);
+  const epoch = pending.value.epoch; pending.value.epoch = epoch - 1;
+  await assert.rejects(a.history.verify(thread.id), /synced history|ownership|epoch/i);
+  assert.equal(a.history.canRun(thread.id), false);
+  pending.value.epoch = epoch;
+  b.history.context(); b.state.sync.state.localHistory[thread.id] = structuredClone(record);
+  b.state.sync.capture('history', machine, thread.id, pending.value);
+  await assert.rejects(b.history.verify(thread.id), /Use this conversation/);
+  assert.equal(b.history.canRun(thread.id), false);
+  assert.equal(a.state.catalog('history', thread.id).digest, previousDigest);
+});
+
+test('pending history follows a same-key current-epoch parent chain anchored to the current server revision', async t => {
+  const f = fixture(t), { a } = f, { thread, owner, child } = await pendingHistoryChain(f);
+  assert.equal(a.history.record(thread.id).digest, child.value.digest);
+  assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), true);
+  await assert.doesNotReject(a.history.verify(thread.id));
+  assert.equal(a.history.canRun(thread.id), true); assert.equal(child.base, null);
+});
+
+test('a pending history chain cannot authorize sending over a newer unrelated server snapshot', async t => {
+  const f = fixture(t), { a } = f, { thread, key, entry, owner, root, child, original } = await pendingHistoryChain(f);
+  const branch = path.join(f.home, 'sessions', 'concurrent-' + thread.id + '.jsonl');
+  fs.writeFileSync(branch, Buffer.concat([original, Buffer.from(encode([question(2, 'Unrelated newer server branch')]))]));
+  const value = { ...await exportCodexHistory({ thread: { ...thread, path: branch }, home: f.home, keepBlob: data => a.state.sync.keepBlob(data) }), epoch: owner.epoch };
+  for (const blob of value.blobs) await a.shared.bridge.call('blob-put', { hash: blob.hash, data: fs.readFileSync(a.state.sync.blobFile(blob.hash)).toString('base64') });
+  const [published] = await a.shared.bridge.call('state-push', { operations: [{ kind: 'history', machine, id: thread.id, key, opId: randomUUID(), base: entry.revision, value, seed: false }] });
+  assert.equal(published.conflict, undefined); assert.ok(published.current.revision > entry.revision);
+  await a.state.sync.applyEntry(published.current);
+  assert.notEqual(value.digest, root.value.digest); assert.notEqual(value.digest, child.value.digest);
+  assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), false);
+  await assert.rejects(a.history.verify(thread.id), /synced history/);
+  assert.equal(a.history.canRun(thread.id), false);
+  assert.equal(root.base, entry.revision); assert.equal(child.base, null); assert.equal(child.parent, root.opId);
+});
+
+test('a lost acknowledgment remains valid when a pending ancestor matches the advanced server snapshot', async t => {
+  const f = fixture(t), { a } = f, { thread, key, entry, owner, root, child } = await pendingHistoryChain(f);
+  const original = a.shared.bridge.call; let committed;
+  a.shared.bridge.call = async (method, args) => {
+    const result = await original(method, args);
+    if (method === 'state-push' && args.operations.some(op => op.opId === root.opId)) {
+      committed = result.find(reply => reply.opId === root.opId).current;
+      throw new Error('History acknowledgment lost');
+    }
+    return result;
+  };
+  await assert.rejects(a.state.sync.tick(), /acknowledgment lost/);
+  assert.ok(committed.revision > entry.revision); assert.equal(committed.value.digest, root.value.digest);
+  await a.state.sync.applyEntry(committed);
+  assert.equal(root.base, entry.revision); assert.equal(child.base, null); assert.equal(child.parent, root.opId);
+  assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), true);
+  await assert.doesNotReject(a.history.verify(thread.id)); assert.equal(a.history.canRun(thread.id), true);
+  a.shared.bridge.call = original;
+  await a.state.sync.tick();
+  assert.equal(a.state.sync.state.pending.includes(root), false); assert.equal(child.base, committed.revision); assert.equal(child.parent, undefined);
+  await a.state.sync.tick();
+  assert.equal(a.state.sync.state.pending.some(op => op.key === key), false);
+  assert.equal(a.state.catalog('history', thread.id).digest, child.value.digest);
+  assert.equal(a.state.sync.state.conflicts[key], undefined);
+});
+
+test('missing, cross-key, stale-epoch and cyclic pending ancestors cannot authorize sending', async t => {
+  for (const kind of ['missing', 'cross-key', 'stale-epoch', 'cycle']) await t.test(kind, async t => {
+    const f = fixture(t), { a } = f, { thread, key, owner, root, child } = await pendingHistoryChain(f);
+    if (kind === 'missing') a.state.sync.state.pending = a.state.sync.state.pending.filter(op => op !== root);
+    else if (kind === 'cross-key') root.key = stateKey('history', machine, randomUUID());
+    else if (kind === 'stale-epoch') root.value.epoch = owner.epoch - 1;
+    else root.parent = child.opId;
+    assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), false);
+    await assert.rejects(a.history.verify(thread.id), /synced history/);
+    assert.equal(a.history.canRun(thread.id), false);
+    assert.equal(a.state.sync.state.conflicts[key], undefined);
+  });
+});
+
+test('a history conflict blocks verification and scheduling even when the local digest matches the server', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  await a.history.tick();
+  const key = stateKey('history', machine, thread.id), entry = a.state.sync.state.entries[key];
+  assert.equal(a.history.record(thread.id).digest, entry.value.digest);
+  a.state.sync.state.conflicts[key] = { remote: structuredClone(entry) };
+  await assert.rejects(a.history.verify(thread.id), /history conflict/);
+  assert.equal(a.history.canRun(thread.id), false);
+});
+
 test('newer peer history cannot replace a dirty local working copy with an empty or foreign ownership cache', async t => {
   for (const cache of ['empty', 'foreign']) await t.test(cache, async t => {
     const f = fixture(t), { a, b } = f, thread = f.create(a);
@@ -339,7 +484,7 @@ test('newer peer history cannot replace a dirty local working copy with an empty
       await b.history.refresh();
       assert.equal(b.history.owners.get(thread.id).owner, a.shared.state.device);
     }
-    await assert.rejects(b.history.read(thread.id), /unsynced conversation messages/);
+    await assert.rejects(b.history.read(thread.id, { refresh: true }), /unsynced conversation messages/);
     assert.notEqual(b.state.catalog('history', thread.id).digest, previous.digest);
     assert.deepEqual(b.history.record(thread.id), previous);
     assert.equal(b.native.get(thread.id).path, previous.path);
@@ -379,6 +524,129 @@ test('a changed native file is retried and never publishes a partially captured 
   assert.ok(a.state.catalog('history', thread.id)); assert.equal(a.history.record(thread.id).stamp, a.history.stamp(thread.path));
   assert.match(fs.readFileSync(thread.path, 'utf8'), /Arrived while exporting/);
   assert.equal(a.calls.some(call => call.method === 'turn/start'), false);
+});
+
+test('missing-parent and corrupt native histories stay thread-specific while healthy conversations keep syncing', async t => {
+  const f = fixture(t), { a, b } = f, linked = f.create(a), corrupt = f.create(a), healthy = f.create(a, 'Healthy conversation after broken histories');
+  const linkedRows = fs.readFileSync(linked.path, 'utf8').trim().split('\n').map(JSON.parse);
+  linkedRows[0].payload.history_base = { thread_id: randomUUID(), end_ordinal_exclusive: 1, end_byte_offset: 10 };
+  fs.writeFileSync(linked.path, encode(linkedRows));
+  fs.appendFileSync(corrupt.path, '{invalid-json\n');
+  const originals = [linked, corrupt].map(thread => fs.readFileSync(thread.path));
+  await a.history.verify(linked.id); await b.history.request(linked.id);
+  await assert.doesNotReject(a.state.tick());
+  assert.ok(a.state.catalog('history', healthy.id));
+  for (const thread of [linked, corrupt]) {
+    const error = a.history.errors.get(thread.id);
+    assert.ok(error?.message); assert.equal(error.stamp, a.history.stamp(thread.path));
+    assert.ok(error.retryAt > Date.now());
+    assert.equal(a.state.catalog('history', thread.id), undefined); assert.equal(a.history.record(thread.id), undefined);
+    assert.equal(a.state.sync.state.pending.some(op => op.kind === 'history' && op.id === thread.id), false);
+    assert.ok(a.logs.some(entry => entry.details?.threadId === thread.id && /history/i.test(entry.event)));
+  }
+  assert.match(a.history.errors.get(linked.id).message, /linked.*missing|ambiguous/i);
+  assert.equal(a.history.errors.has(healthy.id), false); assert.equal(a.state.sync.error, null);
+  const status = a.state.status();
+  assert.equal(status.error, null);
+  assert.deepEqual(new Set(status.historyErrors.map(error => error.id)), new Set([linked.id, corrupt.id]));
+  assert.equal(a.bridgeCalls.some(call => call.method === 'history-release' && call.args.id === linked.id), false);
+  await b.history.refresh();
+  assert.equal(b.history.status().find(owner => owner.id === linked.id).owned, false);
+  assert.equal(b.history.status().find(owner => owner.id === linked.id).waiting, true);
+  [linked, corrupt].forEach((thread, index) => assert.deepEqual(fs.readFileSync(thread.path), originals[index]));
+});
+
+test('failed history export observes its cooldown, retries queued entries after expiry and recovers immediately on a changed source', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a), valid = fs.readFileSync(thread.path);
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  fs.appendFileSync(thread.path, '{invalid-json\n');
+  await a.history.tick();
+  const first = a.history.errors.get(thread.id);
+  assert.ok(first); assert.equal(first.retryAt, now + 60000);
+  const reads = () => a.calls.filter(call => call.method === 'thread/read' && call.params.threadId === thread.id).length;
+  const attempts = reads();
+  a.history.queue.delete(thread.id); a.history.observe(thread);
+  assert.equal(a.history.queue.has(thread.id), false, 'observing the unchanged failing rollout must not schedule another export');
+  a.history.queue.set(thread.id, thread);
+  now += 59999; await a.history.tick();
+  assert.equal(reads(), attempts, 'already-queued failing histories must also respect the cooldown');
+  now++; a.history.observe(thread); await a.history.tick();
+  assert.equal(reads(), attempts + 1);
+  assert.equal(a.history.errors.get(thread.id).retryAt, now + 60000);
+  assert.equal(a.state.catalog('history', thread.id), undefined);
+  fs.writeFileSync(thread.path, Buffer.concat([valid, Buffer.from(encode([question(2, 'Repaired native source')]))]));
+  a.history.observe(thread); assert.equal(a.history.queue.has(thread.id), true);
+  await a.history.tick();
+  assert.equal(a.history.errors.has(thread.id), false); assert.ok(a.state.catalog('history', thread.id));
+  assert.equal(a.history.record(thread.id).stamp, a.history.stamp(thread.path));
+  assert.equal(a.state.sync.error, null); assert.equal(a.state.status().historyErrors.some(error => error.id === thread.id), false);
+});
+
+test('five broken conversations awaiting handoff cannot starve the next healthy export during their cooldown', async t => {
+  const f = fixture(t), { a, b } = f;
+  const now = Date.now(); t.mock.method(Date, 'now', () => now);
+  const broken = Array.from({ length: 5 }, () => f.create(a));
+  const healthy = f.create(a, 'Healthy sixth conversation');
+  for (const thread of broken) {
+    fs.appendFileSync(thread.path, '{invalid-json\n');
+    await a.history.verify(thread.id); await b.history.request(thread.id);
+  }
+  await a.history.tick();
+  assert.equal(a.history.errors.size, 5); assert.equal(a.state.catalog('history', healthy.id), undefined);
+  const brokenReads = () => a.calls.filter(call => call.method === 'thread/read' && broken.some(thread => thread.id === call.params.threadId)).length;
+  const attempts = brokenReads();
+  await a.history.tick();
+  assert.ok(a.state.catalog('history', healthy.id), 'cooling handoff failures must be filtered before the five-export budget is applied');
+  assert.equal(brokenReads(), attempts);
+  for (const thread of broken) {
+    assert.ok(a.history.errors.get(thread.id)?.message);
+    assert.equal(a.state.catalog('history', thread.id), undefined);
+    assert.equal(a.history.status().find(owner => owner.id === thread.id).owned, true);
+  }
+  assert.equal(a.bridgeCalls.some(call => call.method === 'history-release'), false);
+  assert.equal(a.state.sync.error, null);
+});
+
+test('a replacement native history path retries immediately while the unchanged old failing file stays intact', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a), valid = fs.readFileSync(thread.path), originalPath = thread.path;
+  const now = Date.now(); t.mock.method(Date, 'now', () => now);
+  fs.appendFileSync(originalPath, '{invalid-json\n');
+  await a.history.tick();
+  const error = a.history.errors.get(thread.id), bytes = fs.readFileSync(originalPath), stamp = a.history.stamp(originalPath);
+  assert.equal(error.retryAt, now + 60000);
+  const replacement = path.join(f.home, 'sessions', 'replacement-' + thread.id + '.jsonl');
+  fs.writeFileSync(replacement, Buffer.concat([valid, Buffer.from(encode([question(2, 'Recovered through a different native path')]))]));
+  thread.path = replacement; a.history.observe(thread);
+  assert.equal(a.history.queue.has(thread.id), true);
+  await a.history.tick();
+  assert.equal(Date.now(), now); assert.ok(a.state.catalog('history', thread.id));
+  assert.equal(a.history.record(thread.id).path, replacement); assert.equal(a.history.errors.has(thread.id), false);
+  assert.deepEqual(fs.readFileSync(originalPath), bytes); assert.equal(a.history.stamp(originalPath), stamp);
+});
+
+test('failed codec exports cannot write thread errors or snapshots after namespace, machine or session replacement', async t => {
+  for (const change of ['namespace', 'machine', 'session', 'provider-session']) await t.test(change, async t => {
+    const f = fixture(t), { a } = f, thread = f.create(a);
+    fs.appendFileSync(thread.path, '{invalid-json\n');
+    a.state.captureThread(thread); await a.state.sync.tick(); a.history.scanned = true;
+    const codex = { session: {} }; a.connection.connections = new Map([['codex', codex]]);
+    const waiting = gate(), original = fs.promises.realpath.bind(fs.promises); let intercepted = false;
+    t.mock.method(fs.promises, 'realpath', async (file, ...args) => {
+      if (file === thread.path && !intercepted) { intercepted = true; waiting.begin(); await waiting.held; }
+      return original(file, ...args);
+    });
+    const exporting = a.history.tick(); await waiting.started;
+    if (change === 'namespace') a.shared.key = 'history-fixture:/replaced-during-export';
+    else if (change === 'machine') a.switchMachine('access:other-machine:22');
+    else if (change === 'session') a.connection.session = {};
+    else codex.session = {};
+    a.history.context(); waiting.release();
+    await assert.doesNotReject(exporting);
+    assert.equal(a.history.errors.has(thread.id), false);
+    assert.equal(a.state.catalog('history', thread.id), undefined);
+    assert.equal(a.state.sync.state.pending.some(op => op.kind === 'history' && op.id === thread.id), false);
+    assert.equal(a.state.sync.error, null);
+  });
 });
 
 test('a requested handoff waits for both native idle state and a fully uploaded history before releasing ownership', async t => {

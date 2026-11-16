@@ -207,7 +207,7 @@ async function main() {
     assert.equal(b.state.history.status().find(owner => owner.id === logicalId).owned, true);
     await b.state.history.verify(logicalId); await b.state.tick();
     assert.equal(b.state.catalog('history', logicalId).epoch, 2);
-    await a.state.history.read(logicalId);
+    await a.state.history.read(logicalId, { refresh: true });
     assert.notEqual(a.state.history.record(logicalId).nativeId, logicalId);
     const returned = await read(a.pool, logicalId);
     assert.deepEqual(returned.flatMap(turn => turn.items).map(item => [item.id, item.type]), originalTurns.flatMap(turn => turn.items).map(item => [item.id, item.type]));

@@ -75,7 +75,7 @@ async function main() {
     assert.equal(b.state.history.status().find(owner => owner.id === threadId).owned, true);
     await b.state.history.verify(threadId); await assert.rejects(a.state.history.verify(threadId), /Use this conversation|owned by another/);
     fs.appendFileSync(imported.path, encode([{ timestamp, ordinal: 3, type: 'event_msg', payload: { type: 'user_message', message: 'Receiver follow-up appended by the disposable fake agent' } }]));
-    b.state.history.observe(imported); await b.state.history.tick(); await a.state.history.read(threadId);
+    b.state.history.observe(imported); await b.state.history.tick(); await a.state.history.read(threadId, { refresh: true });
     const returned = a.native.get(threadId), returnedRows = decode(returned.path);
     assert.notEqual(returned.path, source); assert.notEqual(returned.path, imported.path);
     assert.match(fs.readFileSync(returned.path, 'utf8'), /Receiver follow-up appended by the disposable fake agent/);

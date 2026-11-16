@@ -332,9 +332,14 @@ app.whenReady().then(async () => {
     checkSender(event);
     if (!methods.has(method)) throw new Error('Unsupported agent operation.');
     if (!connection.ready) throw new Error('Connect to a coding agent first.');
+    const refreshHistory = method === 'thread/read' && params?.refreshSyncedHistory === true;
+    if (params && Object.hasOwn(params, 'refreshSyncedHistory')) {
+      if (method !== 'thread/read' || typeof params.refreshSyncedHistory !== 'boolean') throw new Error('Invalid history refresh request.');
+      params = { ...params }; delete params.refreshSyncedHistory;
+    }
     const rpcMachine = scheduleMachine(), rpcSession = connection.session, rpcSyncKey = shared.key;
     if (shared.enabled && params?.threadId) {
-      if (['thread/read', 'thread/turns/list', 'thread/items/read', 'thread/items/list', 'thread/fork'].includes(method)) await conversations.history.read(params.threadId);
+      if (['thread/read', 'thread/turns/list', 'thread/items/read', 'thread/items/list', 'thread/fork'].includes(method)) await conversations.history.read(params.threadId, { refresh: refreshHistory });
       if (['thread/resume', 'turn/steer', 'turn/interrupt', 'thread/revert', 'thread/archive', 'thread/name/set', 'thread/settings/update', 'thread/metadata/update'].includes(method)) await conversations.history.verify(params.threadId, method === 'turn/interrupt');
       if (connection.session !== rpcSession || scheduleMachine() !== rpcMachine || shared.key !== rpcSyncKey) throw new Error('Conversation connection changed. Try again.');
     }

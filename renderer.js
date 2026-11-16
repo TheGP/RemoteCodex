@@ -14,7 +14,7 @@ const drafts = { target: null, snapshot: null, images: [], suspended: false, res
 const editorDrafts = new Map();
 const timelineView = { following: true, reading: null };
 const pinnedMessages = { saving: false, jumping: null };
-const conversationSync = { paths: {}, pathsMachine: null, refreshing: false, again: false, ownership: new Map(), historyEnabled: false };
+const conversationSync = { paths: {}, pathsMachine: null, status: null, statusOptions: null, refreshing: false, again: false, ownership: new Map(), historyEnabled: false };
 const observedTurns = new Map();
 const pinIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 9V3H8v6l-3 3v2h14v-2l-3-3M12 14v7"/></svg>';
 for (let hours = 1; hours < 24; hours++) $('send-time').add(new Option(`${hours} hour${hours === 1 ? '' : 's'}`, String(hours)));
@@ -23,7 +23,7 @@ const threadDrag = { source: null, pending: new Set(), orderPending: new Set(), 
 const projectDrag = { source: null, pending: null, type: 'application/x-remote-codex-project' };
 const queueDrag = { source: null, type: 'application/x-remote-codex-queue' };
 const usage = { threads: new Map(), account: null, reading: null, generation: 0, updatedAt: 0, error: null, timer: null };
-const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), queues: new Map(), nativeQueues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Map(), newThreads: new Set(), titleTask: Promise.resolve(), titleRetries: new Map(), images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), failedPins: new Set(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
+const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), manualUnread: null, queues: new Map(), nativeQueues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Map(), newThreads: new Set(), titleTask: Promise.resolve(), titleRetries: new Map(), images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), failedPins: new Set(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
 const slash = { index: 0, matches: [], dismissed: null, skills: [], cwd: null, loading: false, generation: 0, skillOnly: false };
 const modes = { plan: false, catalog: [], threads: new Map() };
 const compacting = new Map();
@@ -447,7 +447,7 @@ function renderConversationAccess() {
   $('load-synced-history').hidden = !access?.updatesAvailable;
   $('load-synced-history').disabled = state.loading || state.sending || state.active.has(state.thread?.id);
 }
-$('load-synced-history').onclick = () => { if (state.thread && !state.loading && !state.sending && !state.active.has(state.thread.id)) return openThread(state.thread, true).then(refreshConversationSync).catch(showError); };
+$('load-synced-history').onclick = () => { if (state.thread && !state.loading && !state.sending && !state.active.has(state.thread.id)) return openThread(state.thread, true, true).then(refreshConversationSync).catch(showError); };
 $('take-conversation').onclick = async () => {
   if (!state.thread || conversationSync.requesting) return;
   const thread = state.thread, options = state.options;
@@ -479,6 +479,7 @@ async function stopTurn() {
   finally { if (state.interrupting === operation) state.interrupting = null; updateSendButton(); }
 }
 function updateBusy() {
+  renderConversationSyncNotice();
   for (const button of $('shortcut-buttons').children) button.disabled = shortcutUnavailable({ mode: button.dataset.mode });
   const compact = state.connected && compacting.has(state.thread?.id);
   const busy = compact || state.owned.has(state.thread?.id) && Boolean(state.active.get(state.thread?.id));
@@ -1001,11 +1002,18 @@ function setCompletion(threadId, status = null) {
     state.completions = next; return true;
   } catch (error) { showError(`Could not save conversation markers: ${error.message}`); return false; }
 }
+function isManuallyUnread(threadId) {
+  return Boolean(threadId && state.manualUnread?.key === queueKey(threadId) && state.manualUnread.selection === state.selection && state.unread.has(queueKey(threadId)));
+}
 function isViewingLatest(threadId) {
   const timeline = $('timeline');
-  return Boolean(threadId && state.thread?.id === threadId && !state.loading && !document.hidden && document.hasFocus() && !document.querySelector('dialog[open]') && timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 24);
+  return Boolean(threadId && state.thread?.id === threadId && !isManuallyUnread(threadId) && !state.loading && !document.hidden && document.hasFocus() && !document.querySelector('dialog[open]') && timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 24);
 }
-function acknowledgeVisibleThread() {
+function acknowledgeVisibleThread(event) {
+  if (isManuallyUnread(state.thread?.id)) {
+    if (state.loading || document.hidden || !document.hasFocus() || document.querySelector('dialog[open]') || ['scroll', 'close'].includes(event?.type)) return;
+    state.manualUnread = null;
+  }
   if (!isViewingLatest(state.thread?.id)) return;
   const key = queueKey(state.thread.id);
   const completed = state.completions.has(key);
@@ -1014,8 +1022,8 @@ function acknowledgeVisibleThread() {
   else if (completed) renderThreadIndicators();
 }
 function markUnread(thread) {
-  if (!thread?.id || state.loading && state.thread?.id === thread.id) return;
-  setUnread(thread.id, true);
+  if (!thread?.id) return;
+  if (setUnread(thread.id, true) && state.thread?.id === thread.id) state.manualUnread = { key: queueKey(thread.id), selection: state.selection };
   $('thread-menu').hidden = true;
 }
 function unreadShortcut(event) {
@@ -1023,7 +1031,7 @@ function unreadShortcut(event) {
   const focused = document.activeElement?.closest('#threads .thread');
   const typing = event.target?.closest?.('input,textarea,select,[contenteditable]');
   const plain = !event.metaKey && !event.ctrlKey && !typing && focused?.dataset.threadId === state.thread?.id;
-  if (!(modified || plain) || event.altKey || event.isComposing || event.key?.toLowerCase() !== 'u' || document.querySelector('dialog[open]') || !state.thread || state.loading) return;
+  if (!(modified || plain) || event.altKey || event.isComposing || event.key?.toLowerCase() !== 'u' || document.querySelector('dialog[open]') || !state.thread) return;
   event.preventDefault(); markUnread(state.thread);
 }
 function conversationArrow(event) {
@@ -1179,7 +1187,7 @@ function setThread(thread) {
   renderRequests();
   updateBusy();
 }
-async function openThread(thread, allowBusy = false) {
+async function openThread(thread, allowBusy = false, refreshHistory = false) {
   if (!state.connected || state.sending || state.commandBusy && !allowBusy) return;
   if (thread.needsFolder) {
     const project = projects.data.find(project => project.id === thread.projectId);
@@ -1201,7 +1209,7 @@ async function openThread(thread, allowBusy = false) {
     const shared = !isLocal() && state.options?.sharedServer && threadProvider(thread) === 'codex';
     let result;
     try {
-      result = await rpc(shared ? 'thread/resume' : 'thread/read', { threadId: thread.id, ...(shared ? { excludeTurns: true } : { includeTurns: false }) });
+      result = await rpc(shared ? 'thread/resume' : 'thread/read', { threadId: thread.id, ...(shared ? { excludeTurns: true } : { includeTurns: false, ...(refreshHistory ? { refreshSyncedHistory: true } : {}) }) });
       if (shared && selection === state.selection) { state.owned.add(thread.id); state.writerConflicts.delete(queueKey(thread.id)); }
     } catch (error) {
       if (!shared || !isWriterConflict(error)) throw error;
@@ -1235,7 +1243,7 @@ async function openThread(thread, allowBusy = false) {
     await Promise.allSettled([...$('messages').querySelectorAll('img')].map(image => image.decode()));
     if (selection !== state.selection) return;
     scrollToBottom(true);
-    setUnread(thread.id, false);
+    if (!isManuallyUnread(thread.id)) setUnread(thread.id, false);
     setCompletion(thread.id); renderThreadIndicators();
   } finally {
     if (selection === state.selection) { state.loading = false; state.historyEvents = null; updateBusy(); flushQueue(thread.id).catch(showError); }
@@ -1874,6 +1882,36 @@ function policy() {
   if (!['read-only', 'workspace-write', 'danger-full-access'].includes(sandbox)) throw new Error('Choose a valid access mode.');
   return { approvalPolicy: sandbox === 'danger-full-access' ? 'never' : 'on-request', sandbox };
 }
+function renderConversationSyncNotice() {
+  const notice = $('conversation-sync-notice');
+  const sync = conversationSync.status;
+  if (!sync || conversationSync.statusOptions !== state.options) { notice.hidden = true; return; }
+  const historyError = sync.historyErrors?.find(failure => failure.id === state.thread?.id);
+  const message = sync.error ? 'Sync: ' + sync.error : historyError ? 'This conversation’s history could not sync: ' + historyError.message : null;
+  const conflict = sync.conflicts[0];
+  notice.hidden = !message && !conflict;
+  const signature = JSON.stringify([message, sync.conflicts]);
+  if (notice.dataset.signature !== signature) {
+    notice.dataset.signature = signature; notice.replaceChildren();
+    if (message) { const error = document.createElement('span'); error.textContent = message; notice.append(error); }
+    if (conflict) {
+      const details = document.createElement('details'), summary = document.createElement('summary'), preview = document.createElement('pre');
+      summary.textContent = conflict.kind === 'history' ? 'Conversation history changed on both computers' : conflict.kind === 'shortcuts' ? 'Shortcuts changed on both computers' : 'Draft changed on both computers';
+      preview.textContent = `This computer:\n${conflict.local || '(empty)'}\n\nOther computer:\n${conflict.remote || '(empty)'}`;
+      details.append(summary, preview); notice.append(details);
+      for (const [label, choice] of [['Keep this version', 'local'], ['Use other version', 'remote']]) {
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'subtle'; button.textContent = label;
+        button.onclick = async () => {
+          button.disabled = true;
+          try { await api.resolveSyncConflict(conflict.key, choice, conflict.version); await refreshConversationSync(); }
+          catch (error) { showError(error); await refreshConversationSync(); }
+          finally { button.disabled = false; }
+        };
+        notice.append(button);
+      }
+    }
+  }
+}
 async function refreshConversationSync() {
   if (!api.conversationSync || !state.options) return;
   if (conversationSync.refreshing) { conversationSync.again = true; return; }
@@ -1891,7 +1929,7 @@ async function refreshConversationSync() {
       conversationSync.historyEnabled = Boolean(sync.historyEnabled);
       conversationSync.ownership = new Map((sync.ownership || []).map(access => [access.id, access]));
       const access = conversationAccess();
-      if (previousAccess?.waiting && access?.owned && !access.requested && !state.loading && !state.sending && !state.active.has(state.thread?.id)) await openThread(state.thread, true);
+      if (previousAccess?.waiting && access?.owned && !access.requested && !state.loading && !state.sending && !state.active.has(state.thread?.id)) await openThread(state.thread, true, true);
       updateSendButton(); updateMessageEdits();
       refreshEditorDrafts(editors);
       preferences.conversationStates = saved.conversationStates || {};
@@ -1902,30 +1940,7 @@ async function refreshConversationSync() {
       for (const id of state.pinnedThreads.keys()) if (!state.pinnedIds.has(id)) state.pinnedThreads.delete(id);
       for (const thread of state.threads) if (state.pinnedIds.has(thread.id)) state.pinnedThreads.set(thread.id, thread);
       drafts.pending.clear(); renderThreads(); renderMessagePins(); renderShortcuts();
-      const notice = $('conversation-sync-notice');
-      const conflict = sync.conflicts[0];
-      notice.hidden = !sync.error && !conflict;
-      const signature = JSON.stringify([sync.error, sync.conflicts]);
-      if (notice.dataset.signature !== signature) {
-        notice.dataset.signature = signature; notice.replaceChildren();
-        if (sync.error) { const error = document.createElement('span'); error.textContent = 'Sync: ' + sync.error; notice.append(error); }
-        if (conflict) {
-          const details = document.createElement('details'), summary = document.createElement('summary'), preview = document.createElement('pre');
-          summary.textContent = conflict.kind === 'history' ? 'Conversation history changed on both computers' : conflict.kind === 'shortcuts' ? 'Shortcuts changed on both computers' : 'Draft changed on both computers';
-          preview.textContent = `This computer:\n${conflict.local || '(empty)'}\n\nOther computer:\n${conflict.remote || '(empty)'}`;
-          details.append(summary, preview); notice.append(details);
-          for (const [label, choice] of [['Keep this version', 'local'], ['Use other version', 'remote']]) {
-            const button = document.createElement('button'); button.type = 'button'; button.className = 'subtle'; button.textContent = label;
-            button.onclick = async () => {
-              button.disabled = true;
-              try { await api.resolveSyncConflict(conflict.key, choice, conflict.version); await refreshConversationSync(); }
-              catch (error) { showError(error); await refreshConversationSync(); }
-              finally { button.disabled = false; }
-            };
-            notice.append(button);
-          }
-        }
-      }
+      conversationSync.status = sync; conversationSync.statusOptions = options; renderConversationSyncNotice();
       if (!state.loading && !state.sending && !drafts.suspended && target && target === drafts.target && snapshot === drafts.snapshot) {
         const value = api.draft(target);
         if ((value?.text || '') !== $('prompt').value || JSON.stringify(value?.images || []) !== JSON.stringify(state.images)) {
@@ -2480,7 +2495,7 @@ function showThreadMenu(thread, x, y) {
   state.contextThread = thread;
   const menu = $('thread-menu'); menu.hidden = false;
   $('clone-conversation').disabled = !supports('thread/fork', threadProvider(thread)) || !state.connected || state.sending || state.commandBusy || state.loading;
-  $('mark-unread').disabled = state.unread.has(queueKey(thread.id)) || state.loading && state.thread?.id === thread.id;
+  $('mark-unread').disabled = state.unread.has(queueKey(thread.id));
   $('archive-conversation').disabled = !canArchiveConversation(thread);
   $('archive-conversation').title = state.active.has(thread.id) || thread.status?.type === 'active' ? 'Stop the running task before archiving' : state.queues.get(queueKey(thread.id))?.messages.length ? 'Send or remove queued messages before archiving' : scheduledFor(thread.id).some(task => task.status === 'pending') ? 'Cancel scheduled messages before archiving' : '';
   menu.style.left = Math.max(0, Math.min(x, innerWidth - menu.offsetWidth)) + 'px';
@@ -3510,6 +3525,8 @@ for (const event of ['online', 'offline']) globalThis.addEventListener(event, ()
 document.addEventListener('close', acknowledgeVisibleThread, true);
 $('timeline').addEventListener('scroll', acknowledgeVisibleThread);
 $('timeline').addEventListener('pointerdown', acknowledgeVisibleThread);
+$('timeline').addEventListener('wheel', acknowledgeVisibleThread, { passive: true });
+$('timeline').addEventListener('keydown', event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) acknowledgeVisibleThread(event); });
 function readTimelineDiff(event) {
   const entry = event.target.closest?.('.changed-file-entry[open]');
   if (entry) setTimelineFollowing(false, entry);

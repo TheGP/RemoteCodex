@@ -6,14 +6,14 @@ const { exportCodexHistory, importCodexHistory } = require('./codex-history.cjs'
 const { stateKey, hash } = require('./sync-state.cjs');
 
 class HistoryManager {
-  constructor(state) { this.state = state; this.queue = new Map(); this.owners = new Map(); this.importing = new Map(); this.starting = new Set(); this.completionThreads = new Map(); this.runs = new Map(); this.completedTurns = new Map(); }
+  constructor(state) { this.state = state; this.queue = new Map(); this.owners = new Map(); this.importing = new Map(); this.starting = new Set(); this.completionThreads = new Map(); this.runs = new Map(); this.completedTurns = new Map(); this.errors = new Map(); }
   get enabled() { return this.state.shared.enabled && this.state.connection.ready && (!this.state.connection.describe || this.state.connection.describe('codex').connected) && this.state.options().mode === 'local' && this.state.connection.supports('thread/list', 'codex'); }
   get home() { return path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex')); }
   get nativeSession() { return this.state.connection.connections?.get('codex')?.session || this.state.connection.session; }
   context() {
     const { sync, shared } = this.state; sync.load();
     const key = JSON.stringify([shared.key, this.state.machine()]);
-    if (this.key !== key) { this.key = key; this.owners.clear(); this.queue.clear(); this.cursor = null; this.scanned = false; }
+    if (this.key !== key) { this.key = key; this.owners.clear(); this.queue.clear(); this.errors.clear(); this.cursor = null; this.scanned = false; }
     sync.state.localHistory ||= {};
     if (this.aliasSession !== this.state.connection.session || this.aliasNativeSession !== this.nativeSession || this.aliasKey !== key) {
       this.starting.clear(); this.runs.clear(); this.completionThreads.clear(); this.completedTurns.clear();
@@ -28,7 +28,13 @@ class HistoryManager {
   manifest(id) { return this.state.catalog('history', id); }
   observe(thread) {
     if (!this.enabled || !thread?.id || thread.remoteOnly || thread.provider && thread.provider !== 'codex' || thread.id.startsWith('agent:') || thread.ephemeral) return;
-    this.context(); this.queue.set(thread.id, thread);
+    this.context();
+    const failure = this.errors.get(thread.id);
+    if (failure && failure.retryAt > Date.now()) {
+      if ((!thread.path || thread.path === failure.path) && this.stamp(failure.path) === failure.stamp) return;
+      failure.retryAt = 0;
+    }
+    this.queue.set(thread.id, thread);
   }
   stamp(file) {
     if (typeof file !== 'string' || !file) return null;
@@ -57,6 +63,20 @@ class HistoryManager {
     await this.ownership(id, 'history-request'); await this.state.sync.tick();
     this.state.changed(); return this.status();
   }
+  hasPendingHistory(id, epoch) {
+    const record = this.record(id), { sync } = this.state;
+    if (!record?.digest) return false;
+    const key = stateKey('history', this.state.machine(), id), entry = sync.state.entries[key];
+    if (sync.state.conflicts[key]) return false;
+    let op = sync.state.pending.findLast(op => op.key === key && op.value?.digest === record.digest && op.value.epoch === epoch);
+    const seen = new Set();
+    while (op && op.key === key && op.value?.epoch === epoch && !seen.has(op.opId)) {
+      if (entry?.value?.digest === op.value.digest && entry.value.epoch === epoch) return true;
+      if (!op.parent) return Number.isSafeInteger(op.base) && op.base === (entry?.revision || 0);
+      seen.add(op.opId); op = sync.state.pending.find(parent => parent.opId === op.parent);
+    }
+    return false;
+  }
   async verify(id, stop = false) {
     if (!this.enabled || id.startsWith('agent:')) return;
     if (this.importing.has(id)) await this.importing.get(id);
@@ -65,7 +85,7 @@ class HistoryManager {
     await this.state.shared.bridge.call('history-verify', { machine: context.machine, id, epoch: owner.epoch });
     if (!this.current(context)) throw new Error('Conversation sync connection changed.');
     const manifest = this.manifest(id), record = this.record(id);
-    if (manifest && manifest.digest !== record?.digest) throw new Error('Open this conversation to load its synced history before sending messages.');
+    if (manifest && manifest.digest !== record?.digest && !(owner.owner === this.state.shared.state.device && this.hasPendingHistory(id, owner.epoch))) throw new Error('Open this conversation to load its synced history before sending messages.');
     if (this.state.sync.state.conflicts[stateKey('history', context.machine, id)]) throw new Error('Resolve this conversation’s history conflict before sending messages.');
   }
   async begin(id) {
@@ -126,7 +146,8 @@ class HistoryManager {
   canRun(id) {
     if (!this.enabled || id.startsWith('agent:')) return true;
     const owner = this.owners.get(id), record = this.record(id), manifest = this.manifest(id);
-    return Boolean(owner?.owner === this.state.shared.state.device && !owner.requested && (!manifest || manifest.digest === record?.digest));
+    if (this.state.sync.state.conflicts[stateKey('history', this.state.machine(), id)]) return false;
+    return Boolean(owner?.owner === this.state.shared.state.device && !owner.requested && (!manifest || manifest.digest === record?.digest || this.hasPendingHistory(id, owner.epoch)));
   }
   async export(thread, owner) {
     const context = this.context(), { connection, sync, shared } = this.state;
@@ -135,13 +156,24 @@ class HistoryManager {
     if (native.status?.type === 'active' || native.ephemeral || !native.path) { this.queue.set(thread.id, native); return; }
     const stamp = this.stamp(native.path), previous = this.record(thread.id);
     if (stamp && stamp === previous?.stamp && this.manifest(thread.id)?.epoch === owner.epoch) return;
-    const value = await exportCodexHistory({ thread: { ...native, id: previous?.nativeId || native.id }, logicalId: thread.id, home: this.home, attachmentRoots: [path.join(sync.directory, 'histories', hash(context.key), 'attachments')], keepBlob: data => sync.keepBlob(data) });
+    let value;
+    try { value = await exportCodexHistory({ thread: { ...native, id: previous?.nativeId || native.id }, logicalId: thread.id, home: this.home, attachmentRoots: [path.join(sync.directory, 'histories', hash(context.key), 'attachments')], keepBlob: data => sync.keepBlob(data) }); }
+    catch (error) {
+      if (this.current(context)) {
+        const failure = this.errors.get(thread.id);
+        this.errors.set(thread.id, { message: error.message, path: native.path, stamp, retryAt: Date.now() + 60000 });
+        this.state.sync.log('conversation.history.failed', { threadId: thread.id, error: error.message });
+        if (failure?.message !== error.message) this.state.changed();
+      }
+      return false;
+    }
     if (!this.current(context)) return;
+    if (this.errors.delete(thread.id)) this.state.changed();
     const entry = sync.state.entries[stateKey('history', context.machine, thread.id)];
     sync.state.localHistory[thread.id] = { ...previous, path: native.path, stamp, digest: value.digest, revision: previous?.revision || 0 };
     sync.capture('history', context.machine, thread.id, { ...value, epoch: owner.epoch });
     const pending = sync.state.pending.findLast(op => op.key === stateKey('history', context.machine, thread.id));
-    if (pending && previous && entry?.value?.digest !== previous.digest) { pending.base = previous.revision || 0; sync.savePending(); }
+    if (pending && !pending.parent && previous && entry?.value?.digest !== previous.digest) { pending.base = previous.revision || 0; sync.savePending(); }
     sync.save();
   }
   async tick() {
@@ -150,6 +182,7 @@ class HistoryManager {
     const context = this.context(); let progress = 0;
     try {
       await this.refresh();
+      for (const [id, failure] of this.errors) if (failure.retryAt <= Date.now() || this.stamp(failure.path) !== failure.stamp) this.queue.set(id, { id });
       for (const owner of this.owners.values()) if (owner.owner === this.state.shared.state.device) {
         const local = this.record(owner.id);
         if (local && (this.manifest(owner.id)?.epoch !== owner.epoch || this.stamp(local.path) !== local.stamp)) this.queue.set(owner.id, { id: owner.id });
@@ -161,7 +194,8 @@ class HistoryManager {
         for (const thread of page.data) this.state.captureThread(thread);
         this.cursor = page.nextCursor; this.scanned = !this.cursor;
       }
-      for (const [id, thread] of [...this.queue].slice(0, 5)) {
+      const ready = [...this.queue].filter(([id]) => { const failure = this.errors.get(id); return !failure || failure.retryAt <= Date.now() || this.stamp(failure.path) !== failure.stamp; });
+      for (const [id, thread] of ready.slice(0, 5)) {
         if (!this.current(context)) return;
         this.queue.delete(id);
         const owner = this.owners.get(id) || await this.ownership(id);
@@ -178,7 +212,7 @@ class HistoryManager {
           await this.end(id, { ...context, epoch: owner.epoch, runToken: owner.run_token });
           if (!this.current(context)) return;
         }
-        await this.export(thread, owner);
+        if (await this.export(thread, owner) === false) { progress++; continue; }
         if (!this.current(context)) return;
         if (!this.queue.has(id)) progress++;
         await this.state.sync.tick();
@@ -209,10 +243,26 @@ class HistoryManager {
       }
     }
   }
-  async read(id) {
+  async read(id, { refresh = false } = {}) {
     if (!this.enabled || id.startsWith('agent:')) return;
-    if (this.importing.has(id)) return this.importing.get(id);
-    const operation = this.import(id).finally(() => { if (this.importing.get(id) === operation) this.importing.delete(id); });
+    const record = this.record(id);
+    if (!refresh && record?.path && this.stamp(record.path) !== null) return;
+    if (this.importing.has(id)) {
+      const pending = this.importing.get(id);
+      if (!refresh) return pending;
+      await pending; return this.read(id, { refresh: true });
+    }
+    const context = this.context();
+    const operation = (async () => {
+      if (!refresh) {
+        let native;
+        try { native = (await this.state.connection.call('thread/read', { threadId: id, includeTurns: false })).thread; }
+        catch (error) { if (!/not found|does not exist|no such|unknown thread|no rollout|thread not loaded/i.test(error.message)) throw error; }
+        if (!this.current(context)) throw new Error('Conversation sync connection changed.');
+        if (native?.path && this.stamp(native.path) !== null) return;
+      }
+      return this.import(id);
+    })().finally(() => { if (this.importing.get(id) === operation) this.importing.delete(id); });
     this.importing.set(id, operation); return operation;
   }
   async import(id) {
@@ -266,12 +316,13 @@ class HistoryManager {
     if (result.thread.id !== imported.id) throw new Error('Imported conversation identity does not match.');
     if (native) await connection.call('thread/unsubscribe', { threadId: id });
     sync.state.localHistory[id] = { ...previous, nativeId: imported.id, retiredNativeIds: [...new Set([...previous?.retiredNativeIds || [], previous?.nativeId || id])], path: result.thread.path || imported.path, stamp: this.stamp(result.thread.path || imported.path), digest: manifest.digest, revision: sync.state.entries[stateKey('history', context.machine, id)].revision, ...(typeof goalsEnabled === 'boolean' ? { goalsEnabled } : {}), ...(native?.path ? { previousPath: native.path } : {}) };
+    this.errors.delete(id);
     sync.save(); connection.setThreadAliases?.(sync.state.localHistory); this.state.changed();
   }
   status() {
     if (!this.enabled) return [];
     this.context();
-    return [...this.owners.values()].map(owner => ({ id: owner.id, name: owner.name, owned: owner.owner === this.state.shared.state.device, requested: Boolean(owner.requested), waiting: owner.requested === this.state.shared.state.device, busy: Boolean(owner.busy), updatesAvailable: Boolean(this.manifest(owner.id) && this.manifest(owner.id).digest !== this.record(owner.id)?.digest) }));
+    return [...this.owners.values()].map(owner => ({ id: owner.id, name: owner.name, owned: owner.owner === this.state.shared.state.device, requested: Boolean(owner.requested), waiting: owner.requested === this.state.shared.state.device, busy: Boolean(owner.busy), updatesAvailable: Boolean(this.manifest(owner.id) && this.manifest(owner.id).digest !== this.record(owner.id)?.digest && !(owner.owner === this.state.shared.state.device && this.hasPendingHistory(owner.id, owner.epoch))) }));
   }
   decorate(thread) {
     if (!this.enabled || !this.record(thread.id)) return thread;

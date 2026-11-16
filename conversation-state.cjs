@@ -268,7 +268,9 @@ class ConversationState {
     const conflicts = this.shared.enabled ? this.sync.conflicts().map(({ key, remote, local, version }) => ({ key, version, kind: JSON.parse(key)[0], local: local?.text ?? JSON.stringify(local, null, 2), remote: remote?.value?.text ?? JSON.stringify(remote?.value, null, 2) })) : [];
     const catalog = this.shared.enabled ? JSON.stringify(Object.values(this.sync.state.entries).filter(entry => ['project', 'thread'].includes(entry.kind)).map(entry => entry.revision)) : '';
     const paths = this.shared.enabled ? Object.fromEntries(Object.entries(this.sync.state.bindings).filter(([key]) => JSON.parse(key)[0] === this.machine()).map(([, binding]) => [binding.nativeId, this.projectPaths(binding.id)])) : {};
-    return { paths, enabled: this.shared.enabled, error: this.sync.error, conflicts, catalog, historyEnabled: this.history.enabled, ownership: this.history.status() };
+    const ownership = this.history.status();
+    const historyErrors = this.history.enabled ? [...this.history.errors].map(([id, failure]) => ({ id, message: failure.message })) : [];
+    return { historyErrors, paths, enabled: this.shared.enabled, error: this.sync.error, conflicts, catalog, historyEnabled: this.history.enabled, ownership };
   }
 }
 module.exports = { ConversationState };

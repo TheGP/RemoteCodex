@@ -1879,6 +1879,49 @@ async function checks() {
   check(document.activeElement === $('search'), 'Finishing a history load stole focus after the user moved to search');
   api.rpc = sidebarRpc;
   results.push('plain U marks the clicked sidebar conversation unread across list refreshes, preserves typing and editor keys, and never steals focus after asynchronous reads');
+  {
+    const previousRpc = api.rpc, focusDescriptor = Object.getOwnPropertyDescriptor(document, 'hasFocus'), hiddenDescriptor = Object.getOwnPropertyDescriptor(document, 'hidden');
+    Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => true });
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+    try {
+      for (const pendingMethod of ['thread/read', 'thread/turns/list']) {
+        setUnread(unreadB.id, false);
+        let finishLoad, released = false;
+        api.rpc = (method) => {
+          const result = method === 'thread/read' ? { thread: unreadB } : { data: [], nextCursor: null };
+          return method === pendingMethod && !released ? new Promise(resolve => { finishLoad = () => { released = true; resolve(result); }; }) : Promise.resolve(result);
+        };
+        const loading = openThread(unreadB); await settle();
+        check(state.loading && Boolean(finishLoad), 'The unread regression did not hold conversation loading');
+        showThreadMenu(unreadB, 100, 100); check(!$('mark-unread').disabled, 'Right-click unread was disabled for a loading conversation'); $('thread-menu').hidden = true;
+        unreadRow(unreadB.id).focus();
+        const key = pendingMethod === 'thread/read' ? unreadKey({ ctrlKey: true }) : plainUnread();
+        document.activeElement.dispatchEvent(key);
+        check(key.defaultPrevented && state.unread.has(queueKey(unreadB.id)) && savedPreferences.conversationStates[accessKey()].unread.includes(unreadB.id), 'Unread during loading was ignored or not persisted immediately');
+        finishLoad(); await loading; await settle();
+        $('timeline').dispatchEvent(new Event('scroll'));
+        check(state.unread.has(queueKey(unreadB.id)) && savedPreferences.conversationStates[accessKey()].unread.includes(unreadB.id), 'Finishing the history load or its automatic scroll erased the manual unread mark');
+        handleNotification({ method: 'turn/completed', params: { threadId: unreadB.id, turn: { id: 'manual-unread-during-' + pendingMethod, status: 'completed' } } }); await settle();
+        check(state.unread.has(queueKey(unreadB.id)), 'A completion event erased unread marked during loading');
+        scrollToBottom(true); $('timeline').dispatchEvent(new Event('pointerdown'));
+        check(!state.unread.has(queueKey(unreadB.id)), 'Reading the loaded conversation could not clear its manual unread mark');
+        markUnread(unreadB); await openThread(unreadB);
+        check(!state.unread.has(queueKey(unreadB.id)), 'Reopening the conversation kept an old loading-selection unread guard');
+      }
+      let rejectRead;
+      api.rpc = () => new Promise((_resolve, reject) => { rejectRead = reject; });
+      const failed = openThread(unreadB).catch(error => error); unreadRow(unreadB.id).focus();
+      document.activeElement.dispatchEvent(plainUnread()); rejectRead(new Error('Delayed history failure'));
+      check((await failed).message === 'Delayed history failure' && state.unread.has(queueKey(unreadB.id)), 'A failed load lost the unread mark set while it was pending');
+    } finally {
+      api.rpc = previousRpc;
+      if (focusDescriptor) Object.defineProperty(document, 'hasFocus', focusDescriptor); else delete document.hasFocus;
+      if (hiddenDescriptor) Object.defineProperty(document, 'hidden', hiddenDescriptor); else delete document.hidden;
+      setUnread(unreadB.id, false);
+    }
+    results.push('U and right-click unread work before metadata or turns finish loading, persist immediately, survive completion/automatic scroll/load failures, and clear on real reading or reopening');
+  }
+
 
   state.options = { mode: 'ssh', host: 'other-unread-machine', port: 22 }; const otherUnreadStorage = accessKey() + ':unread'; localStorage.removeItem(otherUnreadStorage);
   restoreUnread(); renderThreadIndicators(); check(!unreadRow(unreadA.id).classList.contains('unread'), 'Unread marker crossed machines');
@@ -1896,7 +1939,8 @@ async function checks() {
   state.active.delete(unreadA.id); renderThreadIndicators();
   check(unreadRow(unreadA.id).querySelector('.thread-state.unread'), 'Unread dot was lost when work stopped');
   setUnread(unreadA.id, false); state.loading = true; markUnread(unreadA); state.loading = false;
-  check(!state.unread.has(queueKey(unreadA.id)), 'Unread was marked during an unfinished read of the selected chat');
+  check(state.unread.has(queueKey(unreadA.id)), 'The selected loading conversation could not be marked unread');
+  setUnread(unreadA.id, false);
   const writeMarkers = api.saveConversationState;
   try {
     api.saveConversationState = () => { throw new Error('Storage full'); };
@@ -3893,6 +3937,37 @@ async function checks() {
   }
   results.push('conversation metadata sync preserves running chats and focused typing, applies clean remote drafts, protects concurrent edits, offers explicit conflict choices, and maps ghost projects only to chosen local folders');
   {
+    const previousOptions = state.options, previousSync = { ...conversationSync };
+    const methods = ['conversationSync', 'preferences', 'pins', 'draft', 'saveDraft'];
+    const previousApi = Object.fromEntries(methods.map(method => [method, api[method]]));
+    api.saveDraft = undefined; resetThread();
+    const healthy = { id: 'sync-healthy-chat', cwd: '/work/project' }, broken = { id: 'sync-broken-chat', cwd: '/work/project' };
+    state.options = { mode: 'local' }; state.connected = true; state.threads = [healthy, broken];
+    const sync = { enabled: true, conflicts: [], error: null, catalog: conversationSync.catalog, paths: {}, historyErrors: [{ id: broken.id, message: 'A linked conversation history file is missing or ambiguous.' }] };
+    api.conversationSync = async () => structuredClone(sync);
+    api.preferences = async () => ({ conversationStates: {}, messagePins: {}, shortcuts: [] }); api.pins = async () => [];
+    api.draft = () => ({ text: $('prompt').value, images: [] });
+    setThread(healthy); state.active.set(healthy.id, 'sync-healthy-turn');
+    $('prompt').value = 'Keep my running chat draft'; $('prompt').focus(); $('prompt').setSelectionRange(2, 6);
+    await refreshConversationSync();
+    check($('conversation-sync-notice').hidden && state.active.get(healthy.id) === 'sync-healthy-turn' && $('prompt').value === 'Keep my running chat draft' && document.activeElement === $('prompt') && $('prompt').selectionStart === 2, 'Another chat’s history error affected a healthy running chat or its draft');
+    setThread(broken);
+    check(!$('conversation-sync-notice').hidden && $('conversation-sync-notice').textContent.includes('This conversation’s history could not sync'), 'The affected conversation did not show its own history warning');
+    setThread(healthy); check($('conversation-sync-notice').hidden, 'A history warning leaked when switching chats without another sync request');
+    sync.error = 'Storage is offline'; await refreshConversationSync();
+    check(!$('conversation-sync-notice').hidden && $('conversation-sync-notice').textContent.includes('Storage is offline'), 'A real server connection error was incorrectly hidden');
+    sync.error = null; await refreshConversationSync(); check($('conversation-sync-notice').hidden, 'A recovered server left its global warning visible');
+    setThread(broken); sync.historyErrors = []; await refreshConversationSync();
+    check($('conversation-sync-notice').hidden, 'Repairing the affected conversation left a stale history warning');
+    sync.historyErrors = [{ id: broken.id, message: 'Missing segment' }]; await refreshConversationSync();
+    state.options = { mode: 'ssh', host: 'another-machine' }; updateBusy();
+    check($('conversation-sync-notice').hidden, 'A previous connection’s history warning leaked into another connection');
+    state.active.delete(healthy.id); state.options = previousOptions; Object.assign(conversationSync, previousSync); resetThread();
+    for (const method of methods) api[method] = previousApi[method];
+    results.push('history sync failures show only in the affected chat, preserve healthy running chats and focused drafts, recover cleanly, and keep real connection errors visible');
+  }
+
+  {
     const methods = ['preferences', 'pins', 'conversationSync', 'draft', 'saveDraft', 'clearDraft', 'hasDraft', 'editLock', 'scheduledTask', 'rpc'];
     const previousApi = Object.fromEntries(methods.map(method => [method, api[method]]));
     const before = { options: state.options, connected: state.connected, threads: state.threads, active: new Map(state.active), queues: new Map(state.queues), pinnedIds: new Set(state.pinnedIds), pinnedThreads: new Map(state.pinnedThreads), unread: new Set(state.unread), completions: new Map(state.completions), drafts: { ...drafts, pending: new Map(drafts.pending) }, sync: { ...conversationSync, catalog: conversationSync.catalog }, preferences: { conversationStates: preferences.conversationStates, messagePins: preferences.messagePins, shortcuts: preferences.shortcuts }, projects: projects.data, agent: agents.current };
@@ -4035,6 +4110,7 @@ async function checks() {
     sync.ownership = [{ ...foreign, owned: true, requested: false, waiting: false, busy: false }]; holdHistory = true;
     const handingOff = refreshConversationSync(); await settle();
     check(Boolean(releaseHistory) && state.loading && $('send').disabled && $('prompt').value === draft && calls.filter(call => call.method === 'thread/read').length === 1 && calls.filter(call => call.method === 'thread/turns/list').length === 1 && state.active.get('ownership-other-chat') === 'keep-running-other-turn', 'Ownership handoff enabled sending before reopening final synced history, repeated the history read, or disturbed drafts/other active chats: ' + JSON.stringify({ started: Boolean(releaseHistory), loading: state.loading, disabled: $('send').disabled, draftKept: $('prompt').value === draft, calls: calls.map(call => call.method) }));
+    check(calls.find(call => call.method === 'thread/read').params.refreshSyncedHistory === true && !Object.hasOwn(calls.find(call => call.method === 'thread/turns/list').params, 'refreshSyncedHistory'), 'Ownership handoff did not explicitly refresh history or leaked its refresh flag into pagination');
     holdHistory = false; releaseHistory(); await handingOff; question = state.items.get('ownership-question');
     check(!conversationReadOnly() && $('conversation-ownership').hidden && !$('send').disabled && !question.label.querySelector('.edit-message').disabled && $('prompt').value === draft && intact(), 'Completed ownership handoff failed to enable send/edit or changed the typed draft');
     check(state.items.get('ownership-final-reply')?.body.textContent.includes('Final peer reply after ownership handoff'), 'Ownership handoff left the old read-only snapshot visible instead of the final peer reply');
@@ -4046,6 +4122,9 @@ async function checks() {
     check(!$('conversation-ownership').hidden && !$('load-synced-history').hidden && !$('load-synced-history').disabled && calls.length === beforeManualReads && state.items.get('ownership-final-reply') === displayedReply && !timelineView.following && timelineView.reading === displayedReply.element && $('prompt').value === draft && intact(), 'Incoming remote history silently reloaded a reader’s view instead of offering explicit loading');
     await $('load-synced-history').onclick();
     check(calls.length === beforeManualReads + 2 && calls.at(-2).method === 'thread/read' && calls.at(-1).method === 'thread/turns/list' && state.items.get('ownership-final-reply')?.body.textContent.includes(latestReply) && $('prompt').value === draft && conversationReadOnly() && $('send').disabled && intact(), 'Explicit history loading failed to refresh the viewed snapshot, made it writable, sent a message, or disrupted drafts/other work');
+    check(calls.at(-2).params.refreshSyncedHistory === true, 'Load latest messages used the cached local history path');
+    const beforeLocalOpen = calls.length; await openThread(thread);
+    check(calls.length === beforeLocalOpen + 2 && !Object.hasOwn(calls[beforeLocalOpen].params, 'refreshSyncedHistory'), 'Opening a local conversation unnecessarily forced a sync refresh');
     sync.ownership = [{ ...foreign, owned: true, requested: true, waiting: false, busy: true }]; state.active.set(thread.id, 'ownership-running-turn');
     $('prompt').value = ''; $('prompt').dispatchEvent(new Event('input', { bubbles: true })); await notify();
     check(conversationReadOnly() && !$('conversation-ownership').hidden && $('conversation-owner').textContent.includes('Transfer requested') && $('take-conversation').hidden && $('send').textContent === '■' && !$('send').disabled, 'An owned source with a requested transfer lost its Stop action or failed to explain the pending handoff');
