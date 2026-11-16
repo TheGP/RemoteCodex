@@ -7,6 +7,7 @@ function draftRequest(operation, target, patch, expected) {
 contextBridge.exposeInMainWorld('agent', {
   settings: () => ipcRenderer.invoke('settings'),
   providers: () => ipcRenderer.invoke('providers'),
+  copyText: text => ipcRenderer.invoke('copy-text', text),
   readImage: (file, context) => ipcRenderer.invoke('read-image', file, context),
   openLink: (href, context) => ipcRenderer.invoke('open-link', href, context),
   linkMenu: (href, context) => ipcRenderer.invoke('link-menu', href, context),
@@ -31,6 +32,7 @@ contextBridge.exposeInMainWorld('agent', {
   syncSchedules: () => ipcRenderer.invoke('sync-schedules'),
   conversationSync: () => ipcRenderer.invoke('conversation-sync'),
   requestConversation: id => ipcRenderer.invoke('request-conversation', id),
+  retryHistorySync: id => ipcRenderer.invoke('retry-history-sync', id),
   resolveSyncConflict: (key, choice, version) => ipcRenderer.invoke('resolve-sync-conflict', key, choice, version),
   mapSyncProject: (id, root) => ipcRenderer.invoke('map-sync-project', id, root),
   scheduledTask: (id, token) => ipcRenderer.invoke('scheduled-task', id, token),

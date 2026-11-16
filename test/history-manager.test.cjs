@@ -153,7 +153,7 @@ test('a newer trusted history import uses the current local workspace and safe r
   assert.equal(metadata.id, source.id); assert.equal(metadata.cwd, b.root); assert.deepEqual(metadata.runtime_workspace_roots, [b.root]);
   [source.path, local.path].forEach((file, index) => assert.deepEqual(fs.readFileSync(file), originals[index]));
   assert.equal(b.history.record(source.id).previousPath, local.path); assert.equal(b.history.record(source.id).digest, a.state.catalog('history', source.id).digest);
-  assert.equal(b.calls.filter(call => call.method === 'thread/unsubscribe').length, 1); assert.equal(b.calls.some(call => call.method === 'turn/start'), false);
+  assert.equal(b.calls.filter(call => call.method === 'thread/unsubscribe').length, 0, 'raw same-ID import must keep the newly resumed view subscribed'); assert.equal(b.calls.some(call => call.method === 'turn/start'), false);
 });
 
 test('a first import cannot replace existing native history without a trusted digest or change its aliases', async t => {
@@ -369,7 +369,7 @@ test('cached and uncached local conversations open without waiting for another c
   } finally { waiting.release(); await upload; }
 });
 
-test('pending current-epoch local history opens and verifies without uploading, while stale epochs and foreign ownership stay blocked', async t => {
+test('owning local history remains writable without uploading even when a pending upload has a stale epoch', async t => {
   const f = fixture(t), { a, b } = f, thread = f.create(a);
   await a.history.tick(); await b.state.sync.tick();
   const previousDigest = a.state.catalog('history', thread.id).digest;
@@ -386,8 +386,9 @@ test('pending current-epoch local history opens and verifies without uploading, 
   assert.equal(a.history.canRun(thread.id), true);
   assert.equal(a.state.sync.state.pending.includes(pending), true);
   const epoch = pending.value.epoch; pending.value.epoch = epoch - 1;
-  await assert.rejects(a.history.verify(thread.id), /synced history|ownership|epoch/i);
-  assert.equal(a.history.canRun(thread.id), false);
+  await assert.doesNotReject(a.history.verify(thread.id));
+  assert.equal(a.history.canRun(thread.id), true);
+  assert.equal(pending.value.epoch, epoch - 1, 'verification must not repair or upload stale drafts');
   pending.value.epoch = epoch;
   b.history.context(); b.state.sync.state.localHistory[thread.id] = structuredClone(record);
   b.state.sync.capture('history', machine, thread.id, pending.value);
@@ -404,7 +405,7 @@ test('pending history follows a same-key current-epoch parent chain anchored to 
   assert.equal(a.history.canRun(thread.id), true); assert.equal(child.base, null);
 });
 
-test('a pending history chain cannot authorize sending over a newer unrelated server snapshot', async t => {
+test('an unrelated server snapshot pauses handoff repair without blocking the owning native conversation', async t => {
   const f = fixture(t), { a } = f, { thread, key, entry, owner, root, child, original } = await pendingHistoryChain(f);
   const branch = path.join(f.home, 'sessions', 'concurrent-' + thread.id + '.jsonl');
   fs.writeFileSync(branch, Buffer.concat([original, Buffer.from(encode([question(2, 'Unrelated newer server branch')]))]));
@@ -415,8 +416,9 @@ test('a pending history chain cannot authorize sending over a newer unrelated se
   await a.state.sync.applyEntry(published.current);
   assert.notEqual(value.digest, root.value.digest); assert.notEqual(value.digest, child.value.digest);
   assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), false);
-  await assert.rejects(a.history.verify(thread.id), /synced history/);
-  assert.equal(a.history.canRun(thread.id), false);
+  await assert.doesNotReject(a.history.verify(thread.id));
+  assert.equal(a.history.canRun(thread.id), true);
+  assert.equal(await a.history.repairPendingHistory(thread.id, owner.epoch), false);
   assert.equal(root.base, entry.revision); assert.equal(child.base, null); assert.equal(child.parent, root.opId);
 });
 
@@ -446,7 +448,7 @@ test('a lost acknowledgment remains valid when a pending ancestor matches the ad
   assert.equal(a.state.sync.state.conflicts[key], undefined);
 });
 
-test('missing, cross-key, stale-epoch and cyclic pending ancestors cannot authorize sending', async t => {
+test('malformed pending ancestors cannot block the owning native conversation or become valid handoff ancestry', async t => {
   for (const kind of ['missing', 'cross-key', 'stale-epoch', 'cycle']) await t.test(kind, async t => {
     const f = fixture(t), { a } = f, { thread, key, owner, root, child } = await pendingHistoryChain(f);
     if (kind === 'missing') a.state.sync.state.pending = a.state.sync.state.pending.filter(op => op !== root);
@@ -454,20 +456,22 @@ test('missing, cross-key, stale-epoch and cyclic pending ancestors cannot author
     else if (kind === 'stale-epoch') root.value.epoch = owner.epoch - 1;
     else root.parent = child.opId;
     assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), false);
-    await assert.rejects(a.history.verify(thread.id), /synced history/);
-    assert.equal(a.history.canRun(thread.id), false);
+    await assert.doesNotReject(a.history.verify(thread.id));
+    assert.equal(a.history.canRun(thread.id), true);
+    assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), false);
     assert.equal(a.state.sync.state.conflicts[key], undefined);
   });
 });
 
-test('a history conflict blocks verification and scheduling even when the local digest matches the server', async t => {
+test('a history conflict remains pending without blocking owning native verification or scheduling', async t => {
   const f = fixture(t), { a } = f, thread = f.create(a);
   await a.history.tick();
   const key = stateKey('history', machine, thread.id), entry = a.state.sync.state.entries[key];
   assert.equal(a.history.record(thread.id).digest, entry.value.digest);
   a.state.sync.state.conflicts[key] = { remote: structuredClone(entry) };
-  await assert.rejects(a.history.verify(thread.id), /history conflict/);
-  assert.equal(a.history.canRun(thread.id), false);
+  await assert.doesNotReject(a.history.verify(thread.id));
+  assert.equal(a.history.canRun(thread.id), true);
+  assert.deepEqual(a.state.sync.state.conflicts[key].remote, entry);
 });
 
 test('newer peer history cannot replace a dirty local working copy with an empty or foreign ownership cache', async t => {
@@ -540,7 +544,7 @@ test('missing-parent and corrupt native histories stay thread-specific while hea
     const error = a.history.errors.get(thread.id);
     assert.ok(error?.message); assert.equal(error.stamp, a.history.stamp(thread.path));
     assert.ok(error.retryAt > Date.now());
-    assert.equal(a.state.catalog('history', thread.id), undefined); assert.equal(a.history.record(thread.id), undefined);
+    assert.equal(a.state.catalog('history', thread.id), undefined); assert.equal(a.history.record(thread.id)?.digest, undefined);
     assert.equal(a.state.sync.state.pending.some(op => op.kind === 'history' && op.id === thread.id), false);
     assert.ok(a.logs.some(entry => entry.details?.threadId === thread.id && /history/i.test(entry.event)));
   }
@@ -705,4 +709,528 @@ test('history imports ignore stale namespace, machine and agent-session response
     waiting.release(); await assert.rejects(reading, /connection changed/);
     assert.equal(b.calls.some(call => call.method === 'thread/resume'), false); assert.equal(b.state.sync.state.localHistory?.[source.id], undefined); assert.equal(b.history.importing.size, 0);
   });
+});
+
+test('a queued follow-up waits for the previous completion to release shared ownership', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  const first = await a.history.begin(thread.id);
+  await a.history.started(thread.id, first, { turn: { id: 'previous-turn', status: 'inProgress' } });
+  const waiting = gate();
+  a.shared.before = async method => { if (method === 'history-end') { waiting.begin(); await waiting.held; } };
+  const completed = a.history.completed({ threadId: thread.id, turn: { id: 'previous-turn', status: 'completed' } });
+  await waiting.started;
+  let next, failure;
+  const followUp = a.history.begin(thread.id).then(value => { next = value; }, error => { failure = error; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(failure, undefined, 'a completed turn must not reject its queued follow-up as still running');
+  assert.equal(next, undefined);
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-begin').length, 1);
+  waiting.release(); await completed; await followUp;
+  assert.equal(failure, undefined); assert.ok(next.runToken); assert.notEqual(next.runToken, first.runToken);
+  assert.equal(a.history.runs.get(thread.id), next);
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-end').length, 1);
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-begin').length, 2);
+});
+
+test('duplicate completions share one release and only one waiting follow-up can start', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  const first = await a.history.begin(thread.id);
+  await a.history.started(thread.id, first, { turn: { id: 'completed-once', status: 'inProgress' } });
+  const waiting = gate();
+  a.shared.before = async method => { if (method === 'history-end') { waiting.begin(); await waiting.held; } };
+  const completion = { threadId: thread.id, turn: { id: 'completed-once', status: 'completed' } };
+  const completed = a.history.completed(completion); await waiting.started;
+  const duplicate = a.history.completed(completion);
+  const followers = Promise.allSettled([a.history.begin(thread.id), a.history.begin(thread.id)]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-end').length, 1);
+  waiting.release(); await Promise.all([completed, duplicate]);
+  const results = await followers;
+  assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+  assert.equal(results.filter(result => result.status === 'rejected').length, 1);
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-begin').length, 2);
+  assert.ok(a.history.runs.get(thread.id).runToken);
+});
+
+test('failed release preserves the previous lock and rejects a waiting send before native admission', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  const first = await a.history.begin(thread.id);
+  await a.history.started(thread.id, first, { turn: { id: 'release-fails', status: 'inProgress' } });
+  const waiting = gate();
+  a.shared.before = async method => { if (method === 'history-end') { waiting.begin(); await waiting.held; throw new Error('Release failed'); } };
+  const completed = a.history.completed({ threadId: thread.id, turn: { id: 'release-fails', status: 'completed' } });
+  await waiting.started;
+  const attempts = Promise.allSettled([completed, a.history.begin(thread.id)]);
+  waiting.release();
+  for (const result of await attempts) { assert.equal(result.status, 'rejected'); assert.match(result.reason.message, /Release failed/); }
+  assert.equal(a.history.runs.get(thread.id), first);
+  assert.equal(first.ending, undefined);
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-begin').length, 1);
+});
+
+test('switching connections during completion cannot start a queued message on the new machine', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  const first = await a.history.begin(thread.id);
+  await a.history.started(thread.id, first, { turn: { id: 'old-session', status: 'inProgress' } });
+  const waiting = gate();
+  a.shared.before = async method => { if (method === 'history-end') { waiting.begin(); await waiting.held; } };
+  const completed = a.history.completed({ threadId: thread.id, turn: { id: 'old-session', status: 'completed' } });
+  await waiting.started;
+  const attempt = assert.rejects(a.history.begin(thread.id), /connection changed/);
+  a.connection.session = {};
+  waiting.release(); await completed; await attempt;
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-begin').length, 1);
+});
+
+test('sending after restart recovers a stale shared busy flag without waiting for background scans', async t => {
+  const f = fixture(t), { a, b } = f, thread = f.create(a);
+  const previous = await a.history.begin(thread.id);
+  await a.history.started(thread.id, previous, { turn: { id: 'interrupted-on-restart', status: 'inProgress' } });
+  thread.turns = [{ id: 'interrupted-on-restart', status: 'interrupted' }];
+  a.connection.session = {};
+  const next = await a.history.begin(thread.id);
+  assert.ok(next.runToken); assert.notEqual(next.runToken, previous.runToken);
+  assert.equal(a.history.runs.get(thread.id), next);
+  const releases = a.bridgeCalls.filter(call => call.method === 'history-end');
+  assert.equal(releases.length, 1); assert.equal(releases[0].args.runToken, previous.runToken);
+  assert.equal(a.calls.some(call => call.method === 'thread/read' && call.params.threadId === thread.id), true);
+  assert.equal(a.calls.some(call => call.method === 'thread/turns/list' && call.params.threadId === thread.id), true);
+  await b.history.refresh();
+  assert.equal(b.history.status().find(owner => owner.id === thread.id).busy, true);
+  assert.equal(a.calls.some(call => call.method === 'turn/start'), false);
+});
+
+test('on-demand recovery preserves a running native turn and retries only after the native thread is idle', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  const previous = await a.history.begin(thread.id);
+  thread.turns = [{ id: 'still-running', status: 'inProgress' }]; thread.status.type = 'active';
+  a.connection.session = {};
+  await assert.rejects(a.history.begin(thread.id), /running task/);
+  assert.equal(a.bridgeCalls.some(call => call.method === 'history-end'), false);
+  thread.turns[0].status = 'interrupted';
+  await assert.rejects(a.history.begin(thread.id), /running task/);
+  assert.equal(a.bridgeCalls.some(call => call.method === 'history-end'), false);
+  thread.status.type = 'notLoaded';
+  const next = await a.history.begin(thread.id);
+  assert.notEqual(next.runToken, previous.runToken);
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-end').length, 1);
+});
+
+test('on-demand recovery never releases foreign ownership or trusts an unknown native turn status', async t => {
+  const f = fixture(t), { a, b } = f, thread = f.create(a);
+  await a.history.begin(thread.id);
+  b.native.set(thread.id, { ...thread });
+  await assert.rejects(b.history.begin(thread.id), /Use this conversation/);
+  assert.equal(b.bridgeCalls.some(call => call.method === 'history-end'), false);
+  a.connection.session = {}; thread.turns = [{ id: 'uncertain', status: 'unknown' }];
+  await assert.rejects(a.history.begin(thread.id), /running task/);
+  assert.equal(a.bridgeCalls.some(call => call.method === 'history-end'), false);
+});
+
+test('a new reservation created during a background idle check cannot be released by that check', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  const old = await a.history.begin(thread.id);
+  thread.turns = [{ id: 'old-interrupted', status: 'interrupted' }];
+  a.connection.session = {}; a.history.context(); await a.history.refresh();
+  const owner = a.history.owners.get(thread.id), waiting = gate(); let held = false;
+  a.connection.before = async method => { if (method === 'thread/read' && !held) { held = true; waiting.begin(); await waiting.held; } };
+  const recovery = a.history.recover(thread.id, owner); await waiting.started;
+  const next = await a.history.begin(thread.id);
+  waiting.release(); assert.equal(await recovery, false);
+  assert.equal(a.history.runs.get(thread.id), next); assert.notEqual(next.runToken, old.runToken);
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-end').length, 1);
+});
+
+test('an orphaned busy flag is checked in the background even when its saved history is unchanged', async t => {
+  const f = fixture(t), { a, b } = f, thread = f.create(a);
+  a.state.captureThread(thread); await a.history.tick();
+  const run = await a.history.begin(thread.id);
+  a.connection.session = {}; a.history.context(); a.history.scanned = true;
+  thread.turns = [{ id: 'aborted', status: 'interrupted' }];
+  const before = a.bridgeCalls.filter(call => call.method === 'history-end').length;
+  // Keep the normal history scan from discovering the stale conversation.
+  const other = f.create(a, 'Other chat');
+  a.history.queue.set(other.id, other);
+  await a.history.tick(); await b.history.refresh();
+  assert.equal(b.history.status().find(owner => owner.id === thread.id).busy, false);
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-end').length, before + 1);
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-end').at(-1).args.runToken, run.runToken);
+});
+
+test('Send recovers a stale local reservation after a missed completion or lost release acknowledgment', async t => {
+  for (const released of [false, true]) await t.test(released ? 'server already released' : 'server still busy', async t => {
+    const f = fixture(t), { a } = f, thread = f.create(a);
+    const previous = await a.history.begin(thread.id);
+    await a.history.started(thread.id, previous, { turn: { id: 'missed-completion', status: 'inProgress' } });
+    thread.turns = [{ id: 'missed-completion', status: 'interrupted' }];
+    if (released) await a.shared.bridge.call('history-end', { machine, id: thread.id, epoch: previous.epoch, runToken: previous.runToken });
+    assert.equal(a.history.runs.get(thread.id), previous);
+    const next = await a.history.begin(thread.id);
+    assert.notEqual(next.runToken, previous.runToken);
+    assert.equal(a.history.runs.get(thread.id), next);
+    assert.equal(a.history.starting.has(thread.id), true);
+  });
+});
+
+test('coalescing another export preserves an existing pending root even before its local revision catches up', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  await a.history.tick();
+  const owner = a.history.owners.get(thread.id), key = stateKey('history', machine, thread.id);
+  fs.appendFileSync(thread.path, encode([question(2, 'First unsynced follow-up')]));
+  await a.history.export(thread, owner);
+  const base = a.state.sync.state.pending.find(op => op.key === key).base;
+  a.history.record(thread.id).revision = 0;
+  fs.appendFileSync(thread.path, encode([question(3, 'Another local follow-up')]));
+  await a.history.export(thread, owner);
+  assert.equal(a.state.sync.state.pending.find(op => op.key === key).base, base);
+  assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), true);
+});
+
+test('a legacy corrupted history base is repaired only after proving the server snapshot is an exact prefix', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  await a.history.tick();
+  const owner = a.history.owners.get(thread.id), key = stateKey('history', machine, thread.id), revision = a.state.sync.state.entries[key].revision;
+  fs.appendFileSync(thread.path, encode([question(2, 'Keep these newer local messages')]));
+  await a.history.export(thread, owner);
+  const op = a.state.sync.state.pending.find(op => op.key === key); op.base = 0;
+  const bytes = fs.readFileSync(thread.path), calls = a.calls.length;
+  assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), false);
+  assert.equal(await a.history.repairPendingHistory(thread.id, owner.epoch), true);
+  assert.equal(op.base, revision); assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), true);
+  assert.equal(a.calls.length, calls, 'repair must use cached chunks, not a full native history read');
+  assert.deepEqual(fs.readFileSync(thread.path), bytes);
+  await a.state.sync.tick();
+  assert.equal(a.state.sync.state.conflicts[key], undefined);
+  assert.equal(a.state.sync.state.entries[key].value.digest, a.history.record(thread.id).digest);
+});
+
+test('legacy children with a numeric base still wait for the parent upload acknowledgment', async t => {
+  const f = fixture(t), { a } = f, { thread, key, root, child } = await pendingHistoryChain(f);
+  child.base = 0;
+  const before = a.bridgeCalls.length;
+  await a.state.sync.tick();
+  const push = a.bridgeCalls.slice(before).find(call => call.method === 'state-push');
+  assert.deepEqual(push.args.operations.filter(op => op.key === key).map(op => op.opId), [root.opId]);
+  assert.equal(child.parent, undefined); assert.ok(child.base > 0);
+  await a.state.sync.tick();
+  assert.equal(a.state.sync.state.conflicts[key], undefined);
+  assert.equal(a.state.sync.state.entries[key].value.digest, a.history.record(thread.id).digest);
+});
+
+test('corrupt cached chunks cannot repair handoff ancestry and do not block the owning native conversation', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  await a.history.tick();
+  const owner = a.history.owners.get(thread.id), key = stateKey('history', machine, thread.id);
+  fs.appendFileSync(thread.path, encode([question(2, 'An unsynced message')]));
+  await a.history.export(thread, owner);
+  const op = a.state.sync.state.pending.find(op => op.key === key); op.base = 0;
+  fs.writeFileSync(a.state.sync.blobFile(op.value.chunks[0].hash), 'corrupt cached bytes');
+  await assert.rejects(a.history.repairPendingHistory(thread.id, owner.epoch), /checksum/);
+  await assert.doesNotReject(a.history.verify(thread.id));
+  assert.equal(a.history.canRun(thread.id), true);
+  assert.equal(op.base, 0); assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), false);
+});
+
+test('history-base repair cannot commit after its connection or server catalog changes', async t => {
+  for (const change of ['session', 'catalog']) await t.test(change, async t => {
+    const f = fixture(t), { a } = f, thread = f.create(a);
+    await a.history.tick();
+    const owner = a.history.owners.get(thread.id), key = stateKey('history', machine, thread.id);
+    fs.appendFileSync(thread.path, encode([question(2, 'Unsynced local text')]));
+    await a.history.export(thread, owner);
+    const op = a.state.sync.state.pending.find(op => op.key === key); op.base = 0;
+    const blob = a.state.sync.blobFile(op.value.chunks[0].hash), waiting = gate(), read = fs.promises.readFile;
+    let held = false;
+    t.mock.method(fs.promises, 'readFile', async (file, ...args) => {
+      if (file === blob && !held) { held = true; waiting.begin(); await waiting.held; }
+      return read(file, ...args);
+    });
+    const repair = a.history.repairPendingHistory(thread.id, owner.epoch); await waiting.started;
+    if (change === 'session') a.connection.session = {};
+    else a.state.sync.state.entries[key] = { ...a.state.sync.state.entries[key], revision: a.state.sync.state.entries[key].revision + 1 };
+    waiting.release(); assert.equal(await repair, false); assert.equal(op.base, 0);
+  });
+});
+
+test('a legacy base conflict can clear only when the complete local snapshot extends the conflicting server version', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  await a.history.tick();
+  const owner = a.history.owners.get(thread.id), key = stateKey('history', machine, thread.id);
+  fs.appendFileSync(thread.path, encode([question(2, 'Preserve this local continuation')]));
+  await a.history.export(thread, owner);
+  const op = a.state.sync.state.pending.find(op => op.key === key), remote = structuredClone(a.state.sync.state.entries[key]);
+  op.base = 0; a.state.sync.state.conflicts[key] = { remote };
+  assert.equal(await a.history.repairPendingHistory(thread.id, owner.epoch), true);
+  assert.equal(a.state.sync.state.conflicts[key], undefined); assert.equal(op.base, remote.revision);
+  assert.equal(a.history.hasPendingHistory(thread.id, owner.epoch), true);
+  const reopened = JSON.parse(fs.readFileSync(a.state.sync.file, 'utf8'));
+  assert.equal(reopened.conflicts[key], undefined); assert.equal(reopened.entries[key].revision, remote.revision);
+  await a.state.sync.tick();
+  assert.equal(a.state.sync.state.entries[key].value.digest, a.history.record(thread.id).digest);
+});
+
+test('a changed screenshot cannot strand a local continuation and both original snapshots stay preserved', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a), image = path.join(a.root, 'latest-screen.png');
+  // Reproduce cached snapshots created before immutable attachment capture.
+  Object.defineProperty(a.history, 'attachmentStore', { value: undefined });
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jM9sAAAAASUVORK5CYII=', 'base64');
+  fs.writeFileSync(image, png);
+  fs.appendFileSync(thread.path, encode([{ timestamp: '2026-11-16T12:00:00.000Z', ordinal: 2, type: 'event_msg', payload: { type: 'item_completed', item: { type: 'ImageView', id: 'same-view', path: image } } }]));
+  await a.history.tick();
+  const key = stateKey('history', machine, thread.id), entry = structuredClone(a.state.sync.state.entries[key]);
+  fs.writeFileSync(image, Buffer.concat([png, Buffer.from('new screenshot')]));
+  fs.appendFileSync(thread.path, encode([question(3, 'Keep this newer message')]));
+  await a.history.export(thread, a.history.owners.get(thread.id));
+  const op = a.state.sync.state.pending.find(op => op.key === key); op.base = 0;
+  a.history.record(thread.id).revision = 0;
+  const local = structuredClone(op.value), original = fs.readFileSync(thread.path), calls = a.calls.length;
+  assert.equal(await a.history.repairPendingHistory(thread.id, a.history.owners.get(thread.id).epoch), true);
+  assert.equal(op.base, entry.revision);
+  assert.equal(a.calls.length, calls); assert.deepEqual(fs.readFileSync(thread.path), original);
+  assert.deepEqual(a.history.record(thread.id).preservedSnapshots.map(snapshot => snapshot.manifest.digest), [entry.value.digest, local.digest]);
+  const saved = JSON.parse(fs.readFileSync(a.state.sync.file, 'utf8'));
+  assert.equal(saved.localHistory[thread.id].preservedSnapshots.length, 2);
+  await a.state.sync.tick();
+  assert.equal(a.state.sync.state.conflicts[key], undefined);
+  assert.equal(a.state.sync.state.entries[key].value.digest, local.digest);
+  // The old snapshot and screenshot remain recoverable after ordinary cache cleanup.
+  const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  for (const blob of entry.value.blobs) fs.utimesSync(a.state.sync.blobFile(blob.hash), old, old);
+  a.state.sync.pruneBlobs(Date.now() + 2 * 60 * 60 * 1000);
+  for (const blob of entry.value.blobs) assert.equal(fs.existsSync(a.state.sync.blobFile(blob.hash)), true);
+  await a.history.verify(thread.id);
+  assert.equal(a.history.record(thread.id).preservedSnapshots.length, 2);
+});
+
+test('a receiving owner must load the final shared snapshot before sending or republishing its earlier copy', async t => {
+  const f = fixture(t), { a, b } = f, thread = f.create(a);
+  await a.history.tick(); await b.history.read(thread.id);
+  const early = b.history.record(thread.id).digest;
+  fs.appendFileSync(thread.path, encode([question(2, 'Final message before handoff')]));
+  await b.history.request(thread.id); await a.history.tick(); await b.history.refresh();
+  const owner = b.history.owners.get(thread.id), final = a.state.catalog('history', thread.id);
+  assert.equal(owner.owner, b.shared.state.device); assert.equal(owner.epoch, 2);
+  assert.notEqual(early, final.digest);
+  await assert.rejects(b.history.verify(thread.id), /Load the latest shared history/);
+  assert.equal(b.history.canRun(thread.id), false); assert.equal(b.history.record(thread.id).authority, null);
+  const before = b.bridgeCalls.length;
+  await b.history.tick();
+  const current = await b.shared.bridge.call('state-get', { kind: 'history', machine, id: thread.id });
+  assert.equal(current.value.digest, final.digest, 'background publication must not replace the final handoff snapshot with an older local copy');
+  assert.equal(b.bridgeCalls.slice(before).some(call => call.method === 'state-push' && call.args.operations.some(op => op.kind === 'history')), false);
+  await b.history.read(thread.id, { refresh: true });
+  await b.history.verify(thread.id);
+  assert.equal(b.history.canRun(thread.id), true);
+  assert.equal(b.history.record(thread.id).authority.epoch, owner.epoch);
+  assert.match(fs.readFileSync(b.history.record(thread.id).path, 'utf8'), /Final message before handoff/);
+});
+
+test('a durable local authority survives reconnect and upload corruption but fresh foreign ownership still fences every send', async t => {
+  const f = fixture(t), { a, b } = f, thread = f.create(a);
+  await a.history.verify(thread.id);
+  const authority = structuredClone(a.history.record(thread.id).authority);
+  assert.deepEqual(authority, { device: a.shared.state.device, epoch: 1, nativeId: thread.id, home: f.home });
+  fs.appendFileSync(thread.path, encode([question(2, 'Locally owned continuation')]));
+  a.state.sync.capture('history', machine, thread.id, { malformed: true });
+  const key = stateKey('history', machine, thread.id);
+  a.state.sync.state.conflicts[key] = { remote: null };
+  const restarted = new HistoryManager(a.state); a.connection.session = {};
+  const before = a.calls.length;
+  await restarted.verify(thread.id);
+  assert.equal(restarted.canRun(thread.id), true);
+  assert.equal(a.calls.length, before, 'durable ownership must not parse or reread the native history on every send');
+  assert.deepEqual(a.history.record(thread.id).authority, authority);
+  assert.equal(a.state.sync.state.conflicts[key].remote, null);
+  await b.history.request(thread.id);
+  await assert.rejects(restarted.verify(thread.id), /Use this conversation/);
+  assert.equal(restarted.canRun(thread.id), false);
+  assert.ok(a.bridgeCalls.filter(call => call.method === 'history-verify').length >= 3);
+});
+
+test('a transferred epoch cannot receive authority from a forged pending digest or another native alias', async t => {
+  const f = fixture(t), { a, b } = f, thread = f.create(a);
+  await a.history.tick(); await b.history.read(thread.id);
+  fs.appendFileSync(thread.path, encode([question(2, 'Required final message')]));
+  await b.history.request(thread.id); await a.history.tick(); await b.history.refresh();
+  const record = b.history.record(thread.id);
+  b.state.sync.capture('history', machine, thread.id, { digest: record.digest, epoch: 2 });
+  await assert.rejects(b.history.verify(thread.id), /Load the latest shared history/);
+  assert.equal(record.authority, null); assert.equal(b.history.canRun(thread.id), false);
+  b.state.sync.state.pending = []; b.state.sync.save();
+  await b.history.read(thread.id, { refresh: true }); await b.history.verify(thread.id);
+  const current = b.history.record(thread.id), authority = structuredClone(current.authority);
+  current.nativeId = randomUUID();
+  assert.equal(b.history.hasAuthority(thread.id), false, 'authority is scoped to the exact imported native copy');
+  current.nativeId = authority.nativeId;
+  current.authority.home = path.join(f.directory, 'different-home');
+  assert.equal(b.history.hasAuthority(thread.id), false, 'authority cannot be reused under a different Codex home');
+});
+
+test('a first authority grant cannot commit after its namespace, machine or agent session changes', async t => {
+  for (const change of ['namespace', 'machine', 'session', 'provider-session']) await t.test(change, async t => {
+    const f = fixture(t), { a } = f, thread = f.create(a), waiting = gate();
+    const codex = { session: {} }; a.connection.connections = new Map([['codex', codex]]);
+    a.connection.before = async method => { if (method === 'thread/read') { waiting.begin(); await waiting.held; } };
+    const verifying = a.history.verify(thread.id); await waiting.started;
+    const originalState = a.state.sync.state;
+    if (change === 'namespace') a.shared.key = 'history-fixture:/new-namespace';
+    else if (change === 'machine') a.switchMachine('access:another-machine:22');
+    else if (change === 'session') a.connection.session = {};
+    else codex.session = {};
+    waiting.release(); await assert.rejects(verifying, /connection changed/);
+    assert.equal(originalState.localHistory[thread.id]?.authority, undefined);
+  });
+});
+
+test('a receiver loads and verifies the final handoff through state-get while an unrelated bulk upload is held', async t => {
+  const f = fixture(t), { a, b } = f, source = f.create(a);
+  await a.history.tick(); await b.history.read(source.id);
+  fs.appendFileSync(source.path, encode([question(2, 'Final message fetched independently')]));
+  await b.history.request(source.id); await a.history.tick(); await b.history.refresh();
+  const final = a.state.catalog('history', source.id).digest;
+  const uploading = f.create(b, 'Independent pending upload');
+  await b.history.verify(uploading.id); await b.history.export(uploading, b.history.owners.get(uploading.id));
+  const waiting = gate(); let finished = false;
+  b.shared.before = async method => { if (method === 'blob-put') { waiting.begin(); await waiting.held; } };
+  const upload = b.state.sync.tick().then(() => { finished = true; }); await waiting.started;
+  let syncAttempts = 0;
+  const originalTick = b.state.sync.tick.bind(b.state.sync);
+  t.mock.method(b.state.sync, 'tick', async () => { syncAttempts++; throw new Error('Transfer proof must not run the global upload coordinator'); });
+  try {
+    const before = b.bridgeCalls.length;
+    await b.history.read(source.id, { refresh: true });
+    await b.history.verify(source.id);
+    assert.equal(finished, false); assert.equal(syncAttempts, 0);
+    assert.equal(b.history.record(source.id).digest, final);
+    assert.equal(b.history.record(source.id).authority.epoch, 2);
+    assert.equal(b.history.canRun(source.id), true);
+    assert.match(fs.readFileSync(b.history.record(source.id).path, 'utf8'), /Final message fetched independently/);
+    assert.equal(b.bridgeCalls.slice(before).filter(call => call.method === 'state-get' && call.args.id === source.id).length, 2, 'both import and first transferred authority require their own current manifest');
+  } finally {
+    b.state.sync.tick = originalTick; waiting.release(); await upload;
+  }
+});
+
+async function conflictingHistory(f) {
+  const { a } = f, thread = f.create(a), original = fs.readFileSync(thread.path);
+  await a.history.tick();
+  const key = stateKey('history', machine, thread.id), entry = a.state.sync.state.entries[key];
+  fs.appendFileSync(thread.path, encode([question(2, 'Keep this local conflicting message')]));
+  await a.history.export(thread, a.history.owners.get(thread.id));
+  const branch = path.join(f.home, 'sessions', 'remote-branch-' + thread.id + '.jsonl');
+  fs.writeFileSync(branch, Buffer.concat([original, Buffer.from(encode([question(2, 'Selected remote conflicting message')]))]));
+  const value = { ...await exportCodexHistory({ thread: { ...thread, path: branch }, home: f.home, keepBlob: data => a.state.sync.keepBlob(data) }), epoch: 1 };
+  for (const blob of value.blobs) await a.shared.bridge.call('blob-put', { hash: blob.hash, data: fs.readFileSync(a.state.sync.blobFile(blob.hash)).toString('base64') });
+  const [reply] = await a.shared.bridge.call('state-push', { operations: [{ kind: 'history', machine, id: thread.id, key, opId: randomUUID(), base: entry.revision, value, seed: false }] });
+  assert.equal(reply.conflict, undefined);
+  await a.state.sync.tick();
+  const conflict = a.state.sync.conflicts().find(conflict => conflict.key === key);
+  assert.ok(conflict); assert.equal(conflict.remote.value.digest, value.digest);
+  return { thread, key, conflict, value };
+}
+
+test('explicit remote history choice opens the selected snapshot and preserves exact local conflicting bytes', async t => {
+  const f = fixture(t), { a } = f, { thread, key, conflict, value } = await conflictingHistory(f);
+  const localBytes = fs.readFileSync(thread.path), waiting = gate();
+  a.connection.before = async method => { if (method === 'thread/resume') { waiting.begin(); await waiting.held; } };
+  const choosing = a.history.useRemote(thread.id, afterRemote => a.state.sync.resolve(key, 'remote', conflict.version, afterRemote));
+  await waiting.started;
+  assert.equal(a.history.importing.has(thread.id), true);
+  const before = a.calls.length;
+  assert.equal(await a.history.export(thread, a.history.owners.get(thread.id)), false);
+  assert.equal(a.calls.length, before, 'background export must not touch a conversation while its explicit history choice is loading');
+  waiting.release(); await choosing;
+  const record = a.history.record(thread.id), opened = fs.readFileSync(record.path, 'utf8');
+  assert.equal(record.digest, value.digest); assert.equal(record.previousPath, thread.path);
+  assert.notEqual(record.path, thread.path); assert.deepEqual(fs.readFileSync(thread.path), localBytes);
+  assert.match(opened, /Selected remote conflicting message/); assert.doesNotMatch(opened, /Keep this local conflicting message/);
+  assert.equal(a.native.get(thread.id).path, record.path);
+  assert.equal(a.state.sync.state.conflicts[key], undefined);
+  assert.equal(a.state.sync.state.pending.some(op => op.key === key), false);
+  assert.equal(a.history.importing.size, 0);
+  assert.equal(a.calls.some(call => ['turn/start', 'thread/unsubscribe'].includes(call.method)), false, 'raw same-ID import must keep the newly resumed view subscribed');
+});
+
+test('an active native task or rejected remote history load preserves the conflict and local pending version', async t => {
+  for (const failure of ['native-active', 'reserved-run', 'resume-rejected']) await t.test(failure, async t => {
+    const f = fixture(t), { a } = f, { thread, key, conflict } = await conflictingHistory(f);
+    const record = structuredClone(a.history.record(thread.id)), bytes = fs.readFileSync(thread.path);
+    const pending = structuredClone(a.state.sync.state.pending.filter(op => op.key === key));
+    const saved = structuredClone(a.state.sync.state.conflicts[key]);
+    if (failure === 'native-active') thread.status.type = 'active';
+    else if (failure === 'reserved-run') a.history.runs.set(thread.id, { turnId: 'still-running' });
+    else a.connection.before = method => { if (method === 'thread/resume') throw new Error('Native import rejected'); };
+    await assert.rejects(a.history.useRemote(thread.id, afterRemote => a.state.sync.resolve(key, 'remote', conflict.version, afterRemote)), /Stop this conversation|could not open/);
+    assert.deepEqual(a.state.sync.state.pending.filter(op => op.key === key), pending);
+    assert.deepEqual(a.state.sync.state.conflicts[key], saved);
+    assert.deepEqual(a.history.record(thread.id), record);
+    assert.equal(a.native.get(thread.id).path, thread.path); assert.deepEqual(fs.readFileSync(thread.path), bytes);
+    assert.equal(a.history.importing.size, 0); assert.equal(a.calls.some(call => call.method === 'thread/unsubscribe'), false);
+    const disk = JSON.parse(fs.readFileSync(a.state.sync.file, 'utf8'));
+    assert.deepEqual(disk.conflicts[key], saved);
+  });
+});
+
+test('a connection switch during fresh-alias unsubscribe cannot commit remote history or copy its conflict into another namespace', async t => {
+  const f = fixture(t), { a } = f, { thread, key, conflict } = await conflictingHistory(f), waiting = gate();
+  let aliases;
+  a.connection.setThreadAliases = value => { aliases = structuredClone(value); };
+  a.history.context();
+  const savedRecord = structuredClone(a.history.record(thread.id));
+  const oldState = a.state.sync.state;
+  a.connection.before = async method => { if (method === 'thread/unsubscribe') { waiting.begin(); await waiting.held; } };
+  const choosing = a.history.useRemote(thread.id, afterRemote => a.state.sync.resolve(key, 'remote', conflict.version, afterRemote));
+  await waiting.started;
+  a.shared.key = 'history-fixture:/switched-during-unsubscribe'; a.history.context();
+  const currentState = a.state.sync.state, currentAliases = structuredClone(aliases);
+  waiting.release(); await assert.rejects(choosing, /connection changed/);
+  assert.equal(a.state.sync.state, currentState);
+  assert.equal(currentState.localHistory[thread.id], undefined);
+  assert.equal(currentState.pending.some(op => op.key === key), false);
+  assert.equal(currentState.conflicts[key], undefined);
+  assert.deepEqual(aliases, currentAliases);
+  assert.deepEqual(oldState.localHistory[thread.id], savedRecord);
+});
+
+test('first export from a path-only native authority retains the existing server revision', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  await a.history.tick();
+  const key = stateKey('history', machine, thread.id), entry = structuredClone(a.state.sync.state.entries[key]);
+  assert.ok(entry.revision > 0);
+  delete a.state.sync.state.localHistory[thread.id]; a.state.sync.save();
+  await a.history.verify(thread.id);
+  const record = a.history.record(thread.id);
+  assert.equal(record.path, thread.path); assert.equal(record.authority.epoch, 1);
+  assert.equal(record.digest, undefined); assert.equal(record.revision, undefined);
+  fs.appendFileSync(thread.path, encode([question(2, 'First export after native authority was granted')]));
+  await a.history.export(thread, a.history.owners.get(thread.id));
+  const op = a.state.sync.state.pending.find(op => op.key === key);
+  assert.ok(op); assert.equal(op.base, entry.revision, 'path-only authority must not manufacture an unverified base-zero snapshot');
+  assert.notEqual(op.value.digest, entry.value.digest);
+  await a.state.sync.tick();
+  assert.equal(a.state.sync.state.conflicts[key], undefined);
+  assert.equal(a.state.sync.state.pending.some(op => op.key === key), false);
+  assert.equal(a.state.catalog('history', thread.id).digest, a.history.record(thread.id).digest);
+});
+
+test('live image snapshots use the current native alias and keep original conversations in their own cache namespace', () => {
+  let mode = 'local';
+  const history = new HistoryManager({ options: () => ({ mode }) }), snapshots = [], records = new Map();
+  const logicalId = randomUUID(), originalId = randomUUID(), firstCopy = randomUUID(), nextCopy = randomUUID();
+  history.record = id => records.get(id);
+  Object.defineProperty(history, 'home', { value: '/isolated-codex-home' });
+  Object.defineProperty(history, 'attachmentStore', { value: { capture: snapshot => snapshots.push(structuredClone(snapshot)) } });
+  const event = id => ({ method: 'item/completed', params: { threadId: id, turnId: 'same-turn', item: { type: 'imageView', id: 'same-image', path: '/fixture/image.png' } } });
+  const original = event(originalId), aliased = event(logicalId);
+  history.captureAttachment(original);
+  records.set(logicalId, { nativeId: firstCopy }); history.captureAttachment(aliased);
+  records.set(logicalId, { nativeId: nextCopy });
+  history.captureAttachment({ ...aliased, method: 'item/started', params: { ...aliased.params, item: { ...aliased.params.item, type: 'ImageView' } } });
+  assert.deepEqual(snapshots.map(snapshot => snapshot.threadId), [originalId, firstCopy, nextCopy]);
+  assert.ok(snapshots.every(snapshot => snapshot.turnId === 'same-turn' && snapshot.item.id === 'same-image' && snapshot.home === '/isolated-codex-home'));
+  assert.equal(aliased.params.threadId, logicalId, 'attachment namespacing must not mutate the logical notification');
+  history.captureAttachment({ ...aliased, provider: 'zcode' });
+  history.captureAttachment({ ...aliased, method: 'turn/completed' });
+  mode = 'ssh'; history.captureAttachment(aliased);
+  assert.equal(snapshots.length, 3);
 });

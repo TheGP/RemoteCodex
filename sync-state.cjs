@@ -1,7 +1,7 @@
 const { createHash, randomUUID } = require('node:crypto');
 const path = require('node:path');
 
-const kinds = new Set(['pin', 'messagePin', 'unread', 'completion', 'draft', 'project', 'thread', 'shortcuts', 'history', 'projectPath']);
+const kinds = new Set(['pin', 'finished', 'messagePin', 'unread', 'completion', 'draft', 'project', 'thread', 'shortcuts', 'history', 'projectPath', 'note']);
 const validId = value => typeof value === 'string' && value.length > 0 && value.length <= 1000 && !/[\x00-\x1f\x7f]/.test(value);
 const stateKey = (kind, machine, id) => {
   if (!kinds.has(kind) || !validId(machine) || !machine.startsWith('access:') || !validId(id)) throw new Error('Invalid synced conversation identity.');
@@ -86,6 +86,7 @@ class StateDatabase {
       }
       this.collectBlobs(now); return { missing };
     }
+    if (method === 'state-get') return this.get(stateKey(args.kind, args.machine, args.id));
     if (method === 'state-pull') {
       if (!Number.isSafeInteger(args.cursor) || args.cursor < 0) throw new Error('Invalid sync cursor.');
       if (!this.nextBlobGc || now >= this.nextBlobGc) this.collectBlobs(now);
@@ -100,16 +101,26 @@ class StateDatabase {
     }
     if (method === 'state-push') {
       if (!Array.isArray(args.operations) || !args.operations.length || args.operations.length > 50) throw new Error('Invalid sync operations.');
+      if (args.isolateErrors === true) return args.operations.map(op => {
+        try { return this.request('state-push', { operations: [op] }, owner, now)[0]; }
+        catch (error) { return { opId: op?.opId, error: error.message }; }
+      });
       const operations = args.operations.map(op => {
         const key = stateKey(op.kind, op.machine, op.id);
         if (!validId(op.opId) || !Number.isSafeInteger(op.base) || op.base < 0 || op.value === undefined || Buffer.byteLength(JSON.stringify(op.value)) > 1024 * 1024) throw new Error('Invalid synced conversation change.');
-        if (['pin', 'unread'].includes(op.kind) && typeof op.value !== 'boolean' && op.value !== null) throw new Error('Invalid synced marker.');
+        const receipt = this.db.prepare('SELECT * FROM sync_ops WHERE id=?').get(op.opId);
+        if (receipt) {
+          if (receipt.key !== key) throw new Error('Sync operation identity was reused.');
+          return { ...op, key, receipt };
+        }
+        if (['pin', 'finished', 'unread'].includes(op.kind) && typeof op.value !== 'boolean' && op.value !== null) throw new Error('Invalid synced marker.');
         if (op.kind === 'projectPath') {
           let identity;
           try { identity = JSON.parse(op.id); } catch { throw new Error('Invalid shared project folder identity.'); }
           if (!Array.isArray(identity) || identity.length !== 2 || !validId(identity[0]) || identity[1] !== owner) throw new Error('Only this computer can publish its project folders.');
           if (op.value !== null && (!Array.isArray(op.value?.roots) || !op.value.roots.length || op.value.roots.length > 100 || op.value.roots.some(root => typeof root !== 'string' || root.length > 4096 || /[\x00-\x1f\x7f]/.test(root) || !path.posix.isAbsolute(root) && !path.win32.isAbsolute(root) || /^[\\/]{2}/.test(root)))) throw new Error('Invalid shared project folder.');
         }
+        if (op.kind === 'note' && op.value !== null && (typeof op.value !== 'string' || !op.value.trim() || op.value.length > 4000 || op.value.includes('\0'))) throw new Error('Invalid synced conversation note.');
         if (op.kind === 'completion' && op.value !== null && !['completed', 'failed'].includes(op.value?.status || op.value)) throw new Error('Invalid synced completion.');
         if (op.value && op.kind === 'draft') for (const image of op.value.images || []) {
           if (!/^[a-f0-9]{64}$/.test(image.hash) || !this.db.prepare('SELECT 1 FROM sync_blobs WHERE hash=?').get(image.hash)) throw new Error('Upload draft attachments before publishing the draft.');
@@ -120,23 +131,30 @@ class StateDatabase {
           if (!Array.isArray(op.value.blobs) || op.value.blobs.length > 628 || !/^[a-f0-9]{64}$/.test(op.value.digest)) throw new Error('Invalid conversation snapshot.');
           for (const blob of op.value.blobs) if (!/^[a-f0-9]{64}$/.test(blob.hash) || !this.db.prepare('SELECT 1 FROM sync_blobs WHERE hash=?').get(blob.hash)) throw new Error('Upload conversation history before publishing it.');
         }
-        return { ...op, key };
+        return { ...op, key, receipt: null };
       });
       return operations.map(op => {
-        const receipt = this.db.prepare('SELECT * FROM sync_ops WHERE id=?').get(op.opId);
+        const receipt = op.receipt || this.db.prepare('SELECT * FROM sync_ops WHERE id=?').get(op.opId);
         const current = this.get(op.key);
         if (receipt) {
           if (receipt.key !== op.key) throw new Error('Sync operation identity was reused.');
           return { opId: op.opId, revision: receipt.revision, current };
         }
         if (op.seed && current) return { opId: op.opId, revision: current.revision, current, seeded: true };
-        if (op.kind === 'draft' && op.stale) return { opId: op.opId, conflict: true, current };
+        if (['draft', 'note'].includes(op.kind) && op.stale) return { opId: op.opId, conflict: true, current };
         if (op.kind === 'completion' && op.value === null && current?.value?.turnId && op.observedTurn !== current.value.turnId) return { opId: op.opId, conflict: true, current };
-        if (['draft', 'shortcuts', 'unread', 'completion', 'history'].includes(op.kind) && !op.seed && (current?.revision || 0) !== op.base) return { opId: op.opId, conflict: true, current };
+        if (['draft', 'shortcuts', 'unread', 'completion', 'history', 'note'].includes(op.kind) && !op.seed && (current?.revision || 0) !== op.base) return { opId: op.opId, conflict: true, current };
         const revision = this.db.prepare('SELECT COALESCE(MAX(revision),0)+1 AS value FROM sync_entries').get().value;
-        this.db.prepare('INSERT INTO sync_entries VALUES(?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET revision=excluded.revision,value=excluded.value,writer=excluded.writer')
-          .run(op.key, op.kind, op.machine, op.id, revision, JSON.stringify(op.value), owner);
-        this.db.prepare('INSERT INTO sync_ops VALUES(?,?,?)').run(op.opId, op.key, revision);
+        this.db.exec('SAVEPOINT sync_operation');
+        try {
+          this.db.prepare('INSERT INTO sync_entries VALUES(?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET revision=excluded.revision,value=excluded.value,writer=excluded.writer')
+            .run(op.key, op.kind, op.machine, op.id, revision, JSON.stringify(op.value), owner);
+          this.db.prepare('INSERT INTO sync_ops VALUES(?,?,?)').run(op.opId, op.key, revision);
+          this.db.exec('RELEASE sync_operation');
+        } catch (error) {
+          try { this.db.exec('ROLLBACK TO sync_operation'); this.db.exec('RELEASE sync_operation'); } catch {}
+          throw error;
+        }
         return { opId: op.opId, revision, current: this.get(op.key) };
       });
     }

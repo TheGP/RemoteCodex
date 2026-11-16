@@ -11,10 +11,11 @@ const providers = require('../providers.cjs');
 const pool = require('../agent-pool.cjs');
 const links = require('../links.cjs');
 
-async function fixture(t, saved, ids = ['codex']) {
+async function fixture(t, saved, ids = ['codex'], savedPreferences) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-startup-'));
   const file = path.join(directory, 'connection.json');
   if (saved !== undefined) fs.writeFileSync(file, saved);
+  if (savedPreferences !== undefined) fs.writeFileSync(path.join(directory, 'preferences.json'), JSON.stringify(savedPreferences));
   const app = new EventEmitter(), ipcMain = new EventEmitter();
   const windows = [], exits = [], attempts = [], errors = [], notifications = [], intervals = [], openedURLs = [], adapters = new Map(), handlers = new Map(), connectErrors = new Map();
   let connection;
@@ -60,7 +61,7 @@ async function fixture(t, saved, ids = ['codex']) {
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(errors, []); assert.deepEqual(exits, []); assert.equal(windows.length, 1);
   const event = { sender: windows[0].webContents, senderFrame: { url: pathToFileURL(windows[0].file).href } };
-  return { file, directory, attempts, adapters, connection, notifications, intervals, openedURLs, connectErrors, request: (name, ...args) => handlers.get(name)(event, ...args) };
+  return { file, directory, attempts, adapters, connection, notifications, intervals, openedURLs, connectErrors, quit: () => app.emit('before-quit'), send: (name, ...args) => { const request = { ...event }; ipcMain.emit(name, request, ...args); return request.returnValue; }, request: (name, ...args) => handlers.get(name)(event, ...args) };
 }
 
 test('changed-file link IPC clamps remote lines through the owning provider and blocks malformed or stale reads', async t => {
@@ -286,4 +287,50 @@ test('failed agent settings writes leave runtime flags and unrelated running wor
   const result = await f.request('connect', next);
   assert.equal(result.options.agents.find(agent => agent.id === 'sample').connected, true);
   assert.equal(codex.disconnects, 0);
+});
+
+
+test('app restart recovers interrupted run markers per machine and provider without resuming conversations', async t => {
+  const f = await fixture(t, undefined, ['codex', 'sample']);
+  await f.request('connect', { mode: 'local', localCwd: f.directory });
+  const codex = f.adapters.get('codex'), sample = f.adapters.get('sample');
+  codex.emit('notification', { method: 'turn/started', params: { threadId: 'working-chat', turn: { id: 'old-turn' } } });
+  codex.emit('notification', { method: 'turn/started', params: { threadId: 'working-chat', turn: { id: 'current-turn' } } });
+  codex.emit('notification', { method: 'turn/completed', params: { threadId: 'working-chat', turn: { id: 'old-turn', status: 'completed' } } });
+  sample.emit('notification', { method: 'turn/started', params: { threadId: 'sample-chat', turn: { id: 'sample-turn' } } });
+  codex.emit('notification', { method: 'turn/started', params: { threadId: 'finished-chat', turn: { id: 'finished-turn' } } });
+  codex.emit('notification', { method: 'turn/completed', params: { threadId: 'finished-chat', turn: { id: 'finished-turn', status: 'completed' } } });
+  const ack = f.send('save-conversation-state', { machine: 'access:local' }, { field: 'completion', threadId: 'working-chat', value: null });
+  assert.equal(ack.ok, true);
+  assert.equal(f.request('preferences').activeRuns['access:local']['working-chat'].turnId, 'current-turn');
+  f.quit();
+  const saved = JSON.parse(fs.readFileSync(path.join(f.directory, 'preferences.json'), 'utf8'));
+  const restarted = await fixture(t, undefined, ['codex', 'sample'], saved), recovered = restarted.request('preferences');
+  assert.equal(recovered.conversationStates['access:local'].completions['working-chat'], 'interrupted');
+  assert.equal(recovered.conversationStates['access:local'].completions['agent:sample:thread:sample-chat'], 'interrupted');
+  assert.equal(recovered.conversationStates['access:local'].completions['finished-chat'], undefined);
+  assert.equal(recovered.activeRuns, undefined); assert.deepEqual(restarted.attempts, []);
+  const cleared = restarted.send('save-conversation-state', { machine: 'access:local' }, { field: 'completion', threadId: 'working-chat', value: null, turnId: 'current-turn' });
+  assert.equal(cleared.ok, true);
+  assert.equal(restarted.request('preferences').conversationStates['access:local'].completions['working-chat'], undefined);
+  assert.equal(restarted.request('preferences').conversationStates['access:local'].completions['agent:sample:thread:sample-chat'], 'interrupted');
+});
+
+test('accepted RPC run results are durable while early completions and shared servers cannot create restart false positives', async t => {
+  const f = await fixture(t);
+  await f.request('connect', { mode: 'local', localCwd: f.directory });
+  const adapter = f.adapters.get('codex');
+  const rpc = (phase, threadId, turnId, requestId) => adapter.emit('rpc', { phase, requestId, method: 'turn/start', threadId, ...(phase === 'finished' ? { result: { turn: { id: turnId, status: 'inProgress' } } } : {}) });
+  rpc('started', 'accepted-chat', 'accepted-turn', 1); rpc('finished', 'accepted-chat', 'accepted-turn', 1);
+  assert.equal(f.request('preferences').activeRuns['access:local']['accepted-chat'].turnId, 'accepted-turn');
+  rpc('started', 'fast-chat', 'fast-turn', 2);
+  adapter.emit('notification', { method: 'turn/completed', params: { threadId: 'fast-chat', turn: { id: 'fast-turn', status: 'completed' } } });
+  rpc('finished', 'fast-chat', 'fast-turn', 2);
+  adapter.emit('notification', { method: 'turn/started', params: { threadId: 'fast-chat', turn: { id: 'fast-turn' } } });
+  assert.equal(f.request('preferences').activeRuns['access:local']['fast-chat'], undefined);
+  assert.equal(adapter.disconnects, 0);
+  const shared = await fixture(t);
+  await shared.request('connect', { mode: 'ssh', host: 'fixture-shared-host', sharedServer: true });
+  shared.adapters.get('codex').emit('notification', { method: 'turn/started', params: { threadId: 'surviving-chat', turn: { id: 'surviving-turn' } } });
+  assert.equal(shared.request('preferences').activeRuns, undefined);
 });

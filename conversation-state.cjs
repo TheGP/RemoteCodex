@@ -6,6 +6,11 @@ const { stateKey, hash } = require('./sync-state.cjs');
 const { agentTarget, agentId } = require('./agent-pool.cjs');
 const { HistoryManager } = require('./history-manager.cjs');
 
+function completionValue(status, turnId) {
+  if (status === 'interrupted') return { status: 'failed', reason: 'interrupted', ...(turnId ? { turnId } : {}) };
+  return status && turnId ? { status, turnId } : status;
+}
+
 class ConversationState {
   constructor({ directory, shared, pins, drafts, preferences, machine, options, connection, changed, log }) {
     Object.assign(this, { shared, pins, drafts, preferences, machine, options, connection, changed });
@@ -81,7 +86,7 @@ class ConversationState {
       return { ...thread, name: saved?.name || thread.name, updatedAt: saved?.updatedAt || thread.updatedAt };
     }
     const previous = this.catalog('thread', thread.id);
-    const project = Object.hasOwn(thread, 'projectId') ? this.projectId(thread.projectId) || (this.history.record(thread.id) ? previous?.project : null) || null : previous?.project || null;
+    const project = Object.hasOwn(thread, 'projectId') ? (thread.projectId ? this.projectId(thread.projectId) || previous?.project || null : null) : previous?.project || null;
     if (previous && previous.updatedAt > (thread.updatedAt || 0)) return thread;
     const value = { id: thread.id, name: thread.name || null, preview: (thread.preview || '').slice(0, 500), createdAt: thread.createdAt || 0, updatedAt: thread.updatedAt || 0, provider: thread.provider || agentTarget(thread.id, 'thread').provider, project };
     const key = stateKey('thread', this.machine(), thread.id);
@@ -190,6 +195,10 @@ class ConversationState {
     const { kind, machine, id, value } = entry;
     if (kind === 'pin') {
       if (machine === this.machine()) this.pins.set(this.options(), id, Boolean(value));
+    } else if (kind === 'note') {
+      this.preferences.update({ conversationNote: { machine, threadId: id, text: value || '' } });
+    } else if (kind === 'finished') {
+      this.preferences.update({ finishedThread: { machine, threadId: id, finished: Boolean(value) } });
     } else if (kind === 'messagePin') {
       const [threadId, itemId] = JSON.parse(id);
       this.preferences.update({ messagePin: { machine, threadId, itemId, ...(value || {}), pinned: Boolean(value) } });
@@ -198,7 +207,7 @@ class ConversationState {
       const markers = this.preferences.read().conversationStates?.[machine] || { unread: [], completions: {} };
       const unread = new Set(markers.unread), completions = { ...markers.completions };
       if (kind === 'unread') { if (value) unread.add(id); else unread.delete(id); }
-      else { if (value) completions[id] = value.status || value; else delete completions[id]; }
+      else { if (value) completions[id] = value.status === 'failed' && value.reason === 'interrupted' ? 'interrupted' : value.status || value; else delete completions[id]; }
       this.preferences.update({ conversationState: { machine, unread: [...unread], completions } });
     } else if (kind === 'draft') {
       const identity = JSON.parse(id), project = value?.project || (Array.isArray(identity[1]) && identity[1][0] === 'project' ? identity[1][1] : null);
@@ -228,8 +237,10 @@ class ConversationState {
     for (const id of this.pins.get(this.options())) this.sync.capture('pin', machine, id, true, true);
     for (const [machine, state] of Object.entries(prefs.conversationStates || {})) {
       for (const id of state.unread) this.sync.capture('unread', machine, id, true, true);
-      for (const [id, status] of Object.entries(state.completions)) this.sync.capture('completion', machine, id, status, true);
+      for (const [id, status] of Object.entries(state.completions)) this.sync.capture('completion', machine, id, completionValue(status), true);
     }
+    for (const [machine, notes] of Object.entries(prefs.conversationNotes || {})) for (const [id, text] of Object.entries(notes)) this.sync.capture('note', machine, id, text, true);
+    for (const [machine, ids] of Object.entries(prefs.finishedThreads || {})) for (const id of ids) this.sync.capture('finished', machine, id, true, true);
     for (const [machine, threads] of Object.entries(prefs.messagePins || {})) for (const [threadId, pins] of Object.entries(threads)) for (const pin of pins) this.sync.capture('messagePin', machine, JSON.stringify([threadId, pin.itemId]), pin, true);
     if (prefs.shortcuts !== undefined) this.sync.capture('shortcuts', 'access:local', 'shortcuts', prefs.shortcuts, true);
     for (const value of this.drafts.list()) this.captureDraft(value.target, true);
@@ -265,12 +276,12 @@ class ConversationState {
     await this.history.tick();
   }
   status() {
-    const conflicts = this.shared.enabled ? this.sync.conflicts().map(({ key, remote, local, version }) => ({ key, version, kind: JSON.parse(key)[0], local: local?.text ?? JSON.stringify(local, null, 2), remote: remote?.value?.text ?? JSON.stringify(remote?.value, null, 2) })) : [];
+    const conflicts = this.shared.enabled ? this.sync.conflicts().map(({ key, remote, local, version }) => ({ key, version, kind: JSON.parse(key)[0], local: typeof local === 'string' ? local : local?.text ?? JSON.stringify(local, null, 2), remote: typeof remote?.value === 'string' ? remote.value : remote?.value?.text ?? JSON.stringify(remote?.value, null, 2) })) : [];
     const catalog = this.shared.enabled ? JSON.stringify(Object.values(this.sync.state.entries).filter(entry => ['project', 'thread'].includes(entry.kind)).map(entry => entry.revision)) : '';
     const paths = this.shared.enabled ? Object.fromEntries(Object.entries(this.sync.state.bindings).filter(([key]) => JSON.parse(key)[0] === this.machine()).map(([, binding]) => [binding.nativeId, this.projectPaths(binding.id)])) : {};
     const ownership = this.history.status();
     const historyErrors = this.history.enabled ? [...this.history.errors].map(([id, failure]) => ({ id, message: failure.message })) : [];
-    return { historyErrors, paths, enabled: this.shared.enabled, error: this.sync.error, conflicts, catalog, historyEnabled: this.history.enabled, ownership };
+    return { queueErrors: this.shared.enabled ? this.sync.queueErrors() : [], historyErrors, paths, enabled: this.shared.enabled, error: this.sync.error, conflicts, catalog, historyEnabled: this.history.enabled, ownership };
   }
 }
-module.exports = { ConversationState };
+module.exports = { ConversationState, completionValue };

@@ -5,6 +5,7 @@ const { createGzip, createGunzip } = require('node:zlib');
 const { Readable } = require('node:stream');
 const { fileURLToPath, pathToFileURL } = require('node:url');
 const { hash } = require('./sync-state.cjs');
+const { CodexAttachmentStore, readCodexImage, imageExtension } = require('./codex-attachments.cjs');
 
 const maxBytes = 512 * 1024 * 1024, chunkBytes = 4 * 1024 * 1024, maxImage = 20 * 1024 * 1024;
 const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
@@ -12,13 +13,6 @@ const digest = /^[a-f0-9]{64}$/;
 const token = 'remote-codex-attachment:';
 const missingToken = 'remote-codex-missing-image:';
 const inside = (root, file) => file === root || file.startsWith(root + path.sep);
-function imageExtension(data) {
-  if (data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return '.png';
-  if (data[0] === 255 && data[1] === 216 && data[2] === 255) return '.jpg';
-  if (/^GIF8[79]a$/.test(data.subarray(0, 6).toString('ascii'))) return '.gif';
-  if (data.subarray(0, 4).toString('ascii') === 'RIFF' && data.subarray(8, 12).toString('ascii') === 'WEBP') return '.webp';
-  throw new Error('Conversation attachment is not a supported image.');
-}
 function parse(line) {
   try { return JSON.parse(line); } catch { throw new Error('Conversation history contains an invalid record.'); }
 }
@@ -38,17 +32,20 @@ async function* lines(stream) {
   }
   if (length) throw new Error('Conversation history ends with an incomplete record.');
 }
-async function transformImages(value, image, selected = false) {
+async function transformImages(value, image, selected = false, identity = null) {
   if (!value || typeof value !== 'object') return;
-  if (['localImage', 'local_image', 'LocalImage', 'ImageView'].includes(value.type) && typeof value.path === 'string') value.path = await image(value.path, value.type === 'ImageView', selected);
+  if (['localImage', 'local_image', 'LocalImage', 'ImageView', 'imageView'].includes(value.type) && typeof value.path === 'string') {
+    const view = ['ImageView', 'imageView'].includes(value.type);
+    value.path = await image(value.path, view, selected, view && identity ? { ...identity, itemId: value.id || identity.itemId } : null);
+  }
   if (value.type === 'input_image' && typeof value.image_url === 'string' && (value.image_url.startsWith('file://') || value.image_url.startsWith(token) || value.image_url.startsWith(missingToken))) value.image_url = await image(value.image_url, true, selected);
   if (value.type === 'user_message' && Array.isArray(value.local_images)) value.local_images = await Promise.all(value.local_images.map(file => image(file, false, selected)));
   for (const [key, child] of Object.entries(value)) if (key !== 'local_images') {
-    if (Array.isArray(child)) { for (const part of child) await transformImages(part, image, selected); }
-    else if (child && typeof child === 'object') await transformImages(child, image, selected);
+    if (Array.isArray(child)) { for (const part of child) await transformImages(part, image, selected, identity); }
+    else if (child && typeof child === 'object') await transformImages(child, image, selected, identity);
   }
 }
-async function exportCodexHistory({ thread, logicalId = thread?.id, home, keepBlob, attachmentRoots = [] }) {
+async function exportCodexHistory({ thread, logicalId = thread?.id, home, keepBlob, attachmentRoots = [], attachmentStore }) {
   if (!uuid.test(thread?.id) || !uuid.test(logicalId) || thread.ephemeral) throw new Error('This conversation cannot be exported.');
   home = await fs.promises.realpath(home);
   const roots = [];
@@ -75,29 +72,24 @@ async function exportCodexHistory({ thread, logicalId = thread?.id, home, keepBl
   };
   const meta = await readMeta(first.file), seen = new Set(), sources = [], attachments = new Map(), missingImages = new Set();
   if (meta.payload.id !== thread.id) throw new Error('Conversation history identity does not match.');
-  const images = async (file, _url, selected) => {
+  const images = async (file, _url, selected, identity) => {
     if (typeof file !== 'string') throw new Error('Invalid conversation image reference.');
     if (file.startsWith('file://')) file = fileURLToPath(file);
-    let real;
-    try { real = await fs.promises.realpath(file); }
+    let image;
+    try {
+      if (attachmentStore && identity?.itemId) {
+        image = attachmentStore.get(identity);
+        if (!image && identity.sourceThreadId !== identity.threadId) image = attachmentStore.get({ ...identity, threadId: identity.sourceThreadId });
+      }
+      image ||= readCodexImage(file, { home, cwd: thread.cwd, selected, attachmentRoots });
+      if (attachmentStore && identity?.itemId) image = attachmentStore.remember(identity, image);
+    }
     catch (error) {
       if (error.code !== 'ENOENT') throw error;
       const id = hash(file); missingImages.add(id); return missingToken + id;
     }
-    const workspace = thread.cwd && await fs.promises.realpath(thread.cwd);
-    let cached = false;
-    for (const root of attachmentRoots) {
-      try { if (await fs.promises.realpath(root) === root && inside(root, real)) cached = true; }
-      catch (error) { if (error.code !== 'ENOENT') throw error; }
-    }
-    if (!selected && !cached && !inside(home, real) && (!workspace || !inside(workspace, real))) throw new Error('Conversation image is outside its allowed folders.');
-    const relative = path.relative(home, real).split(path.sep);
-    if (inside(home, real) && relative.length === 1 || relative.some(part => /^(?:auth|config|credentials|tokens)(?:[._-]|$)/i.test(part)) || /\.(?:sqlite|sqlite3|db|toml)$/i.test(real)) throw new Error('Account and configuration files cannot be conversation attachments.');
-    const stat = await fs.promises.stat(real);
-    if (!stat.isFile() || stat.size > maxImage) throw new Error('Conversation image exceeds 20 MB or is not a regular file.');
-    const data = await fs.promises.readFile(real); imageExtension(data);
-    const id = keepBlob(data);
-    attachments.set(id, { hash: id, bytes: data.length, name: path.basename(real) });
+    const id = keepBlob(image.data);
+    attachments.set(id, { hash: id, bytes: image.data.length, name: image.name });
     if (attachments.size > 500) throw new Error('Conversation has too many image attachments.');
     return token + id;
   };
@@ -119,8 +111,9 @@ async function exportCodexHistory({ thread, logicalId = thread?.id, home, keepBl
       end = record.end; const row = parse(record.line);
       if (row.type === 'session_meta') continue;
       if (boundary && (!Number.isSafeInteger(row.ordinal) || row.ordinal >= boundary.end_ordinal_exclusive)) throw new Error('Conversation history boundary does not match its records.');
-      const selected = row.type === 'event_msg' && (row.payload?.type === 'user_message' || ['item_started', 'item_completed'].includes(row.payload?.type) && row.payload.item?.type === 'ImageView') || row.type === 'response_item' && row.payload?.type === 'message' && row.payload.role === 'user';
-      await transformImages(row, images, selected); yield row;
+      const selected = row.type === 'event_msg' && (row.payload?.type === 'user_message' || ['item_started', 'item_completed'].includes(row.payload?.type) && ['ImageView', 'imageView'].includes(row.payload.item?.type)) || row.type === 'response_item' && row.payload?.type === 'message' && row.payload.role === 'user';
+      const identity = { threadId: thread.id, sourceThreadId: boundary ? head.payload.id : thread.id, itemId: Number.isSafeInteger(row.ordinal) ? 'ordinal:' + row.ordinal : null };
+      await transformImages(row, images, selected, identity); yield row;
     }
     if (boundary && end !== boundary.end_byte_offset) throw new Error('Conversation history boundary is incomplete.');
   }
@@ -224,4 +217,64 @@ async function importCodexHistory({ manifest, nativeId = manifest?.id, home, cwd
     throw new Error(error.code ? 'Could not store shared conversation history.' : error.message);
   }
 }
-module.exports = { exportCodexHistory, importCodexHistory };
+async function* historyRecords(manifest, readBlob) {
+  const checksum = createHash('sha256'); let bytes = 0;
+  const input = Readable.from((async function* () {
+    for (const chunk of manifest.chunks) {
+      if (!digest.test(chunk?.hash) || !Number.isSafeInteger(chunk.bytes) || chunk.bytes <= 0 || chunk.bytes > chunkBytes) throw new Error('Invalid cached conversation chunk.');
+      const data = await readBlob(chunk.hash);
+      if (!Buffer.isBuffer(data) || data.length !== chunk.bytes || hash(data) !== chunk.hash) throw new Error('Cached conversation checksum does not match.');
+      yield data;
+    }
+  })()), output = createGunzip();
+  input.on('error', error => output.destroy(error)); input.pipe(output);
+  try {
+    for await (const { line, end } of lines(output)) {
+      if (end > manifest.bytes) throw new Error('Cached conversation size does not match.');
+      checksum.update(line + '\n'); bytes = end; yield line;
+    }
+    if (bytes !== manifest.bytes || checksum.digest('hex') !== manifest.digest) throw new Error('Cached conversation checksum does not match.');
+  } finally { input.destroy(); output.destroy(); }
+}
+async function extendsCodexHistory({ manifest, base, readBlob, allowImageViewChanges = false }) {
+  if (manifest?.format !== 'codex-rollout-v1' || base?.format !== manifest.format || !uuid.test(manifest.id) || base.id !== manifest.id || !digest.test(manifest.digest) || !digest.test(base.digest) || !Number.isSafeInteger(base.bytes) || base.bytes <= 0 || !Number.isSafeInteger(manifest.bytes) || manifest.bytes < base.bytes || manifest.bytes > maxBytes || !Array.isArray(manifest.chunks) || !manifest.chunks.length || manifest.chunks.length > 128) return false;
+  if (allowImageViewChanges) {
+    if (!Array.isArray(base.chunks) || !base.chunks.length || base.chunks.length > 128) return false;
+    const attachment = (record, snapshot) => {
+      const item = record.payload?.item, file = item?.path;
+      return record.type === 'event_msg' && ['item_started', 'item_completed'].includes(record.payload.type) && item?.type === 'ImageView' && typeof file === 'string' && file.startsWith(token) && digest.test(file.slice(token.length)) && snapshot.attachments?.some(image => image.hash === file.slice(token.length));
+    };
+    const previous = historyRecords(base, readBlob);
+    try {
+      for await (const line of historyRecords(manifest, readBlob)) {
+        const older = await previous.next();
+        if (older.done || line === older.value) continue;
+        const current = parse(line), original = parse(older.value);
+        if (!attachment(current, manifest) || !attachment(original, base)) return false;
+        current.payload.item.path = original.payload.item.path;
+        if (JSON.stringify(current) !== older.value) return false;
+      }
+      return (await previous.next()).done;
+    } finally { await previous.return(); }
+  }
+  const checksum = createHash('sha256'), prefix = createHash('sha256'); let bytes = 0;
+  const input = Readable.from((async function* () {
+    for (const chunk of manifest.chunks) {
+      if (!digest.test(chunk?.hash) || !Number.isSafeInteger(chunk.bytes) || chunk.bytes <= 0 || chunk.bytes > chunkBytes) throw new Error('Invalid cached conversation chunk.');
+      const data = await readBlob(chunk.hash);
+      if (!Buffer.isBuffer(data) || data.length !== chunk.bytes || hash(data) !== chunk.hash) throw new Error('Cached conversation checksum does not match.');
+      yield data;
+    }
+  })()), output = createGunzip();
+  input.on('error', error => output.destroy(error)); input.pipe(output);
+  try {
+    for await (const data of output) {
+      if (bytes + data.length > manifest.bytes) return false;
+      checksum.update(data);
+      if (bytes < base.bytes) prefix.update(data.subarray(0, Math.min(data.length, base.bytes - bytes)));
+      bytes += data.length;
+    }
+    return bytes === manifest.bytes && checksum.digest('hex') === manifest.digest && prefix.digest('hex') === base.digest;
+  } finally { input.destroy(); output.destroy(); }
+}
+module.exports = { exportCodexHistory, importCodexHistory, extendsCodexHistory, CodexAttachmentStore };

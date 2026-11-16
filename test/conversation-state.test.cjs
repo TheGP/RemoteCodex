@@ -541,3 +541,108 @@ test('cancelling a stale open editor preserves the newer shared draft instead of
   assert.equal(b.state.sync.conflicts()[0].remote.value.text, 'New peer draft');
   assert.equal(a.drafts.read(ta).text, 'New peer draft');
 });
+
+
+test('manual finished marks seed, sync, undo and restart without changing unread markers', async t => {
+  const { a, b } = fixture(t);
+  a.preferences.update({ finishedThread: { machine, threadId: 'done-chat', finished: true } });
+  b.preferences.update({ conversationState: { machine, unread: ['done-chat'], completions: {} } });
+  await a.state.tick(); await b.state.tick();
+  assert.deepEqual(b.preferences.read().finishedThreads[machine], ['done-chat']);
+  assert.deepEqual(b.preferences.read().conversationStates[machine].unread, ['done-chat']);
+  b.restart();
+  b.preferences.update({ finishedThread: { machine, threadId: 'done-chat', finished: false } });
+  b.state.sync.capture('finished', machine, 'done-chat', false);
+  await b.state.tick(); await a.state.tick();
+  assert.deepEqual(a.preferences.read().finishedThreads[machine], []);
+  a.restart();
+  assert.deepEqual(a.preferences.read().finishedThreads[machine], []);
+  assert.deepEqual(b.errors, []); assert.deepEqual(a.errors, []);
+});
+
+
+test('interrupted markers seed legacy-compatible failed wire values and decode locally on another computer', async t => {
+  const { a, b } = fixture(t);
+  a.preferences.update({ conversationState: { machine, unread: [], completions: { 'interrupted-chat': 'interrupted', 'failed-chat': 'failed' } } });
+  await a.state.tick();
+  const wire = a.state.catalog('completion', 'interrupted-chat');
+  assert.deepEqual(wire, { status: 'failed', reason: 'interrupted' });
+  await b.state.tick();
+  assert.equal(b.preferences.read().conversationStates[machine].completions['interrupted-chat'], 'interrupted');
+  assert.equal(b.preferences.read().conversationStates[machine].completions['failed-chat'], 'failed');
+  b.state.sync.capture('completion', machine, 'interrupted-chat', null); await b.state.tick(); await a.state.tick();
+  assert.equal(a.preferences.read().conversationStates[machine].completions['interrupted-chat'], undefined);
+  assert.equal(a.preferences.read().conversationStates[machine].completions['failed-chat'], 'failed');
+});
+
+test('conversation notes seed, sync and delete without native agent operations', async t => {
+  const { a, b } = fixture(t);
+  a.preferences.update({ conversationNote: { machine, threadId: 'shared-note-chat', text: 'A reminder\n<b>literal text</b>' } });
+  await a.state.tick(); await b.state.tick();
+  assert.equal(b.preferences.read().conversationNotes[machine]['shared-note-chat'], 'A reminder\n<b>literal text</b>');
+  b.preferences.update({ conversationNote: { machine, threadId: 'shared-note-chat', text: '' } });
+  b.state.sync.capture('note', machine, 'shared-note-chat', null); await b.state.tick(); await a.state.tick();
+  assert.equal(a.preferences.read().conversationNotes[machine]['shared-note-chat'], undefined);
+  assert.deepEqual(a.calls, []); assert.deepEqual(b.calls, []);
+});
+
+test('a new local history snapshot preserves its native project before the shared thread catalog is committed', t => {
+  const { a } = fixture(t);
+  a.connection.supports = method => method === 'thread/list';
+  const project = a.state.captureProject({ id: 'native-project', provider: 'codex', name: 'Rapidcode', roots: [{ path: a.root }] });
+  const thread = { id: 'fresh-project-chat', projectId: project.id, cwd: a.root, name: 'New analysis', createdAt: 200, updatedAt: 250, provider: 'codex' };
+  a.state.sync.state.localHistory = { [thread.id]: { path: path.join(a.root, 'fixture-history.jsonl'), digest: 'fixture', revision: 0 } };
+  a.state.history.context();
+  a.state.history.owners.set(thread.id, { owner: a.shared.state.device, epoch: 1 });
+  assert.equal(a.state.catalog('thread', thread.id), undefined);
+  const captured = a.state.captureThread(thread);
+  assert.equal(captured.projectId, project.id); assert.equal(captured.cwd, a.root);
+  assert.equal(a.state.sync.state.pending.find(op => op.kind === 'thread' && op.id === thread.id).value.project, project.sharedId);
+  const originalOrder = { [project.id]: ['older-chat', thread.id] };
+  a.preferences.update({ threadOrder: { machine, projectId: project.id, ids: originalOrder[project.id], cutoff: 200 } });
+  a.state.captureThread({ ...thread, name: 'Renamed analysis', updatedAt: 1000 });
+  assert.deepEqual(a.preferences.read().threadOrders[machine], originalOrder);
+  const ungrouped = a.state.captureThread({ ...thread, projectId: null, updatedAt: 1001 });
+  assert.equal(ungrouped.projectId, null);
+  assert.equal(a.state.sync.state.pending.find(op => op.kind === 'thread' && op.id === thread.id).value.project, null);
+  assert.deepEqual(a.calls, []);
+});
+
+test('explicit native null or empty project metadata clears a committed history catalog association', async t => {
+  for (const projectId of [null, '']) {
+    const { a, b } = fixture(t);
+    const project = a.state.captureProject({ id: 'committed-native-project', provider: 'codex', name: 'Rapidcode', roots: [{ path: a.root }] });
+    const thread = { id: 'committed-project-chat', projectId: project.id, cwd: a.root, name: 'Grouped analysis', updatedAt: 1 };
+    a.state.captureThread(thread);
+    await a.state.sync.tick(); await b.state.sync.tick();
+    assert.equal(a.state.catalog('thread', thread.id).project, project.sharedId);
+    a.connection.supports = method => method === 'thread/list';
+    a.state.history.context();
+    a.state.sync.state.localHistory[thread.id] = { path: path.join(a.root, 'fixture-history.jsonl'), digest: 'fixture', revision: 0 };
+    a.state.history.owners.set(thread.id, { owner: a.shared.state.device, epoch: 1 });
+    const result = a.state.captureThread({ ...thread, projectId, updatedAt: 2 });
+    assert.equal(result.projectId, projectId);
+    assert.equal(a.state.sync.state.pending.find(op => op.kind === 'thread' && op.id === thread.id).value.project, null);
+    await a.state.sync.tick(); await b.state.sync.tick();
+    assert.equal(a.state.catalog('thread', thread.id).project, null);
+    assert.equal(b.state.catalog('thread', thread.id).project, null);
+    assert.deepEqual(a.calls, []); assert.deepEqual(b.calls, []);
+  }
+});
+
+test('unknown nonempty native project metadata retains the shared association until its mapping arrives', async t => {
+  const { a, b } = fixture(t);
+  const project = a.state.captureProject({ id: 'known-native-project', provider: 'codex', name: 'Rapidcode', roots: [{ path: a.root }] });
+  const thread = { id: 'unknown-project-chat', projectId: project.id, cwd: a.root, name: 'Analysis', updatedAt: 1 };
+  a.state.captureThread(thread); await a.state.sync.tick(); await b.state.sync.tick();
+  const partial = { ...thread, projectId: 'not-listed-yet', updatedAt: 2 };
+  assert.equal(a.state.captureThread(partial).projectId, partial.projectId);
+  await a.state.sync.tick(); await b.state.sync.tick();
+  assert.equal(b.state.catalog('thread', thread.id).project, project.sharedId);
+  const mapped = a.state.captureProject({ id: partial.projectId, provider: 'codex', name: 'New project', roots: [{ path: path.join(a.root, 'new-folder') }] });
+  a.state.captureThread({ ...partial, updatedAt: 3 });
+  await a.state.sync.tick(); await b.state.sync.tick();
+  assert.notEqual(mapped.sharedId, project.sharedId);
+  assert.equal(b.state.catalog('thread', thread.id).project, mapped.sharedId);
+  assert.deepEqual(a.calls, []); assert.deepEqual(b.calls, []);
+});

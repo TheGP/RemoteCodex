@@ -10,7 +10,7 @@ const linkContexts = new WeakMap();
 const completionSound = { audio: null, lastAt: -Infinity };
 const messageDateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
 const schedules = { tasks: [], generation: 0 };
-const drafts = { target: null, snapshot: null, images: [], suspended: false, restoring: false, pending: new Map() };
+const drafts = { target: null, snapshot: null, images: [], suspended: false, restoring: false, pending: new Map(), dirty: false, timer: null, saveStarted: null };
 const editorDrafts = new Map();
 const timelineView = { following: true, reading: null };
 const pinnedMessages = { saving: false, jumping: null };
@@ -124,15 +124,26 @@ function trace(event, details) { try { api.log?.(event, details); } catch {} }
 function composerTarget() { return { machine: accessKey(), kind: 'composer', threadId: state.thread?.id || null, cwd: state.thread?.cwd || $('workspace').value.trim(), projectId: state.thread?.projectId || projects.selected || null }; }
 const composerExpected = saved => Object.fromEntries(['text', 'hours', 'model', 'effort', 'mode', 'access'].map(key => [key, saved?.[key] ?? null]));
 function composerSnapshot() { return { text: $('prompt').value, hours: Number($('send-time').value), model: $('model').value, effort: $('effort').value, mode: modes.plan ? 'plan' : 'default', access: $('permissions').value }; }
+function scheduleComposerDraft() {
+  if (!api.saveDraft || !drafts.target || drafts.suspended || drafts.restoring || state.sending || state.loading) return;
+  const target = drafts.target; drafts.dirty = true;
+  drafts.saveStarted ??= performance.now();
+  clearTimeout(drafts.timer);
+  drafts.timer = setTimeout(() => {
+    if (drafts.target === target) saveComposerDraft();
+    else { drafts.timer = null; drafts.saveStarted = null; }
+  }, Math.max(0, Math.min(200, 1000 - (performance.now() - drafts.saveStarted))));
+}
 function saveComposerDraft() {
+  clearTimeout(drafts.timer); drafts.timer = null; drafts.saveStarted = null;
   if (!api.saveDraft || !drafts.target || drafts.suspended || drafts.restoring || state.sending || state.loading) return false;
   const snapshot = composerSnapshot(); const images = state.images.filter(image => image.url);
   const changedImages = images.length !== drafts.images.length || images.some((image, index) => image !== drafts.images[index]?.image || image.url !== drafts.images[index]?.url);
-  if (!changedImages && drafts.snapshot && Object.keys(snapshot).every(key => snapshot[key] === drafts.snapshot[key])) return true;
+  if (!changedImages && drafts.snapshot && Object.keys(snapshot).every(key => snapshot[key] === drafts.snapshot[key])) { drafts.dirty = false; return true; }
   try {
     api.saveDraft(drafts.target, { ...snapshot, ...(changedImages ? { images } : {}) }, drafts.expected);
     drafts.expected = composerExpected(snapshot.text || images.length ? snapshot : null);
-    drafts.snapshot = snapshot; drafts.images = images.map(image => ({ image, url: image.url }));
+    drafts.snapshot = snapshot; drafts.images = images.map(image => ({ image, url: image.url })); drafts.dirty = false;
     cacheDraftIndicator(drafts.target, Boolean(snapshot.text.trim() || images.length));
     return true;
   } catch (error) { trace('draft.save.failed', { threadId: drafts.target.threadId, error: error.message }); showError(`Could not save unsent draft: ${error.message}`); return false; }
@@ -145,7 +156,7 @@ function cacheDraftIndicator(target, pending) {
   if (target?.kind !== 'composer' || !target.threadId) return;
   const key = target.machine + ':' + target.threadId;
   if (drafts.pending.get(key) === pending) return;
-  drafts.pending.set(key, pending); renderThreadIndicators();
+  drafts.pending.set(key, pending); if (target.machine === accessKey()) renderThreadIndicators(target.threadId);
 }
 function editorTarget(kind, thread, itemId) { return { machine: accessKey(), kind, threadId: thread.id, cwd: thread.cwd, projectId: thread.projectId || null, itemId }; }
 function editorText(target, text) {
@@ -194,7 +205,7 @@ function activateComposerDraft() {
       if (['read-only', 'workspace-write', 'danger-full-access'].includes(saved.access)) $('permissions').value = saved.access;
       modes.plan = saved.mode === 'plan'; if (state.thread) modes.threads.set(state.thread.id, modes.plan);
     } else { $('prompt').value = ''; state.images = []; $('send-time').value = '0'; }
-    renderImages(); drafts.snapshot = composerSnapshot(); drafts.images = state.images.map(image => ({ image, url: image.url }));
+    renderImages(); drafts.snapshot = composerSnapshot(); drafts.images = state.images.map(image => ({ image, url: image.url })); drafts.dirty = false;
   } catch (error) { showError(`Could not restore unsent draft: ${error.message}`); }
   finally { drafts.restoring = false; }
 }
@@ -440,8 +451,8 @@ function conversationAccess() { return conversationSync.historyEnabled && state.
 function conversationReadOnly() { const access = conversationAccess(); return Boolean(access && (!access.owned || access.requested)); }
 function renderConversationAccess() {
   const access = conversationAccess(), panel = $('conversation-ownership');
-  panel.hidden = !access || access.owned && !access.requested;
-  $('conversation-owner').textContent = !access ? '' : access.owned ? 'Transfer requested · finish the current task to hand over' : access.waiting ? `Waiting for ${access.name} to finish and sync` : `${access.busy ? 'Running on' : 'Read only · owned by'} ${access.name}`;
+  panel.hidden = !access || access.owned && !access.requested && !access.syncPending && !access.needsHistory;
+  $('conversation-owner').textContent = !access ? '' : access.owned ? access.requested ? 'Transfer requested · finish the current task to hand over' : access.needsHistory ? 'Load the shared history to continue on this computer' : access.syncPending ? 'Local chat · history upload pending' : '' : access.waiting ? `Waiting for ${access.name} to finish and sync` : `${access.busy ? 'Running on' : 'Read only · owned by'} ${access.name}`;
   const button = $('take-conversation'); button.hidden = Boolean(access?.owned); button.textContent = access?.waiting ? 'Transfer requested' : 'Use on this computer';
   button.disabled = !state.connected || state.loading || state.sending || Boolean(access?.waiting) || Boolean(conversationSync.requesting);
   $('load-synced-history').hidden = !access?.updatesAvailable;
@@ -479,6 +490,7 @@ async function stopTurn() {
   finally { if (state.interrupting === operation) state.interrupting = null; updateSendButton(); }
 }
 function updateBusy() {
+  renderFinishedButton();
   renderConversationSyncNotice();
   for (const button of $('shortcut-buttons').children) button.disabled = shortcutUnavailable({ mode: button.dataset.mode });
   const compact = state.connected && compacting.has(state.thread?.id);
@@ -512,7 +524,7 @@ function updateBusy() {
   renderUsage();
   renderMessagePins();
   updateMessageEdits();
-  saveComposerDraft();
+  if (!drafts.timer) saveComposerDraft();
 }
 function updateMessageEdits() {
   const turns = new Set();
@@ -915,15 +927,19 @@ function interactionStatus(threadId) {
   const request = [...state.requests.values()].find(request => !request.params.threadId || request.params.threadId === threadId);
   return request ? ['item/tool/requestUserInput', 'mcpServer/elicitation/request'].includes(request.method) ? 'Waiting for your answer' : 'Waiting for your approval' : null;
 }
-function renderThreadIndicators() {
+function renderThreadIndicators(threadId = null) {
+  renderFinishedButton();
+  const finished = new Set(preferences.finishedThreads?.[accessKey()] || []);
   const threads = new Map([...state.threads, ...state.pinnedThreads.values()].map(thread => [thread.id, thread]));
-  for (const button of $('threads').querySelectorAll('.thread')) {
+  const selector = threadId ? `.thread[data-thread-id="${CSS.escape(threadId)}"]` : '.thread';
+  for (const button of $('threads').querySelectorAll(selector)) {
     const threadId = button.dataset.threadId;
     const thread = threads.get(threadId);
     const waiting = interactionStatus(threadId);
     const compact = state.connected && compacting.has(threadId);
     const working = !waiting && state.connected && (compact || state.active.has(threadId) || state.dispatching.has(queueKey(threadId)) || thread?.status?.type === 'active');
     const completion = state.completions.get(queueKey(threadId));
+    const interrupted = completion === 'interrupted';
     const unread = state.unread.has(queueKey(threadId));
     const key = queueKey(threadId);
     if (!drafts.pending.has(key)) {
@@ -933,7 +949,8 @@ function renderThreadIndicators() {
     const visibleDraft = state.thread?.id === threadId && drafts.target?.threadId === threadId && drafts.target.machine === accessKey() && !drafts.suspended && !state.loading;
     const pending = visibleDraft ? Boolean($('prompt').value.trim() || state.images.length) : drafts.pending.get(key);
     button.classList.toggle('unread', unread);
-    const label = waiting || (compact ? 'Compacting context…' : working ? 'Working…' : pending ? 'Unsent prompt' : unread ? 'Unread' : completion === 'completed' ? 'Finished' : completion === 'failed' ? 'Failed' : '');
+    button.classList.toggle('is-finished', finished.has(threadId));
+    const label = waiting || (compact ? 'Compacting context…' : working ? 'Working…' : interrupted ? 'Interrupted' : pending ? 'Unsent prompt' : unread ? 'Unread' : completion === 'completed' ? 'Finished' : completion === 'failed' ? 'Failed' : '');
     const scheduled = scheduledFor(threadId);
     let clock = button.querySelector('.thread-schedule');
     const scheduledLabel = scheduled.length ? `${scheduled.length} scheduled message(s); next ${new Date(scheduled[0].runAt).toLocaleString()}` : '';
@@ -946,7 +963,7 @@ function renderThreadIndicators() {
       }
       clock.title = scheduledLabel; clock.setAttribute('aria-label', scheduledLabel);
     }
-    const description = [label, pending && (waiting || working) ? 'Unsent prompt' : '', pending && unread ? 'Unread' : '', scheduledLabel].filter(Boolean).join(' · ');
+    const description = [finished.has(threadId) ? 'Marked finished' : '', label, pending && (waiting || working || interrupted) ? 'Unsent prompt' : '', (pending || interrupted) && unread ? 'Unread' : '', scheduledLabel].filter(Boolean).join(' · ');
     const title = button.querySelector('strong').textContent;
     button.title = title + (description ? ' · ' + description : '');
     if (description) button.setAttribute('aria-label', button.title); else button.removeAttribute('aria-label');
@@ -954,10 +971,28 @@ function renderThreadIndicators() {
     if (!label) { indicator?.remove(); continue; }
     if (!indicator) { indicator = document.createElement('span'); indicator.setAttribute('role', 'img'); }
     button.prepend(indicator);
-    indicator.className = 'thread-state ' + (waiting ? 'waiting' : working ? 'working' : pending ? 'draft' : unread ? 'unread' : completion);
+    indicator.className = 'thread-state ' + (waiting ? 'waiting' : working ? 'working' : interrupted ? 'failed' : pending ? 'draft' : unread ? 'unread' : completion);
     indicator.setAttribute('aria-label', label); indicator.title = label;
   }
 }
+function renderFinishedButton() {
+  const button = $('mark-finished');
+  const finished = Boolean(state.thread && preferences.finishedThreads?.[accessKey()]?.includes(state.thread.id));
+  button.hidden = !state.thread;
+  button.disabled = Boolean(state.finishing);
+  button.textContent = finished ? '✓ Finished' : 'Mark finished';
+  button.title = finished ? 'Mark unfinished' : 'Mark conversation finished';
+  button.setAttribute('aria-pressed', String(finished));
+}
+$('mark-finished').onclick = async () => {
+  if (!state.thread || state.finishing) return;
+  const machine = accessKey(), threadId = state.thread.id;
+  const finished = !preferences.finishedThreads?.[machine]?.includes(threadId);
+  state.finishing = true; renderFinishedButton();
+  try { await savePreferences({ finishedThread: { machine, threadId, finished } }); }
+  catch (error) { showError(`Could not save finished conversation: ${error.message}`); }
+  finally { state.finishing = false; renderThreadIndicators(); }
+};
 function restoreUnread() {
   const machine = accessKey();
   const prefix = accessKey() + ':';
@@ -1160,6 +1195,7 @@ function resetThread(folder) {
   $('older-turns').hidden = true;
   $('thread-title').textContent = 'New conversation';
   $('thread-path').textContent = $('workspace').value;
+  renderConversationNote();
   $('prompt').value = '';
   activateComposerDraft();
   syncComposerAgent();
@@ -1175,6 +1211,7 @@ function setThread(thread) {
   if (state.pinnedIds.has(thread.id)) state.pinnedThreads.set(thread.id, thread);
   $('thread-title').textContent = titleOf(thread);
   $('thread-path').textContent = thread.cwd;
+  renderConversationNote();
   $('welcome').hidden = true;
   const keepDraftSettings = api.draft && drafts.target && ($('prompt').value || state.images.length);
   if (!keepDraftSettings) {
@@ -1187,6 +1224,39 @@ function setThread(thread) {
   renderRequests();
   updateBusy();
 }
+const noteEditor = { target: null, saving: false };
+function renderConversationNote() {
+  const button = $('conversation-note');
+  button.hidden = !state.thread;
+  const text = preferences.conversationNotes?.[accessKey()]?.[state.thread?.id] || '';
+  button.textContent = text || 'Add note'; button.dataset.empty = String(!text);
+  button.title = text ? 'Edit note: ' + text : 'Add a conversation note';
+}
+$('conversation-note').onclick = () => {
+  if (!state.thread || noteEditor.saving) return;
+  const machine = accessKey(), threadId = state.thread.id;
+  const expected = preferences.conversationNotes?.[machine]?.[threadId] || '';
+  noteEditor.target = { machine, threadId, expected };
+  $('note-text').value = expected; $('delete-note').hidden = !expected; $('note-error').hidden = true;
+  $('note-dialog').showModal(); $('note-text').focus();
+};
+async function saveConversationNote(text) {
+  const target = noteEditor.target;
+  if (!target || noteEditor.saving) return;
+  noteEditor.saving = true;
+  for (const control of $('note-form').elements) control.disabled = true;
+  try {
+    await savePreferences({ conversationNote: { ...target, text } });
+    renderConversationNote(); $('note-dialog').close();
+  } catch (error) { $('note-error').textContent = error.message; $('note-error').hidden = false; }
+  finally { noteEditor.saving = false; for (const control of $('note-form').elements) control.disabled = false; }
+}
+$('note-form').onsubmit = event => { event.preventDefault(); return saveConversationNote($('note-text').value); };
+$('delete-note').onclick = () => saveConversationNote('');
+$('cancel-note').onclick = () => $('note-dialog').close();
+$('note-dialog').oncancel = event => { if (noteEditor.saving) event.preventDefault(); };
+$('note-dialog').onclose = () => { noteEditor.target = null; };
+
 async function openThread(thread, allowBusy = false, refreshHistory = false) {
   if (!state.connected || state.sending || state.commandBusy && !allowBusy) return;
   if (thread.needsFolder) {
@@ -1308,6 +1378,18 @@ function markdown(element, text) {
     ALLOW_ARIA_ATTR: false,
     ALLOWED_URI_REGEXP: /^(?:(?:https?|file):|[a-z]:[\\/]|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
   });
+  for (const pre of element.querySelectorAll('pre')) {
+    const block = document.createElement('div'); block.className = 'code-block';
+    const copy = document.createElement('button'); copy.type = 'button'; copy.className = 'copy-code'; copy.textContent = 'Copy'; copy.setAttribute('aria-label', 'Copy code');
+    copy.onclick = async () => {
+      copy.disabled = true;
+      try { await api.copyText((pre.querySelector('code') || pre).textContent); copy.textContent = 'Copied'; }
+      catch { copy.textContent = 'Try again'; }
+      finally { copy.disabled = false; }
+      setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
+    };
+    pre.replaceWith(block); block.append(copy, pre);
+  }
   for (const link of element.querySelectorAll('a[href]')) linkContexts.set(link, { machine: accessKey(), threadId: state.thread?.id, provider: threadProvider(state.thread), cwd: state.thread?.cwd || $('workspace').value });
   for (const placeholder of element.querySelectorAll('[data-codex-image]')) {
     const token = images[Number(placeholder.dataset.codexImage)];
@@ -1655,7 +1737,8 @@ function renderItem(item, prepend = false, turnId = null, container = $('message
       record.pinButton = document.createElement('button'); record.pinButton.type = 'button'; record.pinButton.className = 'message-pin'; record.pinButton.innerHTML = pinIcon;
       record.pinButton.onclick = () => {
         if (state.items.get(record.item.id) !== record) return;
-        const preview = `${record.item.type === 'userMessage' ? 'You' : agentName()}: ${record.body.textContent.trim().replace(/\s+/g, ' ') || 'Image'}`.slice(0, 200);
+        const content = record.body.cloneNode(true); content.querySelectorAll('.copy-code').forEach(button => button.remove());
+        const preview = `${record.item.type === 'userMessage' ? 'You' : agentName()}: ${content.textContent.trim().replace(/\s+/g, ' ') || 'Image'}`.slice(0, 200);
         return saveMessagePin({ itemId: record.item.id, turnId: record.turnId, preview }, !currentMessagePins().some(pin => pin.itemId === record.item.id)).catch(showError);
       };
     }
@@ -1886,24 +1969,48 @@ function renderConversationSyncNotice() {
   const notice = $('conversation-sync-notice');
   const sync = conversationSync.status;
   if (!sync || conversationSync.statusOptions !== state.options) { notice.hidden = true; return; }
+  const belongsHere = entry => {
+    let kind = entry.kind, id = entry.id;
+    if (!id && entry.key) { try { [kind, , id] = JSON.parse(entry.key); } catch { return true; } }
+    if (kind === 'draft' || kind === 'messagePin') { try { const parts = JSON.parse(id); id = kind === 'draft' ? parts[1] : parts[0]; } catch { return true; } }
+    return kind === 'shortcuts' || typeof id === 'string' && id === state.thread?.id;
+  };
   const historyError = sync.historyErrors?.find(failure => failure.id === state.thread?.id);
-  const message = sync.error ? 'Sync: ' + sync.error : historyError ? 'This conversation’s history could not sync: ' + historyError.message : null;
-  const conflict = sync.conflicts[0];
+  const queueError = sync.queueErrors?.find(belongsHere);
+  const message = sync.error ? 'Sync paused: ' + sync.error : historyError ? 'Local history kept · upload paused: ' + historyError.message : queueError ? 'Sync needs attention: ' + queueError.message : null;
+  const conflict = sync.conflicts.find(belongsHere);
   notice.hidden = !message && !conflict;
-  const signature = JSON.stringify([message, sync.conflicts]);
+  const signature = JSON.stringify([message, conflict, state.thread?.id]);
   if (notice.dataset.signature !== signature) {
     notice.dataset.signature = signature; notice.replaceChildren();
     if (message) { const error = document.createElement('span'); error.textContent = message; notice.append(error); }
+    if ((historyError || queueError?.kind === 'history') && state.thread && api.retryHistorySync) {
+      const button = document.createElement('button'), thread = state.thread, options = state.options;
+      button.type = 'button'; button.className = 'subtle'; button.textContent = 'Retry sync';
+      button.onclick = async () => {
+        if (state.options !== options || state.thread?.id !== thread.id) return;
+        button.disabled = true;
+        try { await api.retryHistorySync(thread.id); await refreshConversationSync(); }
+        catch (error) { showError(error); }
+        finally { button.disabled = false; }
+      };
+      notice.append(button);
+    }
     if (conflict) {
       const details = document.createElement('details'), summary = document.createElement('summary'), preview = document.createElement('pre');
-      summary.textContent = conflict.kind === 'history' ? 'Conversation history changed on both computers' : conflict.kind === 'shortcuts' ? 'Shortcuts changed on both computers' : 'Draft changed on both computers';
+      summary.textContent = conflict.kind === 'history' ? 'Conversation history changed on both computers' : conflict.kind === 'shortcuts' ? 'Shortcuts changed on both computers' : conflict.kind === 'note' ? 'Note changed on both computers' : 'Draft changed on both computers';
       preview.textContent = `This computer:\n${conflict.local || '(empty)'}\n\nOther computer:\n${conflict.remote || '(empty)'}`;
       details.append(summary, preview); notice.append(details);
       for (const [label, choice] of [['Keep this version', 'local'], ['Use other version', 'remote']]) {
         const button = document.createElement('button'); button.type = 'button'; button.className = 'subtle'; button.textContent = label;
         button.onclick = async () => {
           button.disabled = true;
-          try { await api.resolveSyncConflict(conflict.key, choice, conflict.version); await refreshConversationSync(); }
+          try {
+            const options = state.options, thread = state.thread;
+            const result = await api.resolveSyncConflict(conflict.key, choice, conflict.version);
+            if (thread && result?.reloadedThread === thread.id && options === state.options && state.thread?.id === thread.id) await openThread(thread, true);
+            await refreshConversationSync();
+          }
           catch (error) { showError(error); await refreshConversationSync(); }
           finally { button.disabled = false; }
         };
@@ -1934,6 +2041,8 @@ async function refreshConversationSync() {
       refreshEditorDrafts(editors);
       preferences.conversationStates = saved.conversationStates || {};
       preferences.messagePins = saved.messagePins || {};
+      preferences.finishedThreads = saved.finishedThreads || {};
+      preferences.conversationNotes = saved.conversationNotes || {}; renderConversationNote();
       preferences.shortcuts = saved.shortcuts;
       const pinsChanged = JSON.stringify([...state.pinnedIds].sort()) !== JSON.stringify([...pins].sort());
       restoreUnread(); state.pinnedIds = new Set(pins);
@@ -1941,7 +2050,7 @@ async function refreshConversationSync() {
       for (const thread of state.threads) if (state.pinnedIds.has(thread.id)) state.pinnedThreads.set(thread.id, thread);
       drafts.pending.clear(); renderThreads(); renderMessagePins(); renderShortcuts();
       conversationSync.status = sync; conversationSync.statusOptions = options; renderConversationSyncNotice();
-      if (!state.loading && !state.sending && !drafts.suspended && target && target === drafts.target && snapshot === drafts.snapshot) {
+      if (!state.loading && !state.sending && !drafts.suspended && !drafts.dirty && target && target === drafts.target && snapshot === drafts.snapshot) {
         const value = api.draft(target);
         if ((value?.text || '') !== $('prompt').value || JSON.stringify(value?.images || []) !== JSON.stringify(state.images)) {
           drafts.target = null; activateComposerDraft(); updateBusy();
@@ -2384,6 +2493,7 @@ async function send(event, steer = false, action = null) {
   if ((!text && !images.length) || images.some(image => !image.url) || !state.connected || state.sending || state.loading) return;
   if (modelUnavailable()) { showError(`${agentName()} model is unavailable. Reconnect or select another model.`); return; }
   if (conversationReadOnly()) { showError('Use this conversation on this computer before sending messages.'); return; }
+  $('error').hidden = true;
   saveComposerDraft(); const originalDraft = drafts.target;
   const delayHours = !steer && !action ? Number($('send-time').value) : 0;
   const input = [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...images.map(image => ({ type: 'image', url: image.url })), ...skillInputs(text, action?.skills)];
@@ -2714,6 +2824,7 @@ async function connect(options) {
     if (!connected) { $('settings-dialog').close(); renderModels(); return; }
     $('workspace').value = isLocal() ? options.localCwd : options.cwd;
     $('thread-path').textContent = $('workspace').value;
+  renderConversationNote();
     $('settings-dialog').close();
     $('error').hidden = true;
     resetThread();
@@ -2849,7 +2960,7 @@ function handleNotification(message) {
     const activeTurn = state.active.get(params.threadId);
     if (!state.finished.has(params.turn.id) && (!activeTurn || activeTurn === params.turn.id)) {
       setThreadRuntimeStatus(params.threadId, { type: 'idle' });
-      if (['completed', 'failed'].includes(params.turn.status)) {
+      if (['completed', 'failed', 'interrupted'].includes(params.turn.status)) {
         if (isViewingLatest(params.threadId)) { setCompletion(params.threadId); setUnread(params.threadId, false); }
         else setCompletion(params.threadId, params.turn.status);
       }
@@ -3460,7 +3571,8 @@ function restoreAccess() {
   const saved = localStorage.getItem(accessKey());
   $('permissions').value = ['read-only', 'workspace-write', 'danger-full-access'].includes(saved) ? saved : 'workspace-write';
 }
-$('prompt').oninput = () => { slash.dismissed = null; slash.index = 0; slash.skillOnly = false; saveComposerDraft(); renderThreadIndicators(); updateSendButton(); updateSlash(); };
+$('prompt').oninput = () => { slash.dismissed = null; slash.index = 0; slash.skillOnly = false; scheduleComposerDraft(); cacheDraftIndicator(drafts.target, Boolean($('prompt').value.trim() || state.images.length)); updateSendButton(); updateSlash(); };
+$('prompt').addEventListener('blur', () => saveComposerDraft());
 $('prompt').onkeydown = promptKeydown;
 $('plan-mode').onclick = () => { modes.plan = false; if (state.thread) modes.threads.set(state.thread.id, false); updateBusy(); };
 $('model').onchange = () => { syncComposerAgent(); updateEfforts(); usage.threads.delete(state.thread?.id); updateBusy(); };

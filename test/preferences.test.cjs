@@ -194,3 +194,70 @@ test('invalid pins, excess pins, and failed writes preserve saved message pins',
   fs.writeFileSync(file, JSON.stringify({ ...saved, messagePins: { 'access:local': { chat: [{ itemId: 'bad' }] } } }));
   assert.throws(() => store.read(), /Invalid saved message pins/);
 });
+
+
+test('manual finished marks persist independently of unread state and remain scoped to each machine', t => {
+  const file = fixture(t), store = new PreferencesStore(file);
+  store.update({ conversationState: { machine: 'access:local', unread: ['chat'], completions: { chat: 'failed' } } });
+  const mark = { machine: 'access:local', threadId: 'chat', finished: true };
+  store.update({ finishedThread: mark }); store.update({ finishedThread: mark });
+  store.update({ finishedThread: { ...mark, machine: 'access:other:22' } });
+  const reopened = new PreferencesStore(file);
+  assert.deepEqual(reopened.read().finishedThreads, { 'access:local': ['chat'], 'access:other:22': ['chat'] });
+  reopened.update({ conversationState: { machine: 'access:local', unread: [], completions: {} } });
+  assert.deepEqual(reopened.read().finishedThreads['access:local'], ['chat']);
+  for (const value of [null, { ...mark, machine: '__proto__' }, { ...mark, threadId: '' }, { ...mark, finished: 'yes' }]) assert.throws(() => reopened.update({ finishedThread: value }));
+  fs.mkdirSync(file + '.tmp');
+  assert.throws(() => reopened.update({ finishedThread: { ...mark, finished: false } }));
+  assert.deepEqual(reopened.read().finishedThreads['access:local'], ['chat']);
+  fs.rmdirSync(file + '.tmp');
+  reopened.update({ finishedThread: { ...mark, finished: false } });
+  assert.deepEqual(reopened.read().finishedThreads, { 'access:local': [], 'access:other:22': ['chat'] });
+});
+
+test('active runs recover as interrupted after restart without losing other conversation preferences', t => {
+  const file = fixture(t), store = new PreferencesStore(file);
+  store.update({ theme: 'purple', conversationState: { machine: 'access:local', unread: ['local-chat'], completions: { done: 'completed' } }, finishedThread: { machine: 'access:local', threadId: 'finished-chat', finished: true } });
+  store.recordRun('access:local', 'local-chat', 'local-turn', 'codex');
+  store.recordRun('access:local', 'agent:sample:thread:chat', 'agent:sample:turn:turn', 'sample');
+  store.recordRun('access:user@host:22', 'remote-chat', 'remote-turn', 'codex');
+  const reopened = new PreferencesStore(file), recovered = reopened.recoverInterruptedRuns();
+  assert.equal(recovered.length, 3);
+  assert.deepEqual(reopened.read().conversationStates['access:local'], { unread: ['local-chat'], completions: { done: 'completed', 'local-chat': 'interrupted', 'agent:sample:thread:chat': 'interrupted' } });
+  assert.equal(reopened.read().conversationStates['access:user@host:22'].completions['remote-chat'], 'interrupted');
+  assert.equal(reopened.read().activeRuns, undefined);
+  assert.deepEqual(reopened.read().finishedThreads['access:local'], ['finished-chat']); assert.equal(reopened.read().theme, 'purple');
+  assert.deepEqual(new PreferencesStore(file).recoverInterruptedRuns(), []);
+  reopened.update({ conversationState: { machine: 'access:local', unread: [], completions: { done: 'completed' } } });
+  assert.equal(new PreferencesStore(file).read().conversationStates['access:local'].completions['local-chat'], undefined);
+});
+
+test('run completions are fenced by machine, provider and exact turn, including early and duplicate events', t => {
+  const file = fixture(t), store = new PreferencesStore(file);
+  store.recordRun('access:local', 'chat', 'old-turn');
+  store.recordRun('access:local', 'chat', 'new-turn');
+  assert.equal(store.finishRun('access:local', 'chat', 'old-turn'), false);
+  assert.equal(store.finishRun('access:local', 'chat', 'new-turn', 'sample'), false);
+  assert.equal(store.finishRun('access:other-host:22', 'chat', 'new-turn'), false);
+  assert.equal(store.recordRun('access:local', 'chat', 'old-turn'), false);
+  assert.equal(store.read().activeRuns['access:local'].chat.turnId, 'new-turn');
+  assert.equal(store.finishRun('access:local', 'chat', 'new-turn'), true);
+  assert.equal(store.recordRun('access:local', 'chat', 'new-turn'), false);
+  store.finishRun('access:local', 'fast-chat', 'fast-turn');
+  assert.equal(store.recordRun('access:local', 'fast-chat', 'fast-turn'), false);
+  assert.deepEqual(new PreferencesStore(file).recoverInterruptedRuns(), []);
+  for (const args of [['access:local', undefined, 'turn'], ['access:local', '__proto__', 'turn'], ['access:local', 'chat', null], ['access:local', 'chat', 'turn', null], ['not-a-machine', 'chat', 'turn']]) assert.throws(() => store.recordRun(...args), /Invalid active run/);
+});
+
+test('conversation notes persist per machine and chat, validate text and remove empty notes', t => {
+  const file = fixture(t), store = new PreferencesStore(file);
+  store.update({ theme: 'purple', conversationNote: { machine: 'access:local', threadId: 'chat-a', text: '  First line\nSecond line <b>literal</b>  ' } });
+  store.update({ conversationNote: { machine: 'access:local', threadId: 'chat-b', text: 'Other chat' } });
+  store.update({ conversationNote: { machine: 'access:remote:22', threadId: 'chat-a', text: 'Other machine' } });
+  assert.equal(new PreferencesStore(file).read().conversationNotes['access:local']['chat-a'], 'First line\nSecond line <b>literal</b>');
+  for (const value of [null, { machine: 'invalid', threadId: 'chat-a', text: 'x' }, { machine: 'access:local', threadId: '__proto__', text: 'x' }, { machine: 'access:local', threadId: 'chat-a', text: 'x'.repeat(4001) }, { machine: 'access:local', threadId: 'chat-a', text: 'bad\0note' }, { machine: 'access:local', threadId: 'chat-a', text: 2 }]) assert.throws(() => store.update({ conversationNote: value }), /Invalid conversation note/);
+  store.update({ conversationNote: { machine: 'access:local', threadId: 'chat-a', text: ' \n ' } });
+  const saved = new PreferencesStore(file).read();
+  assert.equal(saved.conversationNotes['access:local']['chat-a'], undefined);
+  assert.equal(saved.conversationNotes['access:local']['chat-b'], 'Other chat'); assert.equal(saved.conversationNotes['access:remote:22']['chat-a'], 'Other machine'); assert.equal(saved.theme, 'purple');
+});

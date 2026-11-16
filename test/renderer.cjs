@@ -22,6 +22,17 @@ async function checks() {
     if ('completionSound' in patch) savedPreferences.completionSound = patch.completionSound;
     if ('completionVolume' in patch) savedPreferences.completionVolume = patch.completionVolume;
     if ('skipTestDiffs' in patch) savedPreferences.skipTestDiffs = patch.skipTestDiffs;
+    if (patch.conversationNote) {
+      const { machine, threadId, text } = patch.conversationNote;
+      savedPreferences.conversationNotes ||= {}; savedPreferences.conversationNotes[machine] ||= {};
+      if (text.trim()) savedPreferences.conversationNotes[machine][threadId] = text.trim(); else delete savedPreferences.conversationNotes[machine][threadId];
+    }
+    if (patch.finishedThread) {
+      const { machine, threadId, finished } = patch.finishedThread;
+      const ids = new Set(savedPreferences.finishedThreads?.[machine] || []);
+      if (finished) ids.add(threadId); else ids.delete(threadId);
+      savedPreferences.finishedThreads = { ...savedPreferences.finishedThreads, [machine]: [...ids] };
+    }
     if (patch.messagePin) {
       const { machine, threadId, itemId, turnId, preview, pinned } = patch.messagePin;
       savedPreferences.messagePins ||= {}; savedPreferences.messagePins[machine] ||= {};
@@ -41,6 +52,42 @@ async function checks() {
     }
     return structuredClone(savedPreferences);
   };
+  {
+    const previous = { thread: state.thread, threads: state.threads, options: state.options, pinnedIds: state.pinnedIds, finishing: state.finishing };
+    const previousFinished = preferences.finishedThreads, writer = api.savePreferences;
+    state.options = { mode: 'local' }; state.thread = { id: 'manual-done', name: 'A finished conversation' };
+    state.threads = [state.thread]; state.pinnedIds = new Set([state.thread.id]);
+    renderThreads(); updateBusy();
+    check(!$('mark-finished').hidden && $('mark-finished').textContent === 'Mark finished', 'Finished button missing from selected conversation');
+    const order = [...$('threads').querySelectorAll('.thread')].map(row => row.dataset.threadId).join();
+    const beforeUnread = [...state.unread].join(), beforeWorking = [...state.active].join();
+    await $('mark-finished').onclick();
+    const row = () => $('threads').querySelector('[data-thread-id="manual-done"]');
+    check(row().classList.contains('is-finished') && $('mark-finished').getAttribute('aria-pressed') === 'true' && $('mark-finished').title === 'Mark unfinished', 'Finished mark did not mute the title or expose undo');
+    check(getComputedStyle(row().querySelector('strong')).color === getComputedStyle($('mark-finished')).color, `Pinned finished title did not use the muted color: ${getComputedStyle(row().querySelector('strong')).color} vs ${getComputedStyle($('mark-finished')).color}`);
+    check([...state.unread].join() === beforeUnread && [...state.active].join() === beforeWorking && [...$('threads').querySelectorAll('.thread')].map(row => row.dataset.threadId).join() === order, 'Finished mark changed unread state, running work, or list order');
+    preferences.finishedThreads = structuredClone((await api.preferences()).finishedThreads); renderThreads();
+    check(row().classList.contains('is-finished'), 'Reloading preferences lost the finished mark');
+    state.options = { mode: 'ssh', host: 'other-computer', port: 22, user: 'test' }; renderThreads();
+    check(!row().classList.contains('is-finished'), 'Finished mark leaked into another machine');
+    state.options = { mode: 'local' }; renderThreads();
+    api.savePreferences = async () => { throw new Error('Disk full'); };
+    await $('mark-finished').onclick();
+    check(row().classList.contains('is-finished') && !$('mark-finished').disabled, 'Failed finished save lost its mark or disabled retry');
+    api.savePreferences = writer; $('error').hidden = true;
+    await $('mark-finished').onclick();
+    check(!row().classList.contains('is-finished'), 'Finished mark could not be undone');
+    let releaseSave; api.savePreferences = patch => new Promise(resolve => { releaseSave = () => writer(patch).then(resolve); });
+    const saving = $('mark-finished').onclick();
+    check($('mark-finished').disabled, 'Finished save allowed duplicate clicks');
+    state.thread = { id: 'different-chat', name: 'Still open' }; renderFinishedButton();
+    releaseSave(); await saving;
+    check(!$('mark-finished').disabled && $('mark-finished').getAttribute('aria-pressed') === 'false' && savedPreferences.finishedThreads['access:local'].includes('manual-done'), 'Switching chats during save marked the wrong chat');
+    state.thread = null; renderFinishedButton(); check($('mark-finished').hidden, 'Finished control appeared without a conversation');
+    api.savePreferences = writer; preferences.finishedThreads = previousFinished; delete savedPreferences.finishedThreads;
+    Object.assign(state, previous); renderThreads(); updateBusy();
+    results.push('manual finished marks mute pinned and normal titles, persist, undo, stay machine-scoped, preserve running/unread state, handle save errors and chat switches');
+  }
   const savedQueues = new Map();
   api.saveQueue = async queue => { const saved = structuredClone(queue); if (saved.messages.length) savedQueues.set(saved.key, saved); else savedQueues.delete(saved.key); };
   api.queues = async () => [...savedQueues.values()].map(queue => structuredClone(queue));
@@ -1086,14 +1133,14 @@ async function checks() {
   handleNotification({ method: 'turn/started', params: { threadId: statusB.id, turn: { id: 'status-stop' } } });
   handleNotification({ method: 'turn/completed', params: { threadId: statusB.id, turn: { id: 'status-stop', status: 'interrupted' } } });
   await settle();
-  check(!indicator(statusB.id), 'Interrupted conversation retained a spinner or success dot');
+  check(indicator(statusB.id)?.classList.contains('failed') && indicator(statusB.id).title === 'Interrupted', 'Unseen interrupted conversation did not show a red Interrupted marker');
   state.dispatching.add(queueKey(statusA.id)); updateBusy();
   check(indicator(statusA.id)?.classList.contains('working'), 'Sending a message did not immediately show activity');
   state.dispatching.delete(queueKey(statusA.id)); updateBusy();
   handleNotification({ method: 'thread/status/changed', params: { threadId: statusB.id, status: { type: 'active', activeFlags: [] } } });
   check(indicator(statusB.id)?.classList.contains('working'), 'Runtime status notification did not show activity');
   state.connected = false; updateBusy();
-  check(!indicator(statusB.id), 'Disconnected conversation still appeared to be working');
+  check(!indicator(statusB.id)?.classList.contains('working'), 'Disconnected conversation still appeared to be working');
   state.connected = true;
   handleNotification({ method: 'thread/status/changed', params: { threadId: statusB.id, status: { type: 'idle' } } });
   handleNotification({ method: 'turn/started', params: { threadId: statusB.id, turn: { id: 'status-final' } } });
@@ -1112,6 +1159,13 @@ async function checks() {
   try {
     state.options = { mode: 'ssh', host: 'status-test', port: 22 };
     setThread(statusA); state.loading = false; scrollToBottom(true);
+    setCompletion(statusA.id, 'interrupted'); setUnread(statusA.id, true);
+    drafts.pending.set(queueKey(statusA.id), true); renderThreadIndicators(statusA.id);
+    check(indicator(statusA.id)?.classList.contains('failed') && indicator(statusA.id).title === 'Interrupted' && indicator(statusA.id).getAttribute('aria-label') === 'Interrupted', 'Recovered interrupted chat did not show a red Interrupted marker above unread/draft state');
+    state.completions.clear(); restoreUnread(); renderThreadIndicators(statusA.id);
+    check(indicator(statusA.id)?.classList.contains('failed'), 'Restarting marker state lost the interrupted status');
+    drafts.pending.set(queueKey(statusA.id), false); acknowledgeVisibleThread();
+    check(!state.completions.has(queueKey(statusA.id)) && !savedPreferences.conversationStates[accessKey()].completions[statusA.id], 'Reading a recovered interrupted chat did not clear its saved marker');
     const completeReadingTurn = (threadId, id) => {
       handleNotification({ method: 'turn/started', params: { threadId, turn: { id } } });
       handleNotification({ method: 'turn/completed', params: { threadId, turn: { id, status: 'completed' } } });
@@ -2160,6 +2214,40 @@ async function checks() {
   check(pagedOrder() === 'paged-saved-new,paged-unsorted,paged-old', 'Pinning a saved chat changed the cutoff for unpinned conversations');
   state.pinnedIds.clear();
   results.push('legacy custom order acquires a stable saved cutoff; pagination, refreshes, restarts, and pin changes preserve unsorted conversation positions');
+  {
+    resetThread(); state.options = { mode: 'ssh', host: 'project-membership-order-test', port: 22 }; state.connected = true;
+    const project = { id: 'stable-membership-project', name: 'Rapidcode', roots: [{ path: '/rapidcode' }] };
+    const old = Array.from({ length: 192 }, (_, index) => ({ id: 'stable-old-' + index, name: 'Older chat ' + index, cwd: '/rapidcode', projectId: project.id, createdAt: 50, updatedAt: 1000 - index }));
+    const fresh = { id: 'stable-fresh-analysis', name: 'LeaseMacLoginRunner Error Analysis', cwd: '/rapidcode', projectId: project.id, createdAt: 200, updatedAt: 250 };
+    projects.data = [project]; projects.expanded.add(project.id); projects.collapsed.delete(project.id);
+    preferences.threadOrders[accessKey()] = { [project.id]: old.map(thread => thread.id) };
+    preferences.threadOrderCutoffs[accessKey()] = { [project.id]: 100 };
+    const saved = preferences.threadOrders[accessKey()][project.id].join();
+    state.threads = []; state.thread = null; state.pinnedIds = new Set([old[0].id]); state.pinnedThreads = new Map([[old[0].id, old[0]]]); state.active.clear();
+    let reversed = false;
+    api.rpc = async (method, params) => {
+      if (method !== 'thread/list') throw new Error('Unexpected sorting operation: ' + method);
+      if (params.projectId !== project.id) return { data: [], nextCursor: null };
+      if (params.searchTerm) return { data: [{ ...fresh }], nextCursor: null };
+      if (params.cursor) return { data: old.slice(48).map(thread => ({ ...thread })), nextCursor: null };
+      const first = [...old.slice(0, 48).map(thread => ({ ...thread })), { ...fresh }];
+      return { data: reversed ? first.reverse() : first, nextCursor: 'stable-older' };
+    };
+    const rows = () => [...$('threads').querySelectorAll('[data-project-id="' + project.id + '"] .thread')].map(row => row.dataset.threadId);
+    await loadThreads();
+    check(rows()[0] === old[0].id && rows()[1] === fresh.id, 'A new native project chat fell below manual order or outside its project');
+    await loadThreads(true, project.id);
+    check(rows()[1] === fresh.id && rows().length === 193 && preferences.threadOrders[accessKey()][project.id].join() === saved, 'Pagination buried the new chat or rewrote deliberate drag order');
+    fresh.name = 'LeaseMacLoginRunner Error Analysis renamed'; fresh.updatedAt = 3000; reversed = true;
+    await loadThreads(); applyName(fresh.id, fresh.name);
+    check(rows()[1] === fresh.id && rows().length === 193 && rows().slice(2).join() === old.slice(1).map(thread => thread.id).join(), 'Activity, rename or a reordered page changed project/manual positions');
+    $('search').value = 'LeaseMacLoginRunner'; await loadThreads();
+    check(rows().join() === fresh.id && preferences.threadOrders[accessKey()][project.id].join() === saved, 'Searching changed membership or persisted a partial drag order');
+    $('search').value = ''; await loadThreads();
+    check(rows()[0] === old[0].id && rows()[1] === fresh.id && state.pinnedIds.size === 1 && !state.pinnedIds.has(fresh.id), 'Clearing search buried the analysis or silently pinned it');
+  }
+  results.push('new project conversations stay above existing manual order through activity, renames, full pagination, and search without changing pins or saved ordering');
+
   resetThread(); state.options = { mode: 'local' }; state.connected = true;
   const managedProjects = [structuredClone(rapidProject), structuredClone(memeProject), { id: 'project-third', name: 'Third', roots: [{ path: '/third' }] }];
   const managementCalls = [];
@@ -2886,8 +2974,12 @@ async function checks() {
   $('model').value = 'draft-model'; $('model').dispatchEvent(new Event('change', { bubbles: true }));
   $('effort').value = 'high'; modes.plan = true; $('permissions').value = 'read-only'; $('send-time').value = '72';
   const rawDraft = '  Unsent A\nwith its final newline\n';
+  const unrelatedDraftRow = new MutationObserver(() => {});
+  unrelatedDraftRow.observe(draftRow(draftB.id), { attributes: true, childList: true, subtree: true });
   $('prompt').value = rawDraft; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
   check(draftRow(draftA.id).querySelector('.thread-state.draft')?.title === 'Unsent prompt', 'Typing did not immediately mark the idle chat with an unsent prompt');
+  check(unrelatedDraftRow.takeRecords().length === 0, 'Typing updated unrelated sidebar rows');
+  unrelatedDraftRow.disconnect();
   state.active.set(draftA.id, 'draft-working-turn'); renderThreadIndicators();
   check(draftRow(draftA.id).querySelector('.thread-state.working') && draftRow(draftA.id).title.includes('Unsent prompt'), 'An unsent prompt hid the running spinner or lost its tooltip');
   state.active.delete(draftA.id); state.unread.add(queueKey(draftA.id)); state.completions.set(queueKey(draftA.id), 'completed'); renderThreadIndicators();
@@ -2901,7 +2993,9 @@ async function checks() {
   $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
   check(draftWrites.length === writesBeforeTyping, 'Unchanged input rewrote the saved draft');
   $('prompt').value = rawDraft + 'last character'; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
-  check(draftData.get(draftId(drafts.target)).text.endsWith('last character') && !('images' in draftWrites.at(-1).patch), 'The last keystroke was not saved synchronously or typing resent image data');
+  check(!draftData.get(draftId(drafts.target)).text.endsWith('last character'), 'Typing synchronously saved a draft');
+  await new Promise(resolve => setTimeout(resolve, 250));
+  check(draftData.get(draftId(drafts.target)).text.endsWith('last character') && !('images' in draftWrites.at(-1).patch), 'Idle saving lost the last keystroke or resent image data');
   $('prompt').value = rawDraft; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
   await openThread(draftB); check(!$('prompt').value && !state.images.length, 'A draft leaked into another conversation');
   check(draftRow(draftA.id).querySelector('.thread-state.draft') && !draftRow(draftB.id).querySelector('.thread-state.draft'), 'Switching chats lost a background draft marker or marked an empty prompt');
@@ -3791,6 +3885,7 @@ async function checks() {
       activateComposerDraft(); updateBusy();
       check($('prompt').value === saved.text && $('model').value === saved.model && selectedProvider() === 'sample' && $('effort').value === 'high' && $('model').selectedOptions[0].disabled && $('send').disabled, 'Restarting without a provider changed the draft’s agent/model/reasoning or enabled sending');
       $('prompt').value += ' with more details'; $('prompt').oninput();
+      await new Promise(resolve => setTimeout(resolve, 250));
       check(writes.at(-1)?.model === saved.model && writes.at(-1)?.effort === saved.effort, 'Typing over an unavailable-provider draft overwrote its saved model settings');
       await send();
       check(sent.length === 0 && $('prompt').value.includes('more details') && $('error-text').textContent.includes('model is unavailable'), 'Enter sent an unavailable-provider draft to another agent or cleared it');
@@ -3906,6 +4001,16 @@ async function checks() {
     finishSync(structuredClone(sync)); await refreshing;
     check(running() && $('prompt').value === 'Typed while the metadata refresh was waiting' && document.activeElement === $('prompt') && $('prompt').selectionStart === 9, 'An asynchronous metadata refresh overwrote concurrent typing or moved composer focus');
     api.conversationSync = async () => structuredClone(sync); storedDraft.text = $('prompt').value;
+    const healthyDraftWriter = api.saveDraft;
+    $('prompt').value = 'Keep my unsaved text after a disk failure'; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
+    api.saveDraft = () => { throw new Error('Temporary draft write failure'); };
+    check(saveComposerDraft() === false && drafts.dirty, 'Failed deferred saving discarded its dirty state');
+    storedDraft.text = 'Remote draft must not replace a failed local save';
+    await notify();
+    check($('prompt').value === 'Keep my unsaved text after a disk failure' && running(), 'A sync refresh overwrote locally typed text after its deferred save failed');
+    api.saveDraft = healthyDraftWriter;
+    check(saveComposerDraft() && !drafts.dirty && storedDraft.text === $('prompt').value, 'Retrying a failed draft did not save the latest text');
+    $('error').hidden = true;
     sync.conflicts = [{ key: 'metadata-draft-conflict', kind: 'draft', local: 'Local draft version', remote: 'Remote draft version' }];
     await notify();
     const notice = $('conversation-sync-notice'); notice.querySelector('details').open = true;
@@ -3938,7 +4043,7 @@ async function checks() {
   results.push('conversation metadata sync preserves running chats and focused typing, applies clean remote drafts, protects concurrent edits, offers explicit conflict choices, and maps ghost projects only to chosen local folders');
   {
     const previousOptions = state.options, previousSync = { ...conversationSync };
-    const methods = ['conversationSync', 'preferences', 'pins', 'draft', 'saveDraft'];
+    const methods = ['conversationSync', 'preferences', 'pins', 'draft', 'saveDraft', 'retryHistorySync'];
     const previousApi = Object.fromEntries(methods.map(method => [method, api[method]]));
     api.saveDraft = undefined; resetThread();
     const healthy = { id: 'sync-healthy-chat', cwd: '/work/project' }, broken = { id: 'sync-broken-chat', cwd: '/work/project' };
@@ -3952,13 +4057,22 @@ async function checks() {
     await refreshConversationSync();
     check($('conversation-sync-notice').hidden && state.active.get(healthy.id) === 'sync-healthy-turn' && $('prompt').value === 'Keep my running chat draft' && document.activeElement === $('prompt') && $('prompt').selectionStart === 2, 'Another chat’s history error affected a healthy running chat or its draft');
     setThread(broken);
-    check(!$('conversation-sync-notice').hidden && $('conversation-sync-notice').textContent.includes('This conversation’s history could not sync'), 'The affected conversation did not show its own history warning');
+    check(!$('conversation-sync-notice').hidden && $('conversation-sync-notice').textContent.includes('Local history kept'), 'The affected conversation did not show its own history warning');
     setThread(healthy); check($('conversation-sync-notice').hidden, 'A history warning leaked when switching chats without another sync request');
     sync.error = 'Storage is offline'; await refreshConversationSync();
     check(!$('conversation-sync-notice').hidden && $('conversation-sync-notice').textContent.includes('Storage is offline'), 'A real server connection error was incorrectly hidden');
     sync.error = null; await refreshConversationSync(); check($('conversation-sync-notice').hidden, 'A recovered server left its global warning visible');
     setThread(broken); sync.historyErrors = []; await refreshConversationSync();
     check($('conversation-sync-notice').hidden, 'Repairing the affected conversation left a stale history warning');
+    const retries = [];
+    api.retryHistorySync = async id => { retries.push(id); sync.queueErrors = []; };
+    sync.queueErrors = [{ kind: 'history', machine: 'access:local', id: broken.id, key: JSON.stringify(['history', 'access:local', broken.id]), message: 'A pending upload has a missing dependency.' }];
+    setThread(healthy); await refreshConversationSync();
+    check($('conversation-sync-notice').hidden, 'A queued upload error leaked into another chat');
+    setThread(broken); await refreshConversationSync();
+    check($('conversation-sync-notice').textContent.includes('missing dependency'), 'The affected chat did not show its upload dependency error');
+    await [...$('conversation-sync-notice').querySelectorAll('button')].find(button => button.textContent === 'Retry sync').onclick();
+    check(retries.join() === broken.id && $('conversation-sync-notice').hidden && state.active.get(healthy.id) === 'sync-healthy-turn', 'Retry sync targeted the wrong chat or interrupted healthy work');
     sync.historyErrors = [{ id: broken.id, message: 'Missing segment' }]; await refreshConversationSync();
     state.options = { mode: 'ssh', host: 'another-machine' }; updateBusy();
     check($('conversation-sync-notice').hidden, 'A previous connection’s history warning leaked into another connection');
@@ -4160,6 +4274,31 @@ async function checks() {
     Object.assign(drafts, before.drafts); Object.assign(conversationSync, before.sync); Object.assign(preferences, before.preferences); projects.data = before.projects; agents.current = before.agent; $('conversation-ownership').hidden = true; $('error').hidden = true;
   }
   results.push('conversation ownership preserves drafts, gates foreign sends, reloads final handoff history once, offers later peer updates on demand, retains source Stop, and isolates disabled sharing/SSH/ZCode/errors/stale replies');
+  {
+    resetThread(); state.options = { mode: 'local' }; state.connected = true;
+    const a = { id: 'note-a', name: 'First note chat', cwd: '/tmp', status: { type: 'idle' } }, b = { ...a, id: 'note-b', name: 'Second note chat' };
+    state.threads = [a, b]; setThread(a);
+    const beforeRpc = api.rpc; let noteRpc = 0; api.rpc = async () => { noteRpc++; return { data: [] }; };
+    check($('conversation-note').textContent === 'Add note' && !$('conversation-note').hidden, 'Existing conversation did not offer Add note');
+    $('conversation-note').onclick(); $('note-text').value = 'Remember <img src=x onerror=alert(1)>\nSecond line';
+    const newline = new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true, cancelable: true }); $('note-text').dispatchEvent(newline);
+    check(!newline.defaultPrevented && $('note-dialog').open, 'Shift+Enter saved the note instead of allowing a newline');
+    $('note-text').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); await settle();
+    check(!$('note-dialog').open && $('conversation-note').textContent.includes('<img') && !$('conversation-note').querySelector('img'), 'Note Enter save failed or rendered note HTML');
+    $('conversation-note').onclick(); $('note-text').value = 'Changed original note'; setThread(b);
+    await $('note-form').onsubmit({ preventDefault() {} }); await settle();
+    check(preferences.conversationNotes[accessKey()][a.id] === 'Changed original note' && !preferences.conversationNotes[accessKey()][b.id] && $('conversation-note').textContent === 'Add note', 'Saving a note after switching chats modified the new selection');
+    setThread(a); $('conversation-note').onclick(); $('note-text').value = 'Unsaved note'; $('cancel-note').onclick(); await settle();
+    check($('conversation-note').textContent === 'Changed original note', 'Cancel saved a note');
+    $('conversation-note').onclick(); const previousSave = api.savePreferences; api.savePreferences = async () => { throw new Error('Note save failed'); }; $('note-text').value = 'Retain typed note';
+    await $('note-form').onsubmit({ preventDefault() {} });
+    check($('note-dialog').open && $('note-text').value === 'Retain typed note' && $('note-error').textContent === 'Note save failed', 'Failed note save discarded the editor or hid its error');
+    api.savePreferences = previousSave; await $('delete-note').onclick(); await settle();
+    check($('conversation-note').textContent === 'Add note' && !preferences.conversationNotes[accessKey()][a.id], 'Deleting the note did not remove it');
+    check(!noteRpc && state.threads[0].id === a.id && state.threads[1].id === b.id, 'Editing notes invoked the coding agent or reordered conversations');
+    resetThread(); check($('conversation-note').hidden, 'A new conversation displayed another chat’s note'); api.rpc = beforeRpc;
+  }
+  results.push('conversation notes save with Enter, keep Shift+Enter newlines, display plain text, preserve target chats across navigation, cancel/delete safely, retain failed edits, and never invoke agents or reorder chats');
   api.rpc = originalRpc; state.threads = [branchSource]; await openThread(branchSource); connectionLabels(); status(connectedStatus());
   projects.data = [{ id: branchSource.projectId, name: 'Rapidcode', roots: [{ path: branchSource.cwd }] }];
   await expandProject(projects.data[0], false);
@@ -4250,6 +4389,12 @@ module.exports = async () => {
         conversationSync.historyEnabled = true;
         conversationSync.ownership = new Map([[id, { id, name: 'Other Mac', owned: false, requested: false, waiting: false, busy: true, updatesAvailable: true }]]);
         state.active.delete(id); state.owned.delete(id); updateBusy();
+      };
+      globalThis.previewNote = () => {
+        conversationSync.historyEnabled = false; $('conversation-ownership').hidden = true;
+        setThread({id:'note-preview',name:'Mac-runners health',cwd:'/Users/EugeneBos/Websites/rapidcode',status:{type:'idle'}});
+        preferences.conversationNotes ||= {}; preferences.conversationNotes[accessKey()] = {'note-preview':'Check the runner health report before the next release.'};
+        renderConversationNote(); $('thread-menu').hidden = true;
       };
       globalThis.previewSync = async () => {
         api.scheduleSharing = async () => ({ enabled: true, host: 'root@warmer', port: 22, key: '', folder: '~/.local/share/remote-codex/schedule-sync', connected: true });
@@ -4344,6 +4489,10 @@ module.exports = async () => {
     await new Promise(resolve => setTimeout(resolve, 100));
     if (!await testWindow.webContents.executeJavaScript("document.getElementById('conversation-ownership').checkVisibility() && document.getElementById('take-conversation').checkVisibility() && document.getElementById('load-synced-history').checkVisibility() && document.getElementById('send').disabled && document.getElementById('prompt').value === 'My unsent draft stays here'")) throw new Error('Ownership screenshot omitted its read-only panel/actions or changed the draft');
     fs.writeFileSync(path.join(__dirname, '..', 'artifacts', 'conversation-ownership.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript('previewNote()');
+    fs.writeFileSync(path.join(artifacts, 'conversation-note.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript("document.getElementById('conversation-note').click()");
+    fs.writeFileSync(path.join(artifacts, 'conversation-note-editor.png'), (await testWindow.webContents.capturePage()).toPNG());
     return results;
   } finally { testWindow.destroy(); }
 };

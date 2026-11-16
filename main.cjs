@@ -4,7 +4,7 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const { connectionKey, rendererMethods } = require('./providers.cjs');
-const { AgentPool, agentTarget, poolOptions: connectionOptions } = require('./agent-pool.cjs');
+const { AgentPool, agentId, agentTarget, poolOptions: connectionOptions } = require('./agent-pool.cjs');
 const { PinStore } = require('./pins.cjs');
 const { QueueStore } = require('./queues.cjs');
 const { PreferencesStore } = require('./preferences.cjs');
@@ -15,7 +15,7 @@ const { generateTitle, titleKey, readThreadForTitle } = require('./titles.cjs');
 const { ScheduleStore, Scheduler } = require('./scheduler.cjs');
 const { SharedSchedules } = require('./shared-schedules.cjs');
 const { serverKey, sharingOptions } = require('./shared-schedules.cjs');
-const { ConversationState } = require('./conversation-state.cjs');
+const { ConversationState, completionValue } = require('./conversation-state.cjs');
 const { DiagnosticLog, TurnDiagnostics } = require('./diagnostics.cjs');
 const { DraftStore, registerDraftIpc } = require('./drafts.cjs');
 const { AgentWakeLock } = require('./wake-lock.cjs');
@@ -43,6 +43,10 @@ app.whenReady().then(async () => {
   connection.on('connection', ({ provider, connection: driver }) => {
     const wakeLock = new AgentWakeLock(powerSaveBlocker, driver, working => driver.emit('diagnostic', { event: 'power.keep-awake', details: { working } }));
     agents.set(provider, { wakeLock, diagnostics: new TurnDiagnostics(driver) });
+    driver.on('rpc', event => {
+      const threadId = event.threadId || event.result?.reviewThreadId, turn = event.result?.turn;
+      if (event.phase === 'finished' && turn?.status === 'inProgress' && threadId && wakeLock.active.get(threadId) === turn.id) rememberRun(connection.machine, provider, connection.threadIdentity(provider, threadId), agentId(provider, 'turn', turn.id));
+    });
   });
   app.on('before-quit', () => { for (const agent of agents.values()) agent.wakeLock.clear(); });
   const diagnostic = new DiagnosticLog(path.join(app.getPath('userData'), 'logs'));
@@ -68,6 +72,15 @@ app.whenReady().then(async () => {
   const queues = new QueueStore(path.join(app.getPath('userData'), 'queues'));
   const drafts = new DraftStore(path.join(app.getPath('userData'), 'drafts'));
   const preferences = new PreferencesStore(path.join(app.getPath('userData'), 'preferences.json'));
+  let interruptedRuns = [];
+  try { interruptedRuns = preferences.recoverInterruptedRuns(); }
+  catch (error) { diagnostic.write('runs.recovery.failed', { error: error.message }); }
+  function rememberRun(machine, provider, threadId, turnId) {
+    const options = connection.launchOptions.find(option => option.provider === provider);
+    if (provider === 'codex' && options?.mode === 'ssh' && options.sharedServer) return;
+    try { preferences.recordRun(machine, threadId, turnId, provider); }
+    catch (error) { diagnostic.write('runs.save.failed', { provider, threadId, error: error.message }); }
+  }
   const schedules = new ScheduleStore(path.join(app.getPath('userData'), 'schedules.json'));
   const editLocks = new Map();
   ipcMain.handle('edit-lock', (event, threadId, token) => {
@@ -118,6 +131,10 @@ app.whenReady().then(async () => {
     machine: scheduleMachine, options: () => settings, connection, changed: conversationsChanged,
     log: (event, details) => diagnostic.write(event, details)
   });
+  for (const run of interruptedRuns) {
+    try { conversations.sync.capture('completion', run.machine, run.threadId, completionValue('interrupted', run.turnId)); }
+    catch (error) { conversations.sync.failed(error); }
+  }
   conversations.historyBlocked = id => editLocks.has(id) || scheduler.dispatching.has(id);
   conversations.history.background = true;
   shared.resolveTask = task => conversations.scheduledTask(task);
@@ -156,7 +173,27 @@ app.whenReady().then(async () => {
     }
     current(); await conversations.history.request(id); setImmediate(tickSchedules); return conversations.status();
   });
-  ipcMain.handle('resolve-sync-conflict', async (event, key, choice, version) => { checkSender(event); await conversations.sync.resolve(key, choice, version); return conversations.status(); });
+  ipcMain.handle('retry-history-sync', (event, id) => {
+    checkSender(event);
+    if (!conversations.history.enabled || typeof id !== 'string' || !id || id.length > 200 || id.startsWith('agent:')) throw new Error('History sync is not available for this conversation.');
+    conversations.history.retry(id);
+    setImmediate(() => conversations.tick().catch(error => conversations.sync.failed(error)));
+  });
+  ipcMain.handle('resolve-sync-conflict', async (event, key, choice, version) => {
+    checkSender(event);
+    let identity;
+    try { identity = JSON.parse(key); } catch { throw new Error('Invalid sync conflict.'); }
+    if (!Array.isArray(identity) || identity.length !== 3 || identity.some(part => typeof part !== 'string' || !part)) throw new Error('Invalid sync conflict.');
+    if (identity[0] === 'history') {
+      if (identity[1] !== scheduleMachine() || !conversations.history.enabled) throw new Error('Open this conversation on its computer before choosing its history.');
+      if (choice === 'remote') {
+        await conversations.history.useRemote(identity[2], apply => conversations.sync.resolve(key, choice, version, apply));
+        return { ...conversations.status(), reloadedThread: identity[2] };
+      }
+      await conversations.history.verify(identity[2]);
+    }
+    await conversations.sync.resolve(key, choice, version); return conversations.status();
+  });
   ipcMain.handle('map-sync-project', (event, id, root) => {
     checkSender(event);
     const binding = conversations.binding(id);
@@ -221,8 +258,12 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('preferences', event => { checkSender(event); return preferences.read(); });
   ipcMain.handle('save-preferences', (event, patch) => {
-    checkSender(event); const result = preferences.update(patch);
+    checkSender(event);
+    const note = patch?.conversationNote, previousNote = note && (preferences.read().conversationNotes?.[note.machine]?.[note.threadId] || '');
+    const result = preferences.update(patch);
+    if (note) conversations.sync.capture('note', note.machine, note.threadId, result.conversationNotes[note.machine][note.threadId] || null, false, undefined, note.expected !== undefined && note.expected !== previousNote);
     if (patch.messagePin) { const { machine, threadId, itemId, pinned, ...pin } = patch.messagePin; conversations.sync.capture('messagePin', machine, JSON.stringify([threadId, itemId]), pinned ? { itemId, ...pin } : null); }
+    if (patch.finishedThread) { const { machine, threadId, finished } = patch.finishedThread; conversations.sync.capture('finished', machine, threadId, finished); }
     if (patch.shortcuts !== undefined) conversations.sync.capture('shortcuts', 'access:local', 'shortcuts', result.shortcuts);
     return result;
   });
@@ -230,7 +271,7 @@ app.whenReady().then(async () => {
     try {
       checkSender(event);
       if (change) {
-        if (!['unread', 'completion'].includes(change.field) || typeof change.threadId !== 'string' || !change.threadId || change.threadId.length > 200 || change.field === 'unread' && typeof change.value !== 'boolean' || change.field === 'completion' && change.value !== null && !['completed', 'failed'].includes(change.value)) throw new Error('Invalid conversation marker change.');
+        if (!['unread', 'completion'].includes(change.field) || typeof change.threadId !== 'string' || !change.threadId || change.threadId.length > 200 || change.field === 'unread' && typeof change.value !== 'boolean' || change.field === 'completion' && change.value !== null && !['completed', 'failed', 'interrupted'].includes(change.value)) throw new Error('Invalid conversation marker change.');
         const saved = preferences.read().conversationStates?.[conversationState.machine] || { unread: [], completions: {} };
         const unread = new Set(saved.unread), completions = { ...saved.completions };
         if (change.field === 'unread') { if (change.value) unread.add(change.threadId); else unread.delete(change.threadId); }
@@ -239,7 +280,7 @@ app.whenReady().then(async () => {
       }
       preferences.update({ conversationState });
       if (change) {
-        const value = change.field === 'completion' && change.value && typeof change.turnId === 'string' ? { status: change.value, turnId: change.turnId } : change.value;
+        const value = change.field === 'completion' ? completionValue(change.value, typeof change.turnId === 'string' ? change.turnId : undefined) : change.value;
         conversations.sync.capture(change.field, conversationState.machine, change.threadId, value, false, change.turnId);
       }
       event.returnValue = { ok: true };
@@ -254,6 +295,11 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('settings', event => { checkSender(event); return publicSettings(); });
   ipcMain.handle('providers', event => { checkSender(event); return connection.listProviders(settings); });
+  ipcMain.handle('copy-text', (event, text) => {
+    checkSender(event);
+    if (typeof text !== 'string') throw new Error('Invalid clipboard text.');
+    clipboard.writeText(text);
+  });
   ipcMain.handle('read-image', (event, file, context) => { checkSender(event); return readImage(connection.connectionFor(connection.providerFor({}, context)), file); });
   ipcMain.handle('link-menu', (event, href, context) => {
     checkSender(event);
@@ -444,6 +490,16 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('respond', (event, id, result) => { checkSender(event); return connection.respond(id, result); });
   connection.on('notification', message => {
+    if (!message.machine || message.machine === scheduleMachine()) {
+      try { conversations.history.captureAttachment(message); }
+      catch (error) { diagnostic.write('conversation.attachment.capture.failed', { threadId: message.params?.threadId, error: error.message }); }
+    }
+    const params = message.params || {}, machine = message.machine || connection.machine;
+    if (message.method === 'turn/started') rememberRun(machine, message.provider || 'codex', params.threadId, params.turn?.id);
+    if (message.method === 'turn/completed') {
+      try { preferences.finishRun(machine, params.threadId, params.turn?.id, message.provider || 'codex'); }
+      catch (error) { diagnostic.write('runs.finish.failed', { threadId: params.threadId, error: error.message }); }
+    }
     if (['connection/closed', 'provider/closed'].includes(message.method)) shared.receiptChecks.clear();
     if (message.method === 'connection/closed') releaseEditors();
     if (message.method === 'provider/closed') releaseEditors(message.provider);

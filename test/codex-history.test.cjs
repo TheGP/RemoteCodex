@@ -6,7 +6,7 @@ const path = require('node:path');
 const { randomUUID, randomBytes, createHash } = require('node:crypto');
 const { gzipSync, gunzipSync } = require('node:zlib');
 const { pathToFileURL } = require('node:url');
-const { exportCodexHistory, importCodexHistory } = require('../codex-history.cjs');
+const { exportCodexHistory, importCodexHistory, extendsCodexHistory, CodexAttachmentStore } = require('../codex-history.cjs');
 
 const checksum = data => createHash('sha256').update(data).digest('hex');
 const encode = rows => Buffer.from(rows.map(row => JSON.stringify(row) + '\n').join(''));
@@ -344,4 +344,127 @@ test('concurrent native imports safely share newly created calendar storage fold
     assert.equal(decode(fs.readFileSync(result.value.path))[0].payload.id, ids[index]);
   }
   assert.notEqual(results[0].value.path, results[1].value.path);
+});
+
+
+test('history ancestry checks verify exact canonical prefixes and complete checksums across compressed chunks', async t => {
+  const f = fixture(t), thread = f.create([user(1, 'Unicode: 確認碼 and 😀'), assistant(2)]);
+  const base = await f.exportThread(thread);
+  fs.appendFileSync(thread.path, encode([user(3, 'A newer local message')]));
+  const manifest = await f.exportThread(thread), compressed = Buffer.concat(manifest.chunks.map(chunk => f.blobs.get(chunk.hash)));
+  manifest.chunks = [];
+  for (let offset = 0; offset < compressed.length; offset += 31) {
+    const bytes = compressed.subarray(offset, offset + 31);
+    manifest.chunks.push({ hash: f.keepBlob(bytes), bytes: bytes.length });
+  }
+  const check = (candidate = manifest, ancestor = base) => extendsCodexHistory({ manifest: candidate, base: ancestor, readBlob: f.readBlob });
+  assert.equal(await check(), true);
+  assert.equal(await check(manifest, { ...base, digest: checksum(Buffer.from('unrelated history')) }), false);
+  assert.equal(await check({ ...manifest, digest: checksum(Buffer.from('wrong full checksum')) }), false);
+  assert.equal(await check({ ...manifest, bytes: base.bytes - 1 }), false);
+  assert.equal(await check({ ...manifest, id: randomUUID() }), false);
+  f.blobs.set(manifest.chunks[0].hash, Buffer.from('corrupt bytes'));
+  await assert.rejects(check(), /checksum/);
+});
+
+test('history recovery accepts changed ImageView attachments only when every other older record matches', async t => {
+  const f = fixture(t), image = path.join(f.cwd, 'latest-screen.png'); fs.writeFileSync(image, png);
+  const view = { timestamp, type: 'event_msg', ordinal: 2, payload: { type: 'item_completed', item: { type: 'ImageView', id: 'original-view', path: image } } };
+  const thread = f.create([user(1), view]), base = await f.exportThread(thread);
+  fs.writeFileSync(image, Buffer.concat([png, Buffer.from('new screenshot')]));
+  fs.appendFileSync(thread.path, encode([user(3, 'Continue the same conversation')]));
+  const manifest = await f.exportThread(thread);
+  assert.equal(await extendsCodexHistory({ manifest, base, readBlob: f.readBlob }), false);
+  const check = candidate => extendsCodexHistory({ manifest: candidate, base, readBlob: f.readBlob, allowImageViewChanges: true });
+  assert.equal(await check(manifest), true);
+  const rows = decode(f.portable(manifest)); rows[1].payload.message = 'A different user message';
+  assert.equal(await check(f.replaceRows(manifest, rows)), false);
+  const changedView = decode(f.portable(manifest)); changedView[2].payload.item.id = 'different-view';
+  assert.equal(await check(f.replaceRows(manifest, changedView)), false);
+  const unlisted = decode(f.portable(manifest)); unlisted[2].payload.item.path = 'remote-codex-attachment:' + '0'.repeat(64);
+  assert.equal(await check(f.replaceRows(manifest, unlisted)), false);
+  f.blobs.set(base.chunks[0].hash, Buffer.from('corrupted older snapshot'));
+  await assert.rejects(check(manifest), /checksum/);
+});
+
+test('changed user image inputs cannot be treated as changed ImageView output', async t => {
+  const f = fixture(t), image = path.join(f.cwd, 'user-input.png'); fs.writeFileSync(image, png);
+  const thread = f.create([imageRow(1, image)]), base = await f.exportThread(thread);
+  fs.writeFileSync(image, Buffer.concat([png, Buffer.from('different input')]));
+  fs.appendFileSync(thread.path, encode([user(2, 'Follow-up')]));
+  const manifest = await f.exportThread(thread);
+  assert.equal(await extendsCodexHistory({ manifest, base, readBlob: f.readBlob, allowImageViewChanges: true }), false);
+});
+
+test('tool-time snapshots keep prior ImageView events immutable when one screenshot path is reused', async t => {
+  const f = fixture(t), image = path.join(f.cwd, 'screenshot.png'), id = randomUUID();
+  const view = (ordinal, itemId) => ({ timestamp, type: 'event_msg', ordinal, payload: { type: 'item_completed', item: { type: 'ImageView', id: itemId, path: image } } });
+  fs.writeFileSync(image, png);
+  let store = new CodexAttachmentStore(path.join(f.directory, 'captured-events'));
+  store.capture({ threadId: id, turnId: 'native-turn-with-no-rollout-turn-id', item: { type: 'imageView', id: 'first-view', path: image }, home: f.home });
+  const newer = Buffer.concat([png, Buffer.from('newer capture')]); fs.writeFileSync(image, newer);
+  const thread = f.write([f.meta(id), user(1), view(2, 'first-view')]);
+  const exportThread = () => exportCodexHistory({ thread, home: f.home, keepBlob: f.keepBlob, attachmentStore: store });
+  const first = await exportThread(), firstRows = decode(f.portable(first));
+  assert.equal(firstRows[2].payload.item.path, 'remote-codex-attachment:' + checksum(png));
+  store.capture({ threadId: id, turnId: 'next-turn', item: { type: 'imageView', id: 'second-view', path: image }, home: f.home });
+  fs.appendFileSync(thread.path, encode([view(3, 'second-view')]));
+  const original = fs.readFileSync(thread.path); fs.unlinkSync(image);
+  store = new CodexAttachmentStore(store.directory);
+  const latest = await exportThread(), latestRows = decode(f.portable(latest));
+  assert.equal(latestRows[2].payload.item.path, firstRows[2].payload.item.path);
+  assert.equal(latestRows[3].payload.item.path, 'remote-codex-attachment:' + checksum(newer));
+  assert.equal(await extendsCodexHistory({ manifest: latest, base: first, readBlob: f.readBlob }), true);
+  assert.deepEqual(new Set(latest.attachments.map(image => image.hash)), new Set([checksum(png), checksum(newer)]));
+  assert.deepEqual(fs.readFileSync(thread.path), original);
+  assert.equal((await exportThread()).digest, latest.digest);
+});
+
+test('forked histories reuse the captured parent event and independently capture a child event at the same path', async t => {
+  const f = fixture(t), image = path.join(f.cwd, 'shared-screenshot.png'); fs.writeFileSync(image, png);
+  const store = new CodexAttachmentStore(path.join(f.directory, 'event-cache')), parentId = randomUUID(), childId = randomUUID();
+  const view = (ordinal, itemId) => ({ timestamp, type: 'event_msg', ordinal, payload: { type: 'item_completed', item: { type: 'ImageView', id: itemId, path: image } } });
+  const inherited = [f.meta(parentId), view(1, 'parent-view')]; f.write(inherited, parentId);
+  store.capture({ threadId: parentId, item: { type: 'imageView', id: 'parent-view', path: image }, home: f.home });
+  const newer = Buffer.concat([png, Buffer.from('child screenshot')]); fs.writeFileSync(image, newer);
+  store.capture({ threadId: childId, item: { type: 'imageView', id: 'child-view', path: image }, home: f.home });
+  const thread = f.write([f.meta(childId, { history_base: { thread_id: parentId, end_ordinal_exclusive: 2, end_byte_offset: encode(inherited).length } }), view(3, 'child-view')]);
+  const rows = decode(f.portable(await exportCodexHistory({ thread, home: f.home, keepBlob: f.keepBlob, attachmentStore: store })));
+  assert.equal(rows[1].payload.item.path, 'remote-codex-attachment:' + checksum(png));
+  assert.equal(rows[2].payload.item.path, 'remote-codex-attachment:' + checksum(newer));
+});
+
+test('an imported native alias retains copy-scoped attachments across a receiving-device export and retry', async t => {
+  const f = fixture(t), image = path.join(f.cwd, 'source.png'); fs.writeFileSync(image, png);
+  const id = randomUUID(), thread = f.write([f.meta(id), { timestamp, type: 'event_msg', ordinal: 1, payload: { type: 'item_completed', thread_id: id, item: { type: 'ImageView', id: 'portable-view', path: pathToFileURL(image).href } } }]);
+  const manifest = await f.exportThread(thread), nativeId = randomUUID(), imported = await f.importManifest(manifest, { nativeId });
+  const store = new CodexAttachmentStore(path.join(f.directory, 'receiving-events'));
+  const importedThread = { ...imported, cwd: f.receiverCwd };
+  const first = await exportCodexHistory({ thread: importedThread, logicalId: id, home: f.receiver, keepBlob: f.keepBlob, attachmentRoots: [path.join(f.cache, 'attachments')], attachmentStore: store });
+  assert.deepEqual(store.get({ threadId: nativeId, itemId: 'portable-view' }).data, png);
+  const rows = decode(fs.readFileSync(imported.path)), original = fs.readFileSync(imported.path), importedImage = new URL(rows[1].payload.item.path);
+  fs.writeFileSync(importedImage, Buffer.concat([png, Buffer.from('overwritten receiver cache')]));
+  const repeated = await exportCodexHistory({ thread: importedThread, logicalId: id, home: f.receiver, keepBlob: f.keepBlob, attachmentRoots: [path.join(f.cache, 'attachments')], attachmentStore: new CodexAttachmentStore(store.directory) });
+  assert.equal(repeated.digest, first.digest); assert.deepEqual(repeated.attachments, first.attachments);
+  assert.deepEqual(fs.readFileSync(imported.path), original);
+});
+
+test('selecting remote history cannot reuse a competing local attachment capture for the same logical item', async t => {
+  const f = fixture(t), image = path.join(f.cwd, 'screenshot.png'), id = randomUUID(), itemId = 'same-logical-view';
+  fs.writeFileSync(image, png);
+  const store = new CodexAttachmentStore(path.join(f.directory, 'shared-store'));
+  store.capture({ threadId: id, item: { type: 'imageView', id: itemId, path: image }, home: f.home });
+  const remoteBytes = Buffer.concat([png, Buffer.from('remote history image')]); fs.writeFileSync(image, remoteBytes);
+  const thread = f.write([f.meta(id), { timestamp, type: 'event_msg', ordinal: 1, payload: { type: 'item_completed', thread_id: id, item: { type: 'ImageView', id: itemId, path: image } } }]);
+  const remote = await f.exportThread(thread), nativeId = randomUUID(), imported = await f.importManifest(remote, { nativeId });
+  const exportCopy = () => exportCodexHistory({ thread: { ...imported, cwd: f.receiverCwd }, logicalId: id, home: f.receiver, keepBlob: f.keepBlob, attachmentRoots: [path.join(f.cache, 'attachments')], attachmentStore: store });
+  const first = await exportCopy();
+  assert.deepEqual(first.attachments.map(({ hash, bytes }) => ({ hash, bytes })), remote.attachments.map(({ hash, bytes }) => ({ hash, bytes })));
+  assert.deepEqual(store.get({ threadId: id, itemId }).data, png);
+  assert.deepEqual(store.get({ threadId: nativeId, itemId }).data, remoteBytes);
+  const selectedPath = new URL(decode(fs.readFileSync(imported.path))[1].payload.item.path);
+  fs.writeFileSync(selectedPath, Buffer.concat([png, Buffer.from('later reused path')]));
+  store.capture({ threadId: nativeId, item: { type: 'imageView', id: itemId, path: selectedPath.href }, home: f.receiver });
+  assert.equal((await exportCopy()).digest, first.digest);
+  assert.deepEqual((await exportCopy()).attachments, first.attachments);
 });

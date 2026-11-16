@@ -16,11 +16,11 @@ app.whenReady().then(async () => {
   const scheduled = new ScheduleStore(path.join(directory, 'schedules.json'));
   const index = path.resolve(__dirname, '..', 'index.html'); const page = pathToFileURL(index).href;
   const thread = { id: 'desktop-draft-chat', cwd: directory, name: 'Draft conversation', historyMode: 'paginated', status: { type: 'idle' } };
-  const calls = []; let window, finishSend, settingsError = null, connections = 0;
+  const calls = []; let window, finishSend, settingsError = null, connections = 0, draftChanges = 0;
   const options = connectionOptions({ mode: 'local', localCwd: directory, host: 'unused', cwd: directory, port: 22, key: '', codexPath: '' });
   const providers = new AgentConnection().listProviders();
   const publicSettings = () => ({ ...options, machine: connectionKey(options), agents: providers, settingsError });
-  registerDraftIpc(ipcMain, store, event => { if (event.sender !== window?.webContents || event.senderFrame?.url !== page) throw new Error('Untrusted draft caller'); });
+  registerDraftIpc(ipcMain, store, event => { if (event.sender !== window?.webContents || event.senderFrame?.url !== page) throw new Error('Untrusted draft caller'); }, () => {}, () => { draftChanges++; });
   ipcMain.handle('settings', publicSettings);
   ipcMain.handle('providers', () => providers);
   ipcMain.handle('preferences', () => ({ theme: 'system', startupProjects: {}, conversationStates: {}, threadOrders: {} }));
@@ -53,6 +53,26 @@ app.whenReady().then(async () => {
   };
   const close = async () => { const closing = window; await new Promise(resolve => { closing.once('closed', resolve); closing.close(); }); window = null; };
   try {
+    if (process.env.PROFILE_TYPING) {
+      await open(); await evaluate(`openThread(${JSON.stringify(thread)})`);
+      await evaluate(`state.threads = [state.thread, ...Array.from({length: 299}, (_, index) => ({id: 'typing-profile-' + index, name: 'Conversation ' + index, cwd: state.thread.cwd}))]; renderThreads(); $('prompt').value = ''; saveComposerDraft();`);
+      const before = draftChanges;
+      const profile = await evaluate(`(() => {
+        const prompt = $('prompt'), samples = [], observer = new MutationObserver(() => {});
+        let mutations = 0; observer.observe($('threads'), {subtree: true, attributes: true, childList: true, characterData: true});
+        for (let index = 0; index < 80; index++) {
+          const start = performance.now(); prompt.value += 'x'; prompt.dispatchEvent(new Event('input', {bubbles: true})); samples.push(performance.now() - start);
+          mutations += observer.takeRecords().length;
+        }
+        observer.disconnect(); samples.sort((a, b) => a - b);
+        return {rows: 300, keystrokes: samples.length, p50Ms: samples[40], p95Ms: samples[76], maxMs: samples.at(-1), sidebarMutations: mutations};
+      })()`);
+      profile.draftChangesDuringInput = draftChanges - before;
+      assert.equal(profile.draftChangesDuringInput, 0);
+      assert.ok(profile.sidebarMutations < 20, 'Typing repeatedly rebuilt the conversation list');
+      console.log('TYPING_PROFILE ' + JSON.stringify(profile));
+      await close(); fs.rmSync(directory, { recursive: true, force: true }); app.exit(0); return;
+    }
     settingsError = 'Saved connection settings could not be loaded: invalid configuration';
     await open(true);
     assert.equal(connections, 0); assert.equal(calls.length, 0);
@@ -64,6 +84,23 @@ app.whenReady().then(async () => {
     console.log('PASS invalid settings keep the real UI open without connecting; saving repaired settings connects and clears the error');
     await close();
     await open();
+    const savesBeforeTyping = draftChanges;
+    await evaluate(`(() => { const prompt = $('prompt'); for (const text of ['Fast', 'Fast typing', 'Fast typing saved']) { prompt.value = text; prompt.dispatchEvent(new Event('input', {bubbles: true})); } })()`);
+    assert.equal(draftChanges, savesBeforeTyping, 'Keystrokes performed blocking draft writes');
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(draftChanges, savesBeforeTyping + 1);
+    assert.equal(new DraftStore(store.directory).last('access:local').draft.text, 'Fast typing saved');
+    const continuous = draftChanges;
+    for (let index = 0; index < 15; index++) {
+      await evaluate(`$('prompt').value += 'x'; $('prompt').dispatchEvent(new Event('input', {bubbles: true}));`);
+      await new Promise(resolve => setTimeout(resolve, 80));
+    }
+    assert.ok(draftChanges > continuous, 'Continuous typing never saved a draft');
+    await evaluate(`$('prompt').value = 'Flush immediately on blur'; $('prompt').dispatchEvent(new Event('input', {bubbles: true})); $('prompt').dispatchEvent(new Event('blur'));`);
+    assert.equal(new DraftStore(store.directory).last('access:local').draft.text, 'Flush immediately on blur');
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assert.equal(new DraftStore(store.directory).last('access:local').draft.text, 'Flush immediately on blur');
+    console.log('PASS prompt typing batches disk writes, saves during continuous input, and flushes its latest text on blur');
     await evaluate("document.getElementById('prompt').value = '  Unsent before restart\\n'; document.getElementById('prompt').dispatchEvent(new Event('input', { bubbles: true })); document.getElementById('send-time').value = '24'; document.getElementById('send-time').dispatchEvent(new Event('change', { bubbles: true }));");
     assert.equal(new DraftStore(store.directory).last('access:local').draft.text, '  Unsent before restart\n');
     await evaluate("document.getElementById('prompt').value += 'last change before close';");
@@ -72,7 +109,7 @@ app.whenReady().then(async () => {
     await open();
     assert.equal(await evaluate("document.getElementById('prompt').value"), '  Unsent before restart\nlast change before close');
     assert.equal(await evaluate("document.getElementById('send-time').value"), '24');
-    console.log('PASS real Electron preload saves input synchronously and before closing; reopening restores a new-chat draft and its send time');
+    console.log('PASS real Electron preload flushes settings and input before closing; reopening restores a new-chat draft and its send time');
     await evaluate(`openThread(${JSON.stringify(thread)})`);
     await evaluate("document.getElementById('prompt').value = 'Conversation draft'; document.getElementById('prompt').dispatchEvent(new Event('input', { bubbles: true }));");
     assert.equal(await evaluate("Boolean(document.querySelector('.thread-state.draft'))"), true);
