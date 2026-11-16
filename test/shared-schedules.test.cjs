@@ -363,3 +363,29 @@ test('coordinator editing leases expire locally and old tokens cannot renew or u
   await b.shared.verify(replacement);
   await assert.rejects(a.shared.lock('same-local-chat'), /Another computer/);
 });
+
+test('an uncertain native send releases its local starting marker while retaining its durable reservation', async t => {
+  const f = fixture(t); f.seed('history-timeout'); const a = f.client('computer-a');
+  await a.shared.configure(options);
+  const reservation = { runToken: 'reserved-run' }; let uncertain = 0, cancelled = 0;
+  a.shared.beforeSend = async () => reservation;
+  a.shared.uncertainSend = (id, value) => { assert.equal(id, 'same-local-chat'); assert.equal(value, reservation); uncertain++; };
+  a.shared.cancelSend = async () => { cancelled++; };
+  const call = a.connection.call.bind(a.connection);
+  a.connection.call = async (method, params) => { if (method === 'turn/start') throw new Error('Native request timed out'); return call(method, params); };
+  f.clock.value += 3600000; await a.shared.tick();
+  assert.equal(uncertain, 1); assert.equal(cancelled, 0);
+  assert.equal(a.shared.state.receipts.length, 0);
+  assert.equal(f.request('list')[0].status, 'unconfirmed');
+});
+
+test('a confirmed native send stays sent when recording its completed history reservation needs retry', async t => {
+  const f = fixture(t); f.seed('history-after-send'); const a = f.client('computer-a');
+  await a.shared.configure(options);
+  const reservation = { runToken: 'reserved-run' }; let recorded = 0;
+  a.shared.beforeSend = async () => reservation;
+  a.shared.afterSend = async (id, value, result) => { assert.equal(id, 'same-local-chat'); assert.equal(value, reservation); assert.ok(result.turn.id); recorded++; throw new Error('Sync server temporarily offline'); };
+  f.clock.value += 3600000; await a.shared.tick(); await a.shared.tick();
+  assert.equal(recorded, 1); assert.equal(sends(a).length, 1);
+  assert.equal(f.request('list')[0].status, 'sent');
+});

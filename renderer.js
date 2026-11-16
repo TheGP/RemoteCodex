@@ -14,7 +14,7 @@ const drafts = { target: null, snapshot: null, images: [], suspended: false, res
 const editorDrafts = new Map();
 const timelineView = { following: true, reading: null };
 const pinnedMessages = { saving: false, jumping: null };
-const conversationSync = { refreshing: false, again: false };
+const conversationSync = { paths: {}, pathsMachine: null, refreshing: false, again: false, ownership: new Map(), historyEnabled: false };
 const observedTurns = new Map();
 const pinIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 9V3H8v6l-3 3v2h14v-2l-3-3M12 14v7"/></svg>';
 for (let hours = 1; hours < 24; hours++) $('send-time').add(new Option(`${hours} hour${hours === 1 ? '' : 's'}`, String(hours)));
@@ -23,7 +23,7 @@ const threadDrag = { source: null, pending: new Set(), orderPending: new Set(), 
 const projectDrag = { source: null, pending: null, type: 'application/x-remote-codex-project' };
 const queueDrag = { source: null, type: 'application/x-remote-codex-queue' };
 const usage = { threads: new Map(), account: null, reading: null, generation: 0, updatedAt: 0, error: null, timer: null };
-const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), queues: new Map(), nativeQueues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Map(), newThreads: new Set(), titleTask: Promise.resolve(), titleRetries: new Map(), images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
+const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), queues: new Map(), nativeQueues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Map(), newThreads: new Set(), titleTask: Promise.resolve(), titleRetries: new Map(), images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), failedPins: new Set(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
 const slash = { index: 0, matches: [], dismissed: null, skills: [], cwd: null, loading: false, generation: 0, skillOnly: false };
 const modes = { plan: false, catalog: [], threads: new Map() };
 const compacting = new Map();
@@ -436,6 +436,26 @@ function status(text) {
 function canStopTurn() {
   return state.connected && !state.connecting && !state.sending && !state.loading && !state.commandBusy && state.owned.has(state.thread?.id) && state.active.has(state.thread?.id) && !$('prompt').value.trim() && !state.images.length;
 }
+function conversationAccess() { return conversationSync.historyEnabled && state.options?.mode === 'local' && selectedProvider() === 'codex' && state.thread ? conversationSync.ownership.get(state.thread.id) : null; }
+function conversationReadOnly() { const access = conversationAccess(); return Boolean(access && (!access.owned || access.requested)); }
+function renderConversationAccess() {
+  const access = conversationAccess(), panel = $('conversation-ownership');
+  panel.hidden = !access || access.owned && !access.requested;
+  $('conversation-owner').textContent = !access ? '' : access.owned ? 'Transfer requested · finish the current task to hand over' : access.waiting ? `Waiting for ${access.name} to finish and sync` : `${access.busy ? 'Running on' : 'Read only · owned by'} ${access.name}`;
+  const button = $('take-conversation'); button.hidden = Boolean(access?.owned); button.textContent = access?.waiting ? 'Transfer requested' : 'Use on this computer';
+  button.disabled = !state.connected || state.loading || state.sending || Boolean(access?.waiting) || Boolean(conversationSync.requesting);
+  $('load-synced-history').hidden = !access?.updatesAvailable;
+  $('load-synced-history').disabled = state.loading || state.sending || state.active.has(state.thread?.id);
+}
+$('load-synced-history').onclick = () => { if (state.thread && !state.loading && !state.sending && !state.active.has(state.thread.id)) return openThread(state.thread, true).then(refreshConversationSync).catch(showError); };
+$('take-conversation').onclick = async () => {
+  if (!state.thread || conversationSync.requesting) return;
+  const thread = state.thread, options = state.options;
+  conversationSync.requesting = true; renderConversationAccess();
+  try { await api.requestConversation(thread.id); if (state.options === options) await refreshConversationSync(); }
+  catch (error) { if (state.options === options) showError(error); }
+  finally { conversationSync.requesting = false; renderConversationAccess(); }
+};
 function updateSendButton() {
   const stop = canStopTurn();
   const busy = state.owned.has(state.thread?.id) && state.active.has(state.thread?.id);
@@ -445,7 +465,9 @@ function updateSendButton() {
   $('send').title = stop ? 'Stop task' : busy ? 'Send after the current turn finishes' : 'Send message';
   $('send').setAttribute('aria-label', stop ? 'Stop task' : 'Send message');
   $('send').disabled = !stop && modelUnavailable() || agentMetadata(selectedProvider())?.connected === false || !state.connected || state.connecting || state.sending || state.commandBusy || state.loading || interrupting || queueLocked(state.queues.get(queueKey(state.thread?.id))) || state.images.some(image => !image.url);
+  if (!stop && conversationReadOnly()) $('send').disabled = true;
   $('send-time').disabled = $('send').disabled;
+  renderConversationAccess();
 }
 async function stopTurn() {
   if (!canStopTurn()) return;
@@ -488,14 +510,17 @@ function updateBusy() {
   renderThreadIndicators();
   renderUsage();
   renderMessagePins();
+  updateMessageEdits();
+  saveComposerDraft();
+}
+function updateMessageEdits() {
   const turns = new Set();
-  for (const button of $('messages').querySelectorAll('.edit-message')) {
+  for (const button of $('timeline').querySelectorAll('.edit-message')) {
     const turnId = button.dataset.turnId;
     button.hidden = turns.has(turnId); turns.add(turnId);
-    button.disabled = modelUnavailable() || !supports('thread/revert') || !state.connected || state.sending || state.commandBusy || state.loading || state.active.has(state.thread?.id);
+    button.disabled = conversationReadOnly() || modelUnavailable() || !supports('thread/revert') || !state.connected || state.sending || state.commandBusy || state.loading || state.active.has(state.thread?.id);
     button.title = state.active.has(state.thread?.id) ? 'Stop the running task before editing' : 'Edit and resend in this conversation';
   }
-  saveComposerDraft();
 }
 function mergeRateLimit(previous = {}, incoming = {}) {
   const merged = { ...previous };
@@ -608,6 +633,7 @@ $('close-usage').onclick = () => $('usage-panel').hidePopover();
 addEventListener('resize', positionUsagePanel);
 function setTimelineFollowing(following, reading = null) {
   timelineView.following = following; timelineView.reading = reading;
+  if (following) hidePinContext();
   $('jump-latest').hidden = following;
 }
 function timelineAtBottom() {
@@ -660,28 +686,74 @@ async function saveMessagePin(pin, pinned) {
     preferences.messagePins = saved.messagePins || {};
   } finally { pinnedMessages.saving = false; renderMessagePins(); scrollToBottom(); }
 }
-async function jumpToMessagePin(pin) {
+function hidePinContext() {
+  pinnedMessages.context?.remove(); pinnedMessages.context = null;
+}
+function showPinContext(record) {
+  const context = record.pinContext;
+  if (!context) return;
+  if (pinnedMessages.context !== context) hidePinContext();
+  pinnedMessages.context = context;
+  $('messages').before(context);
+  context.querySelector('.load-pin-context').disabled = !state.turnCursor || Boolean(pinnedMessages.jumping);
+  updateMessageEdits();
+}
+function renderPinnedItem(entry, pin) {
+  if (entry.turnId !== pin.turnId || entry.item?.id !== pin.itemId) throw new Error('The coding agent returned a different pinned message.');
+  const context = document.createElement('section'); context.className = 'pin-context'; context.setAttribute('aria-label', 'Pinned message');
+  const body = document.createElement('div');
+  const footer = document.createElement('div'); footer.className = 'pin-context-footer';
+  const note = document.createElement('span'); note.textContent = 'More recent messages below';
+  const load = document.createElement('button'); load.type = 'button'; load.className = 'subtle load-pin-context'; load.textContent = 'Load surrounding history';
+  load.onclick = () => jumpToMessagePin(pin, true).catch(showError);
+  footer.append(note, load); context.append(body, footer);
+  const item = { ...entry.item, startedAtMs: entry.item.startedAtMs ?? entry.startedAtMs, completedAtMs: entry.item.completedAtMs ?? entry.completedAtMs };
+  const record = renderItem(item, false, entry.turnId, body);
+  if (!record) throw new Error('This pinned message cannot be displayed.');
+  record.pinContext = context; showPinContext(record);
+  return record;
+}
+async function jumpToMessagePin(pin, context = false) {
   if (!state.thread || state.loading || pinnedMessages.jumping) return;
-  const operation = { selection: state.selection };
-  pinnedMessages.jumping = operation; setTimelineFollowing(false); renderMessagePins();
-  const current = () => pinnedMessages.jumping === operation && state.selection === operation.selection;
+  const operation = { selection: state.selection, started: performance.now(), source: 'cached', count: 0 };
   const find = () => { const record = state.items.get(pin.itemId); return record?.turnId === pin.turnId ? record : null; };
+  pinnedMessages.jumping = operation; setTimelineFollowing(false, context ? find()?.element : null); renderMessagePins();
+  const current = () => pinnedMessages.jumping === operation && state.selection === operation.selection;
   try {
-    const seen = new Set();
-    while (!find() && state.turnCursor && !seen.has(state.turnCursor)) {
+    if (!find() && !context && agentMetadata(threadProvider(state.thread))?.methods?.includes('thread/items/read')) {
       if (!state.connected) throw new Error('Connect to load the pinned message.');
+      try {
+        const result = await rpc('thread/items/read', { threadId: state.thread.id, turnId: pin.turnId, itemIds: [pin.itemId] });
+        if (!current()) return;
+        if (!Array.isArray(result.data)) throw new Error('Invalid pinned-message response.');
+        const entry = result.data.find(entry => entry.turnId === pin.turnId && entry.item?.id === pin.itemId);
+        if (!entry) throw new Error('This pinned message is no longer in the conversation. You can unpin it.');
+        if (!find()) renderPinnedItem(entry, pin);
+        operation.source = 'direct';
+      } catch (error) {
+        if (!current()) return;
+        if (!/unknown (?:variant|method)|method.*not found|not support|unsupported.*(?:method|operation)|only.*paginated|legacy/i.test(error.message)) throw error;
+        trace('pin.jump.fallback', { threadId: state.thread.id, turnId: pin.turnId, error: error.message });
+      }
+    }
+    const seen = new Set();
+    while ((!find() || context && find().pinContext) && state.turnCursor && !seen.has(state.turnCursor)) {
+      if (!state.connected) throw new Error('Connect to load the pinned message.');
+      operation.source = 'pages'; operation.count++;
       seen.add(state.turnCursor); await loadOlderTurns();
       if (!current()) return;
     }
     const record = find();
     if (!record) throw new Error('This pinned message is no longer in the conversation. You can unpin it.');
+    if (record.pinContext) showPinContext(record); else hidePinContext();
     record.element.tabIndex = -1; record.element.focus({ preventScroll: true });
     setTimelineFollowing(false, record.element);
     $('timeline').scrollTop += record.element.getBoundingClientRect().top - $('timeline').getBoundingClientRect().top - 12;
     record.element.classList.add('pinned-target');
     setTimeout(() => record.element.classList.remove('pinned-target'), 1800);
+    trace('pin.jump.completed', { threadId: state.thread.id, turnId: pin.turnId, source: operation.source, count: operation.count, durationMs: Math.round(performance.now() - operation.started) });
   } catch (error) { if (current()) throw error; }
-  finally { if (pinnedMessages.jumping === operation) { pinnedMessages.jumping = null; renderMessagePins(); } }
+  finally { if (pinnedMessages.jumping === operation) { pinnedMessages.jumping = null; if (pinnedMessages.context) pinnedMessages.context.querySelector('.load-pin-context').disabled = !state.turnCursor; renderMessagePins(); } }
 }
 function renderThreads() {
   const focusedThread = $('threads').contains(document.activeElement) ? document.activeElement.closest('.thread')?.dataset.threadId : null;
@@ -689,7 +761,7 @@ function renderThreads() {
   const search = $('search').value.trim().toLowerCase();
   const projectIds = new Set(projects.data.map(project => project.id));
   const available = [...new Map([...state.pinnedThreads.values(), ...state.threads].map(thread => [thread.id, thread])).values()];
-  const pinned = [...state.pinnedIds].map(id => state.pinnedThreads.get(id) || { id, preview: 'Unavailable conversation' }).filter(thread => !projectIds.has(thread.projectId) && (!search || titleOf(thread).toLowerCase().includes(search)));
+  const pinned = [...state.pinnedIds].map(id => available.find(thread => thread.id === id) || { id, preview: state.failedPins.has(id) ? 'Could not load conversation' : 'Loading conversation…' }).filter(thread => !projectIds.has(thread.projectId) && (!search || titleOf(thread).toLowerCase().includes(search)));
   const recent = state.threads.filter(thread => !state.pinnedIds.has(thread.id) && !projectIds.has(thread.projectId));
   const heading = (text, target = fragment) => {
     const label = document.createElement('div'); label.className = 'list-heading thread-group'; label.textContent = text; target.append(label);
@@ -1048,8 +1120,10 @@ async function loadThreads(more = false, projectId = null) {
   filters.forEach((id, index) => { if (id) projects.cursors.set(id, pages[index].nextCursor); else state.threadCursor = pages[index].nextCursor; });
   for (const thread of state.threads) if (state.pinnedIds.has(thread.id)) state.pinnedThreads.set(thread.id, thread);
   const missing = [...state.pinnedIds].filter(id => !state.pinnedThreads.has(id));
+  for (const id of missing) state.failedPins.delete(id);
   const pinned = await Promise.allSettled(missing.map(threadId => rpc('thread/read', { threadId, includeTurns: false })));
   if (generation !== state.listGeneration) return;
+  state.failedPins = new Set(missing.filter((id, index) => pinned[index].status === 'rejected'));
   for (const result of pinned) if (result.status === 'fulfilled' && state.pinnedIds.has(result.value.thread.id)) state.pinnedThreads.set(result.value.thread.id, result.value.thread);
   renderThreads();
   updateSettingsActions();
@@ -1226,7 +1300,7 @@ function markdown(element, text) {
     ALLOW_ARIA_ATTR: false,
     ALLOWED_URI_REGEXP: /^(?:(?:https?|file):|[a-z]:[\\/]|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
   });
-  for (const link of element.querySelectorAll('a[href]')) linkContexts.set(link, { machine: accessKey(), cwd: state.thread?.cwd || $('workspace').value });
+  for (const link of element.querySelectorAll('a[href]')) linkContexts.set(link, { machine: accessKey(), threadId: state.thread?.id, provider: threadProvider(state.thread), cwd: state.thread?.cwd || $('workspace').value });
   for (const placeholder of element.querySelectorAll('[data-codex-image]')) {
     const token = images[Number(placeholder.dataset.codexImage)];
     if (token) placeholder.replaceWith(messageImage(token.href, token.text || 'Image')); else placeholder.remove();
@@ -1351,6 +1425,7 @@ function updateFileDiff(entry) {
 function isTestFile(filePath) {
   return /(?:^|\/)(?:__tests__|tests?)(?:\/|$)|(?:^|\/)test_[^/]+$|[._-](?:test|spec)\.[^/]+$/i.test(filePath.replace(/\\/g, '/'));
 }
+function localFilePath(file) { return mapProjectPath(file, conversationSync.pathsMachine === accessKey() ? conversationSync.paths?.[state.thread?.projectId] : null); }
 function renderFileSummary(turnId) {
   if (!turnId) return;
   let card = [...$('messages').querySelectorAll('.changed-files')].find(element => element.dataset.turnId === turnId);
@@ -1360,9 +1435,9 @@ function renderFileSummary(turnId) {
   for (const record of records) {
     for (const [index, change] of (record.item.changes || []).entries()) {
       if (typeof change.path !== 'string') continue;
-      const path = change.kind?.move_path || change.path;
-      const file = files.get(change.path) || files.get(path) || { id: JSON.stringify([record.item.id, index]), added: 0, removed: 0, diffs: [], kind: change.kind?.type };
-      if (change.kind?.move_path) files.delete(change.path);
+      const source = localFilePath(change.path), path = localFilePath(change.kind?.move_path || change.path);
+      const file = files.get(source) || files.get(path) || { id: JSON.stringify([record.item.id, index]), added: 0, removed: 0, diffs: [], kind: change.kind?.type };
+      if (change.kind?.move_path) files.delete(source);
       file.path = path;
       if (change.kind?.type === 'delete' || change.kind?.type === 'add') file.kind = change.kind.type;
       else if (change.kind?.move_path) file.kind = 'rename';
@@ -1397,7 +1472,7 @@ function renderFileSummary(turnId) {
   const rows = card.lastElementChild;
   const entries = new Map([...rows.children].map(entry => [entry.dataset.fileId, entry]));
   let next = rows.firstElementChild;
-  const context = { machine: accessKey(), cwd: state.thread?.cwd || $('workspace').value, provider: threadProvider(state.thread), clampLine: true };
+  const context = { machine: accessKey(), threadId: state.thread?.id, cwd: state.thread?.cwd || $('workspace').value, provider: threadProvider(state.thread), clampLine: true };
   const shouldExpand = entry => preferences.skipTestDiffs === false || !isTestFile(entry.dataset.path);
   const updateToggleTitle = () => { card.firstElementChild.title = [...rows.children].some(entry => shouldExpand(entry) && !entry.open) || !card.querySelector('.changed-file-entry[open]') ? 'Expand all file diffs' : 'Collapse all file diffs'; };
   card.firstElementChild.onclick = event => {
@@ -1455,7 +1530,7 @@ function renderFileSummary(turnId) {
   for (const entry of entries.values()) entry.remove();
   updateToggleTitle();
 }
-function renderItem(item, prepend = false, turnId = null) {
+function renderItem(item, prepend = false, turnId = null, container = $('messages')) {
   if (!item?.id) return;
   const anchor = timelineView.reading;
   const anchorTop = anchor?.isConnected && anchor.checkVisibility() ? anchor.getBoundingClientRect().top : null;
@@ -1472,10 +1547,14 @@ function renderItem(item, prepend = false, turnId = null) {
     element.append(label, body);
     record = { element, label, body, item };
     state.items.set(item.id, record);
+  }
+  if (record.container !== container) {
+    const { element } = record;
+    const previousGroup = record.group;
     if (isMessage) {
-      if (prepend) $('messages').prepend(element); else $('messages').append(element);
+      if (prepend) container.prepend(element); else container.append(element);
     } else {
-      let neighbor = $('messages')[prepend ? 'firstElementChild' : 'lastElementChild'];
+      let neighbor = container[prepend ? 'firstElementChild' : 'lastElementChild'];
       if (neighbor?.classList.contains('changed-files')) neighbor = neighbor[prepend ? 'nextElementSibling' : 'previousElementSibling'];
       let group = neighbor?.classList.contains('activity-log') && neighbor.dataset.turnId === (turnId || '') ? neighbor : null;
       if (!group) {
@@ -1483,10 +1562,16 @@ function renderItem(item, prepend = false, turnId = null) {
         const summary = document.createElement('summary'); summary.title = 'Show or hide full activity log';
         const entries = document.createElement('div'); entries.className = 'activity-items';
         group.append(summary, entries);
-        if (prepend) $('messages').prepend(group); else $('messages').append(group);
+        if (prepend) container.prepend(group); else container.append(group);
       }
       group.lastElementChild[prepend ? 'prepend' : 'append'](element);
       record.group = group;
+    }
+    if (previousGroup && !previousGroup.lastElementChild.children.length) previousGroup.remove();
+    record.container = container;
+    if (record.pinContext && container === $('messages')) {
+      if (pinnedMessages.context === record.pinContext) hidePinContext();
+      delete record.pinContext;
     }
   }
   record.item = { ...record.item, ...item };
@@ -1799,6 +1884,15 @@ async function refreshConversationSync() {
       const options = state.options, snapshot = drafts.snapshot, target = drafts.target, editors = new Map(editorDrafts);
       const [saved, pins, sync] = await Promise.all([api.preferences(), api.pins(), api.conversationSync()]);
       if (options !== state.options) continue;
+      const pathsChanged = JSON.stringify(conversationSync.paths) !== JSON.stringify(sync.paths || {});
+      conversationSync.paths = sync.paths || {}; conversationSync.pathsMachine = accessKey();
+      if (pathsChanged) for (const turnId of new Set([...state.items.values()].filter(record => record.item.type === 'fileChange').map(record => record.turnId))) renderFileSummary(turnId);
+      const previousAccess = state.thread && conversationSync.ownership.get(state.thread.id);
+      conversationSync.historyEnabled = Boolean(sync.historyEnabled);
+      conversationSync.ownership = new Map((sync.ownership || []).map(access => [access.id, access]));
+      const access = conversationAccess();
+      if (previousAccess?.waiting && access?.owned && !access.requested && !state.loading && !state.sending && !state.active.has(state.thread?.id)) await openThread(state.thread, true);
+      updateSendButton(); updateMessageEdits();
       refreshEditorDrafts(editors);
       preferences.conversationStates = saved.conversationStates || {};
       preferences.messagePins = saved.messagePins || {};
@@ -1817,7 +1911,7 @@ async function refreshConversationSync() {
         if (sync.error) { const error = document.createElement('span'); error.textContent = 'Sync: ' + sync.error; notice.append(error); }
         if (conflict) {
           const details = document.createElement('details'), summary = document.createElement('summary'), preview = document.createElement('pre');
-          summary.textContent = conflict.kind === 'shortcuts' ? 'Shortcuts changed on both computers' : 'Draft changed on both computers';
+          summary.textContent = conflict.kind === 'history' ? 'Conversation history changed on both computers' : conflict.kind === 'shortcuts' ? 'Shortcuts changed on both computers' : 'Draft changed on both computers';
           preview.textContent = `This computer:\n${conflict.local || '(empty)'}\n\nOther computer:\n${conflict.remote || '(empty)'}`;
           details.append(summary, preview); notice.append(details);
           for (const [label, choice] of [['Keep this version', 'local'], ['Use other version', 'remote']]) {
@@ -2196,7 +2290,7 @@ async function flushQueue(threadId) {
 }
 function shortcutUnavailable(shortcut) {
   if (shortcut?.mode === 'fill') return state.connecting || state.sending || state.loading || state.commandBusy || drafts.suspended;
-  return modelUnavailable() || !state.connected || state.connecting || state.sending || state.loading || state.commandBusy || state.images.some(image => !image.url) || queueLocked(state.queues.get(queueKey(state.thread?.id)));
+  return conversationReadOnly() || modelUnavailable() || !state.connected || state.connecting || state.sending || state.loading || state.commandBusy || state.images.some(image => !image.url) || queueLocked(state.queues.get(queueKey(state.thread?.id)));
 }
 function promptSkillNames(text) { return [...new Set(text.split(/\s+/).filter(token => /^\$[a-zA-Z_][\w:.-]*$/.test(token)).map(token => token.slice(1)))]; }
 async function resolvePromptSkills(text, required = false) {
@@ -2274,6 +2368,7 @@ async function send(event, steer = false, action = null) {
   const images = shortcut ? [] : [...state.images];
   if ((!text && !images.length) || images.some(image => !image.url) || !state.connected || state.sending || state.loading) return;
   if (modelUnavailable()) { showError(`${agentName()} model is unavailable. Reconnect or select another model.`); return; }
+  if (conversationReadOnly()) { showError('Use this conversation on this computer before sending messages.'); return; }
   saveComposerDraft(); const originalDraft = drafts.target;
   const delayHours = !steer && !action ? Number($('send-time').value) : 0;
   const input = [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...images.map(image => ({ type: 'image', url: image.url })), ...skillInputs(text, action?.skills)];
@@ -2564,6 +2659,7 @@ async function connect(options) {
   state.connected = false;
   state.nativeQueues.clear();
   state.options = options;
+  conversationSync.ownership.clear(); conversationSync.historyEnabled = false;
   usage.generation++; usage.threads.clear(); usage.account = null; usage.reading = null; usage.updatedAt = 0; usage.error = null;
   state.commandBusy = false; state.branching = null; state.resending = null; state.archiving = null;
   projects.generation++; projects.data = []; projects.selected = null; projects.expanded.clear(); projects.cursors.clear(); projects.collapsed.clear();
@@ -2581,6 +2677,7 @@ async function connect(options) {
   state.threads = [];
   state.pinnedIds.clear();
   state.pinnedThreads.clear();
+  state.failedPins.clear();
   state.pinning.clear();
   state.threadCursor = null;
   state.threadQuery = null;
@@ -3378,10 +3475,13 @@ function loadOlderTurns() {
     const result = await rpc('thread/turns/list', { threadId: state.thread.id, cursor: state.turnCursor, limit: 25, sortDirection: 'desc', itemsView: 'full' });
     if (selection !== state.selection) return;
     const height = $('timeline').scrollHeight, top = $('timeline').scrollTop;
+    const anchor = timelineView.reading || pinnedMessages.context?.querySelector('.message');
+    const anchorTop = anchor?.isConnected && anchor.checkVisibility() ? anchor.getBoundingClientRect().top : null;
     for (const turn of result.data) for (const item of [...(turn.items || [])].reverse()) renderItem(item, true, turn.id);
     state.turnCursor = result.nextCursor;
     $('older-turns').hidden = !result.nextCursor;
-    $('timeline').scrollTop = top + $('timeline').scrollHeight - height;
+    if (anchorTop !== null && anchor.isConnected && anchor.checkVisibility()) $('timeline').scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+    else $('timeline').scrollTop = top + $('timeline').scrollHeight - height;
   } finally { if (state.olderHistory === operation) { state.olderHistory = null; $('older-turns').disabled = false; updateBusy(); } } })();
   return operation.promise;
 }

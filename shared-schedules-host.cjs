@@ -19,7 +19,7 @@ class SharedScheduleDatabase {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(file);
     fs.chmodSync(file, 0o600);
-    this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=256; PRAGMA max_page_count=32768;
+    this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=256; PRAGMA max_page_count=2097152;
       CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, machine TEXT NOT NULL, thread_id TEXT NOT NULL, status TEXT NOT NULL, run_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, summary TEXT NOT NULL, payload TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS due_tasks ON tasks(machine,thread_id,status,run_at);
       CREATE TABLE IF NOT EXISTS tombstones(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
@@ -69,7 +69,7 @@ class SharedScheduleDatabase {
   }
   perform(method, args, owner, now) {
     if (method === 'hello') return { protocol: 1, leaseMs };
-    if (method.startsWith('state-') || method.startsWith('blob-')) return this.state.request(method, args, owner, now);
+    if (method.startsWith('state-') || method.startsWith('blob-') || method.startsWith('history-')) return this.state.request(method, args, owner, now);
     if (method === 'storage-info') {
       const directory = path.dirname(this.file);
       let bytes = 0, remaining = 10000, complete = true;

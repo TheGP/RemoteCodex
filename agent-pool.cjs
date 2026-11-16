@@ -42,7 +42,20 @@ class AgentPool extends EventEmitter {
     this.connecting = new Set(); this.pages = new Map();
     this.launchOptions = []; this.recovering = null; this.attempts = new Map(); this.configuration = null;
     this.session = null; this.generation = 0; this.machine = null;
+    this.threadAliases = new Map(); this.threadOrigins = new Map();
   }
+  setThreadAliases(records) {
+    const previous = JSON.stringify([...this.threadAliases]);
+    this.threadAliases.clear(); this.threadOrigins.clear();
+    for (const [logical, record] of Object.entries(records)) if (record.nativeId) {
+      const target = agentTarget(logical, 'thread');
+      if (target.provider !== 'codex' || typeof record.nativeId !== 'string' || record.nativeId.startsWith('agent:')) throw new Error('Invalid synced conversation alias.');
+      this.threadAliases.set(logical, record.nativeId);
+      for (const native of [target.value, record.nativeId, ...record.retiredNativeIds || []]) this.threadOrigins.set(native, logical);
+    }
+    if (previous !== JSON.stringify([...this.threadAliases])) this.pages.clear();
+  }
+  threadIdentity(provider, id) { return provider === 'codex' && this.threadOrigins.get(id) || agentId(provider, 'thread', id); }
   get ready() { return [...this.connections.values()].some(connection => connection.ready); }
   describe(id = 'codex', options = this.configuration) {
     const descriptor = providerSettings(this.registry).find(provider => provider.id === id);
@@ -85,7 +98,7 @@ class AgentPool extends EventEmitter {
   turn(provider, turn) { return turn ? { ...turn, id: agentId(provider, 'turn', turn.id), ...(turn.items ? { items: turn.items.map(item => this.item(provider, item)) } : {}) } : turn; }
   thread(provider, thread) {
     if (!thread) return thread;
-    return { ...thread, provider, id: agentId(provider, 'thread', thread.id), projectId: agentId(provider, 'project', thread.projectId), ...(thread.model ? { model: agentId(provider, 'model', thread.model) } : {}), ...(thread.turns ? { turns: thread.turns.map(turn => this.turn(provider, turn)) } : {}) };
+    return { ...thread, provider, id: this.threadIdentity(provider, thread.id), projectId: agentId(provider, 'project', thread.projectId), ...(thread.model ? { model: agentId(provider, 'model', thread.model) } : {}), ...(thread.turns ? { turns: thread.turns.map(turn => this.turn(provider, turn)) } : {}) };
   }
   project(provider, project) { return project ? { ...project, provider, id: agentId(provider, 'project', project.id) } : project; }
   result(provider, method, result) {
@@ -95,11 +108,12 @@ class AgentPool extends EventEmitter {
     if (result.turn) mapped.turn = this.turn(provider, result.turn);
     if (result.project) mapped.project = this.project(provider, result.project);
     if (result.reviewThreadId) mapped.reviewThreadId = agentId(provider, 'thread', result.reviewThreadId);
-    if (Array.isArray(result.data)) mapped.data = result.data.map(value => {
+    if (Array.isArray(result.data)) mapped.data = result.data.filter(value => method !== 'thread/list' || provider !== 'codex' || !this.threadAliases.has(this.threadIdentity(provider, value.id)) || this.threadAliases.get(this.threadIdentity(provider, value.id)) === value.id).map(value => {
       if (method === 'thread/list') return this.thread(provider, value);
       if (method === 'project/list') return this.project(provider, value);
       if (method === 'thread/turns/list') return this.turn(provider, value);
       if (method === 'thread/items/list') return this.item(provider, value);
+      if (method === 'thread/items/read') return { ...value, turnId: agentId(provider, 'turn', value.turnId), item: this.item(provider, value.item) };
       if (method === 'model/list') return { ...value, provider, providerName: this.catalog.describe(provider).name, nativeModel: value.model, model: agentId(provider, 'model', value.model) };
       if (method === 'collaborationMode/list') return { ...value, provider, ...(value.model ? { model: agentId(provider, 'model', value.model) } : {}) };
       return value;
@@ -108,7 +122,9 @@ class AgentPool extends EventEmitter {
   }
   notification(provider, message) {
     const params = { ...message.params };
-    for (const [key, kind] of [['threadId', 'thread'], ['turnId', 'turn'], ['itemId', 'item'], ['projectId', 'project']]) if (params[key] !== undefined) params[key] = agentId(provider, kind, params[key]);
+    const origin = provider === 'codex' && this.threadOrigins.get(params.threadId);
+    if (origin && this.threadAliases.get(origin) !== params.threadId) return null;
+    for (const [key, kind] of [['threadId', 'thread'], ['turnId', 'turn'], ['itemId', 'item'], ['projectId', 'project']]) if (params[key] !== undefined) params[key] = kind === 'thread' ? this.threadIdentity(provider, params[key]) : agentId(provider, kind, params[key]);
     if (params.thread) params.thread = this.thread(provider, params.thread);
     if (params.turn) params.turn = this.turn(provider, params.turn);
     if (params.item) params.item = this.item(provider, params.item);
@@ -157,7 +173,10 @@ class AgentPool extends EventEmitter {
       let connection = this.connections.get(id);
       if (!connection) {
         connection = new AgentConnection(this.registry); this.connections.set(id, connection);
-        connection.on('notification', message => { if (message.method !== 'connection/closed' || !this.connecting.has(id)) this.emit('notification', this.notification(id, message)); });
+        connection.on('notification', message => {
+          if (message.method === 'connection/closed' && this.connecting.has(id)) return;
+          const notification = this.notification(id, message); if (notification) this.emit('notification', notification);
+        });
         connection.on('diagnostic', entry => this.emit('diagnostic', { ...entry, details: { ...entry.details, provider: id } }));
         this.emit('connection', { provider: id, connection });
       }
@@ -195,11 +214,19 @@ class AgentPool extends EventEmitter {
 
   nativeParams(provider, params) {
     const native = { ...params };
+    if (native.itemIds !== undefined) {
+      if (!Array.isArray(native.itemIds) || !native.itemIds.length || native.itemIds.length > 100 || native.itemIds.some(id => typeof id !== 'string' || !id)) throw new Error('Invalid message identities.');
+      native.itemIds = native.itemIds.map(id => {
+        const target = agentTarget(id, 'item');
+        if (target.provider !== provider) throw new Error('This message belongs to another coding agent.');
+        return target.value;
+      });
+    }
     for (const [key, kind] of [['threadId', 'thread'], ['turnId', 'turn'], ['beforeTurnId', 'turn'], ['expectedTurnId', 'turn'], ['itemId', 'item'], ['projectId', 'project'], ['beforeProjectId', 'project'], ['model', 'model']]) {
       if (native[key] === undefined || native[key] === null || native[key] === '') continue;
       const target = agentTarget(native[key], kind);
       if (target.provider !== provider) throw new Error('This conversation belongs to another coding agent.');
-      native[key] = target.value;
+      native[key] = kind === 'thread' && this.threadAliases.has(native[key]) ? this.threadAliases.get(native[key]) : target.value;
       if (key === 'model' && !target.value) delete native.model;
     }
     if (native.collaborationMode?.settings?.model) {
@@ -275,6 +302,7 @@ class AgentPool extends EventEmitter {
   async rejectRequest(id) { const target = agentTarget(id, 'request'); return this.connectionFor(target.provider).rejectRequest(target.value); }
   disconnect() {
     this.session = null; this.pages.clear(); this.connecting.clear(); this.attempts.clear(); this.launchOptions = []; this.recovering = null; this.configuration = null;
+    this.threadAliases.clear(); this.threadOrigins.clear();
     for (const connection of this.connections.values()) connection.disconnect();
     this.emit('disconnected');
   }

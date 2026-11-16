@@ -11,6 +11,8 @@ const { ConversationState } = require('../conversation-state.cjs');
 const { PinStore } = require('../pins.cjs');
 const { DraftStore } = require('../drafts.cjs');
 const { PreferencesStore } = require('../preferences.cjs');
+const { mapProjectPath } = require('../path-mapping.js');
+const { openFileLink } = require('../links.cjs');
 
 async function main() {
   const host = process.env.CODEX_TEST_HOST || 'root@warmer', id = randomUUID();
@@ -53,6 +55,18 @@ async function main() {
     assert.equal(b.drafts.read(target).target.cwd, b.root);
     assert.equal(b.drafts.read(target).text, 'Unsent draft');
     assert.equal(b.drafts.read(target).images[0].url, 'data:image/png;base64,aW1hZ2U=');
+    await b.state.tick(); await a.state.tick();
+    assert.equal(a.state.sync.entries('projectPath', machine()).length, 2);
+    assert.equal(b.state.sync.entries('projectPath', machine()).length, 2);
+    assert.equal(mapProjectPath(a.root + '/mapped #file.ts', b.state.fileMapping(id)), b.root + '/mapped #file.ts');
+    assert.equal(mapProjectPath(b.root + '/mapped #file.ts', a.state.fileMapping(id)), a.root + '/mapped #file.ts');
+    const localFile = path.join(b.root, 'mapped #file.ts'); fs.writeFileSync(localFile, 'Only the receiving workspace has this file.');
+    let opened;
+    await openFileLink(a.root.split('/').map(encodeURIComponent).join('/') + '/mapped%20%23file.ts#L77C3', {
+      cwd: b.root, settings: { mode: 'local' }, opener: 'gitferry', mapPath: file => mapProjectPath(file, b.state.fileMapping(id)),
+      application: () => 'Test editor', openExternal: async url => { opened = new URL(url); }
+    });
+    assert.equal(opened.searchParams.get('file'), localFile); assert.equal(opened.searchParams.get('line'), '77'); assert.equal(opened.searchParams.get('column'), '3');
     a.drafts.save(source, { text: 'First computer edit' }); a.state.captureDraft(source);
     b.drafts.save(target, { text: 'Second computer edit' }); b.state.captureDraft(target);
     await a.state.tick(); await b.state.tick();
@@ -61,7 +75,7 @@ async function main() {
     await b.state.sync.resolve(conflict.key, 'local', conflict.version); await b.state.tick(); await a.state.tick();
     assert.equal(a.drafts.read(source).text, 'Second computer edit');
     const storage = await a.shared.storageInfo(); assert.equal(storage.complete, true); assert.ok(storage.bytes > 0);
-    console.log('PASS Warmer SSH: pins, message pins, unread, shortcuts, image drafts, distinct project roots and concurrent draft resolution; no native execution.');
+    console.log('PASS Warmer SSH: pins, message pins, unread, shortcuts, image drafts, distinct project roots, bidirectional file mapping with exact editor positions, and concurrent draft resolution; no native execution.');
   } finally {
     for (const client of clients) { client.state.sync.close(); client.shared.close(); }
     const cleanup = `const fs=require("node:fs"),path=require("node:path"),os=require("node:os");fs.rmSync(path.join(os.homedir(),".local/share/remote-codex/schedule-sync/conversations-test-${id}"),{recursive:true,force:true});`;

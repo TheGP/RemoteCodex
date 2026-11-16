@@ -47,8 +47,9 @@ async function editorSshHost(settings, run = execute) {
   return settings.host;
 }
 
-async function openFileLink(value, { cwd, settings, opener = 'vscode', openExternal, reveal, application, sshHost = editorSshHost, current = () => {}, clampLine = false, readFile }) {
+async function openFileLink(value, { cwd, settings, opener = 'vscode', openExternal, reveal, application, sshHost = editorSshHost, current = () => {}, clampLine = false, readFile, mapPath = file => file }) {
   const target = parseFileLink(value, cwd);
+  target.file = mapPath(target.file);
   const local = settings.mode === 'local';
   if (!['vscode', 'antigravity', 'gitferry', 'reveal'].includes(opener)) throw new Error('Choose a file opener in Settings.');
   if (local && !(await fs.stat(target.file)).isFile()) throw new Error('This link does not point to a file.');

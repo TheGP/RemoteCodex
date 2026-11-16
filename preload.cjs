@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('agent', {
   saveScheduleSharing: value => ipcRenderer.invoke('save-schedule-sharing', value),
   syncSchedules: () => ipcRenderer.invoke('sync-schedules'),
   conversationSync: () => ipcRenderer.invoke('conversation-sync'),
+  requestConversation: id => ipcRenderer.invoke('request-conversation', id),
   resolveSyncConflict: (key, choice, version) => ipcRenderer.invoke('resolve-sync-conflict', key, choice, version),
   mapSyncProject: (id, root) => ipcRenderer.invoke('map-sync-project', id, root),
   scheduledTask: (id, token) => ipcRenderer.invoke('scheduled-task', id, token),

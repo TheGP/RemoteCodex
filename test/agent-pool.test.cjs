@@ -66,6 +66,30 @@ test('parallel agents share a machine while models, chats, history and turns ret
   assert.equal(adapters.get('codex').calls.length + adapters.get('sample').calls.length, before);
 });
 
+test('direct message reads preserve wrapped identities and reject foreign or invalid item lists', async t => {
+  const { pool, adapters } = fixture(t);
+  await pool.connect({ mode: 'local' });
+  for (const provider of ['codex', 'sample']) {
+    const adapter = adapters.get(provider);
+    adapter.call = async (method, params) => {
+      adapter.calls.push({ method, params });
+      return { data: [{ turnId: 'same-turn', item: { id: 'same-item', type: 'agentMessage', text: 'Pinned' }, startedAtMs: 1234 }] };
+    };
+    const params = { threadId: agentId(provider, 'thread', 'same-chat'), turnId: agentId(provider, 'turn', 'same-turn'), itemIds: [agentId(provider, 'item', 'same-item')] };
+    const result = await pool.call('thread/items/read', params);
+    assert.deepEqual(adapter.calls.at(-1), { method: 'thread/items/read', params: { threadId: 'same-chat', turnId: 'same-turn', itemIds: ['same-item'] } });
+    assert.deepEqual(result.data, [{ turnId: params.turnId, item: { id: params.itemIds[0], type: 'agentMessage', text: 'Pinned' }, startedAtMs: 1234 }]);
+  }
+  const adapter = adapters.get('sample'), count = adapter.calls.length;
+  const base = { threadId: agentId('sample', 'thread', 'same-chat'), turnId: agentId('sample', 'turn', 'same-turn') };
+  for (const itemIds of [null, 'same-item', [], [null], [''], Array(101).fill('same-item')]) {
+    await assert.rejects(pool.call('thread/items/read', { ...base, itemIds }), /Invalid message/);
+  }
+  await assert.rejects(pool.call('thread/items/read', { ...base, itemIds: ['same-item'] }), /another coding agent/);
+  await assert.rejects(pool.call('thread/items/read', { ...base, itemIds: [agentId('sample', 'turn', 'same-item')] }), /Invalid item/);
+  assert.equal(adapter.calls.length, count);
+});
+
 test('simultaneous questions with identical native IDs can be answered independently and expire on reconnect', async t => {
   const { pool, adapters } = fixture(t), events = [];
   pool.on('notification', event => events.push(event));
@@ -381,4 +405,88 @@ test('disabling an agent during recovery ignores its late initialization and lea
   finish(); await recovery;
   assert.equal(pool.describe('sample').enabled, false); assert.equal(pool.describe('sample').connected, false);
   assert.equal(pool.describe('sample').error, null); assert.equal(adapters.get('codex'), codex); assert.equal(codex.disconnects, 0);
+});
+
+test('synced Codex aliases route native calls and normalize replies and events while preserving turn and item IDs', async t => {
+  const { pool, adapters } = fixture(t), events = [];
+  pool.on('notification', event => events.push(event));
+  await pool.connect({ mode: 'local' });
+  pool.setThreadAliases({ 'logical-chat': { nativeId: 'native-current', retiredNativeIds: ['native-retired'] } });
+  const codex = adapters.get('codex');
+  codex.call = async (method, params) => {
+    codex.calls.push({ method, params });
+    if (method === 'thread/turns/list') return { data: [{ id: 'stable-turn', items: [{ id: 'stable-item', type: 'agentMessage', text: 'Pinned answer' }] }], nextCursor: null };
+    return { thread: { id: params.threadId, cwd: '/tmp', turns: [{ id: 'stable-turn', items: [{ id: 'stable-item', type: 'agentMessage', text: 'Pinned answer' }] }] } };
+  };
+  const result = await pool.call('thread/resume', { threadId: 'logical-chat', excludeTurns: true });
+  assert.equal(codex.calls.at(-1).params.threadId, 'native-current');
+  assert.equal(result.thread.id, 'logical-chat');
+  assert.equal(result.thread.turns[0].id, 'stable-turn'); assert.equal(result.thread.turns[0].items[0].id, 'stable-item');
+  const history = await pool.call('thread/turns/list', { threadId: 'logical-chat' });
+  assert.equal(codex.calls.at(-1).params.threadId, 'native-current');
+  assert.equal(history.data[0].id, 'stable-turn'); assert.equal(history.data[0].items[0].id, 'stable-item');
+  codex.emit('notification', { method: 'item/completed', params: { threadId: 'native-current', turnId: 'stable-turn', item: { id: 'stable-item', type: 'agentMessage', text: 'Pinned answer' }, thread: { id: 'native-current' }, turn: { id: 'stable-turn', items: [{ id: 'stable-item' }] } } });
+  const event = events.at(-1);
+  assert.equal(event.params.threadId, 'logical-chat'); assert.equal(event.params.thread.id, 'logical-chat');
+  assert.equal(event.params.turnId, 'stable-turn'); assert.equal(event.params.turn.id, 'stable-turn');
+  assert.equal(event.params.item.id, 'stable-item'); assert.equal(event.params.turn.items[0].id, 'stable-item');
+  const count = events.length;
+  for (const id of ['native-retired', 'logical-chat']) {
+    const stale = { method: 'turn/completed', params: { threadId: id, turn: { id: 'stable-turn', status: 'completed' } } };
+    assert.equal(pool.notification('codex', stale), null);
+    codex.emit('notification', stale);
+    assert.equal(events.length, count);
+  }
+  const sample = adapters.get('sample');
+  await pool.call('thread/read', { threadId: agentId('sample', 'thread', 'logical-chat') });
+  assert.equal(sample.calls.at(-1).params.threadId, 'logical-chat');
+  sample.emit('notification', { method: 'item/completed', params: { threadId: 'native-current', turnId: 'stable-turn', item: { id: 'stable-item' } } });
+  assert.equal(events.at(-1).params.threadId, agentId('sample', 'thread', 'native-current'));
+  assert.equal(events.at(-1).params.item.id, agentId('sample', 'item', 'stable-item'));
+});
+
+test('conversation lists expose only the active Codex alias and preserve colliding IDs from other providers', async t => {
+  const { pool, adapters } = fixture(t);
+  await pool.connect({ mode: 'local' });
+  pool.setThreadAliases({ 'logical-chat': { nativeId: 'native-current', retiredNativeIds: ['native-retired'] } });
+  const rows = ['logical-chat', 'native-retired', 'native-current', 'unrelated-chat'].map((id, index) => ({ id, updatedAt: 100 - index, path: '/fixture/' + id }));
+  for (const adapter of adapters.values()) adapter.call = async () => ({ data: rows, nextCursor: null });
+  const merged = await pool.call('thread/list', { limit: 50 });
+  const codex = merged.data.filter(thread => thread.provider === 'codex'), sample = merged.data.filter(thread => thread.provider === 'sample');
+  assert.deepEqual(codex.map(thread => thread.id).sort(), ['logical-chat', 'unrelated-chat']);
+  assert.equal(codex.find(thread => thread.id === 'logical-chat').path, '/fixture/native-current');
+  assert.deepEqual(sample.map(thread => thread.id), rows.map(thread => agentId('sample', 'thread', thread.id)));
+  const direct = await pool.call('thread/list', { provider: 'codex', limit: 50 });
+  assert.deepEqual(direct.data.map(thread => thread.id), ['logical-chat', 'unrelated-chat']);
+});
+
+test('disconnect clears Codex aliases and saved aliases can be restored without changing other providers', async t => {
+  const { pool, adapters } = fixture(t);
+  const records = { 'logical-chat': { nativeId: 'native-current', retiredNativeIds: ['native-retired'] } };
+  const persisted = JSON.stringify(records);
+  await pool.connect({ mode: 'local' }); pool.setThreadAliases(records);
+  pool.disconnect();
+  assert.equal(pool.threadIdentity('codex', 'native-current'), 'native-current');
+  assert.equal(pool.threadIdentity('codex', 'native-retired'), 'native-retired');
+  assert.equal(pool.nativeParams('codex', { threadId: 'logical-chat' }).threadId, 'logical-chat');
+  await pool.connect({ mode: 'local' });
+  assert.equal(pool.threadIdentity('codex', 'native-current'), 'native-current');
+  pool.setThreadAliases(JSON.parse(persisted));
+  await pool.call('thread/read', { threadId: 'logical-chat' });
+  assert.equal(adapters.get('codex').calls.at(-1).params.threadId, 'native-current');
+  assert.equal(pool.threadIdentity('codex', 'native-retired'), 'logical-chat');
+  assert.equal(pool.threadIdentity('sample', 'native-current'), agentId('sample', 'thread', 'native-current'));
+  pool.setThreadAliases({});
+  assert.equal(pool.threadIdentity('codex', 'native-current'), 'native-current');
+});
+
+test('alias replacement invalidates buffered native conversation pages', async t => {
+  const { pool, adapters } = fixture(t);
+  await pool.connect({ mode: 'local' });
+  adapters.get('codex').call = async () => ({ data: [{ id: 'logical-chat', updatedAt: 100 }, { id: 'native-retired', updatedAt: 90 }, { id: 'native-current', updatedAt: 80 }], nextCursor: null });
+  adapters.get('sample').call = async () => ({ data: [{ id: 'sample-chat', updatedAt: 200 }], nextCursor: null });
+  const first = await pool.call('thread/list', { limit: 1 });
+  assert.ok(first.nextCursor);
+  pool.setThreadAliases({ 'logical-chat': { nativeId: 'native-current', retiredNativeIds: ['native-retired'] } });
+  await assert.rejects(pool.call('thread/list', { limit: 1, cursor: first.nextCursor }), /list expired/);
 });

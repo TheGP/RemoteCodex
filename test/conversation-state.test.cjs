@@ -9,6 +9,7 @@ const { PinStore } = require('../pins.cjs');
 const { DraftStore } = require('../drafts.cjs');
 const { PreferencesStore } = require('../preferences.cjs');
 const { hash, stateKey } = require('../sync-state.cjs');
+const { mapProjectPath } = require('../path-mapping.js');
 
 const machine = 'access:local';
 function fixture(t) {
@@ -59,6 +60,17 @@ function fixture(t) {
   return { a: clients[0], b: clients[1] };
 }
 
+test('fresh native thread capture initializes sync state before the first background tick', async t => {
+  const { a, b } = fixture(t);
+  assert.equal(a.state.sync.state, undefined);
+  const thread = { id: 'startup-native-chat', name: 'Captured before background sync', cwd: a.root, updatedAt: 1 };
+  assert.doesNotThrow(() => a.state.captureThread(thread));
+  assert.equal(a.state.sync.state.pending.find(op => op.kind === 'thread').value.name, thread.name);
+  assert.deepEqual(a.calls, []); assert.deepEqual(a.bridgeCalls, []);
+  await a.state.tick(); await b.state.tick();
+  assert.equal(b.state.catalog('thread', thread.id).name, thread.name);
+});
+
 test('shared project catalogs require an explicit local folder mapping before running a peer conversation', async t => {
   const { a, b } = fixture(t);
   const project = a.state.captureProject({ id: 'native-project-0', provider: 'codex', name: 'Shared project', roots: [{ path: a.root }] });
@@ -81,6 +93,120 @@ test('shared project catalogs require an explicit local folder mapping before ru
   assert.equal(b.calls[0].params.path, b.root); assert.equal(b.calls[0].context.provider, 'codex');
   assert.deepEqual(b.calls[1].params.roots, [{ path: b.root }]);
   assert.equal(b.calls[1].params.idempotencyKey, hash(JSON.stringify([project.sharedId, b.root])));
+});
+
+test('each device publishes a separate project path row and peer file links require an explicit local folder', async t => {
+  const { a, b } = fixture(t);
+  const project = a.state.captureProject({ id: 'path-native-project', provider: 'codex', name: 'Path project', roots: [{ path: a.root }] });
+  a.state.captureThread({ id: 'path-chat', projectId: project.id, name: 'Path chat', cwd: a.root });
+  await a.state.tick(); await b.state.tick();
+  const sourceId = JSON.stringify([project.sharedId, a.shared.state.device]);
+  assert.deepEqual(b.state.catalog('projectPath', sourceId), { roots: [a.root] });
+  assert.equal(b.state.binding(project.sharedId), undefined);
+  assert.throws(() => b.state.fileMapping('path-chat'), /Choose this shared project/);
+  assert.deepEqual(b.calls, []);
+  await b.state.bind(project.sharedId, b.root);
+  const peerId = JSON.stringify([project.sharedId, b.shared.state.device]);
+  assert.deepEqual(b.state.sync.state.pending.find(op => op.kind === 'projectPath' && op.id === peerId).value, { roots: [b.root] });
+  assert.equal(mapProjectPath(path.join(a.root, 'src', 'a.ts'), b.state.fileMapping('path-chat')), path.join(b.root, 'src', 'a.ts'));
+  await b.state.tick(); await a.state.tick();
+  for (const client of [a, b]) {
+    assert.deepEqual(client.state.catalog('projectPath', sourceId), { roots: [a.root] });
+    assert.deepEqual(client.state.catalog('projectPath', peerId), { roots: [b.root] });
+    assert.equal(client.state.sync.entries('projectPath', machine).length, 2);
+    assert.equal(client.state.fileMapping('path-chat').root, client.root);
+  }
+  assert.equal(mapProjectPath(path.join(b.root, 'src', 'a.ts'), a.state.fileMapping('path-chat')), path.join(a.root, 'src', 'a.ts'));
+  assert.equal(mapProjectPath(path.join(a.root + '-sibling', 'a.ts'), b.state.fileMapping('path-chat')), path.join(a.root + '-sibling', 'a.ts'));
+});
+
+test('moving and explicitly remapping project folders retains each device’s current and historical roots', async t => {
+  const { a, b } = fixture(t);
+  const native = { id: 'moving-native-project', provider: 'codex', name: 'Moving project', roots: [{ path: a.root }] };
+  const project = a.state.captureProject(native);
+  a.state.captureThread({ id: 'moving-chat', projectId: native.id, name: 'Moving chat', cwd: a.root });
+  await a.state.tick(); await b.state.tick(); await b.state.bind(project.sharedId, b.root);
+  await b.state.tick(); await a.state.tick();
+  const movedA = path.join(path.dirname(a.root), 'moved source'), movedB = path.join(path.dirname(b.root), 'moved destination');
+  fs.mkdirSync(movedA); fs.mkdirSync(movedB);
+  a.state.captureProject({ ...native, roots: [{ path: movedA }] });
+  await a.state.tick(); await b.state.tick();
+  assert.deepEqual(b.state.catalog('projectPath', JSON.stringify([project.sharedId, a.shared.state.device])), { roots: [movedA, a.root] });
+  assert.equal(b.state.binding(project.sharedId).root, b.root);
+  for (const root of [a.root, movedA]) assert.equal(mapProjectPath(path.join(root, 'src', 'a.ts'), b.state.fileMapping('moving-chat')), path.join(b.root, 'src', 'a.ts'));
+  await b.state.bind(project.sharedId, movedB); await b.state.tick(); await a.state.tick();
+  assert.deepEqual(a.state.catalog('projectPath', JSON.stringify([project.sharedId, b.shared.state.device])), { roots: [movedB, b.root] });
+  assert.equal(a.state.binding(project.sharedId).root, movedA); assert.equal(b.state.binding(project.sharedId).root, movedB);
+  for (const root of [a.root, movedA, b.root]) assert.equal(mapProjectPath(path.join(root, 'src', 'a.ts'), b.state.fileMapping('moving-chat')), path.join(movedB, 'src', 'a.ts'));
+  for (const root of [b.root, movedB]) assert.equal(mapProjectPath(path.join(root, 'src', 'a.ts'), a.state.fileMapping('moving-chat')), path.join(movedA, 'src', 'a.ts'));
+});
+
+test('the first tick migrates persisted local project bindings into device path rows without native project discovery', async t => {
+  const { a, b } = fixture(t);
+  const project = a.state.captureProject({ id: 'legacy-native-project', provider: 'codex', name: 'Legacy project', roots: [{ path: a.root }] });
+  a.state.sync.state.pending = a.state.sync.state.pending.filter(op => op.kind !== 'projectPath');
+  a.state.sync.save(); a.restart();
+  assert.equal(a.state.sync.state, undefined);
+  assert.equal(a.state.binding(project.sharedId).root, a.root);
+  assert.equal(a.state.sync.state.pending.some(op => op.kind === 'projectPath'), false);
+  await a.state.tick(); await b.state.tick();
+  assert.deepEqual(b.state.catalog('projectPath', JSON.stringify([project.sharedId, a.shared.state.device])), { roots: [a.root] });
+  assert.deepEqual(a.calls, []); assert.deepEqual(b.calls, []);
+  assert.equal(b.state.binding(project.sharedId), undefined);
+});
+
+test('peer-owned project path hints cannot change a chosen local binding or execute the advertised folder', async t => {
+  const { a, b } = fixture(t);
+  const project = a.state.captureProject({ id: 'hint-native-project', provider: 'codex', name: 'Hint project', roots: [{ path: a.root }] });
+  a.state.captureThread({ id: 'hint-chat', projectId: project.id, name: 'Hint chat' });
+  await a.state.tick(); await b.state.tick(); await b.state.bind(project.sharedId, b.root); await b.state.tick();
+  const saved = structuredClone(b.state.binding(project.sharedId)), calls = b.calls.length, advertised = '/foreign/computer/advertised-root';
+  a.state.sync.capture('projectPath', machine, JSON.stringify([project.sharedId, a.shared.state.device]), { roots: [advertised, a.root] });
+  await a.state.sync.tick(); await b.state.sync.tick();
+  assert.deepEqual(b.state.binding(project.sharedId), saved);
+  assert.equal(b.calls.length, calls);
+  const mapping = b.state.fileMapping('hint-chat');
+  assert.equal(mapping.root, b.root); assert.ok(mapping.roots.includes(advertised));
+  assert.equal(mapProjectPath(advertised + '/src/a.ts', mapping), path.join(b.root, 'src', 'a.ts'));
+});
+
+test('project path histories and file mappings stay isolated between sync destinations', async t => {
+  const { a, b } = fixture(t);
+  const native = { id: 'namespace-path-project', provider: 'codex', name: 'Namespace paths', roots: [{ path: a.root }] };
+  const project = a.state.captureProject(native);
+  a.state.captureThread({ id: 'namespace-path-chat', projectId: native.id, name: 'Namespace path chat' });
+  await a.state.tick(); await b.state.tick(); await b.state.bind(project.sharedId, b.root); await b.state.tick(); await a.state.tick();
+  const originalKey = a.shared.key, otherRoot = path.join(path.dirname(a.root), 'other namespace');
+  a.shared.key = 'fixture-server:/path-isolation';
+  assert.equal(a.state.fileMapping('namespace-path-chat'), null); assert.equal(a.state.binding(project.sharedId), undefined);
+  const other = a.state.captureProject({ ...native, roots: [{ path: otherRoot }] });
+  a.state.captureThread({ id: 'namespace-path-chat', projectId: native.id, name: 'Other namespace chat' });
+  await a.state.tick(); await b.state.tick();
+  assert.notEqual(other.sharedId, project.sharedId);
+  assert.deepEqual(a.state.fileMapping('namespace-path-chat'), { root: otherRoot, roots: [otherRoot] });
+  assert.equal(b.state.fileMapping('namespace-path-chat').roots.includes(otherRoot), false);
+  a.shared.key = originalKey; await a.state.tick();
+  const restored = a.state.fileMapping('namespace-path-chat');
+  assert.equal(restored.root, a.root); assert.ok(restored.roots.includes(b.root)); assert.equal(restored.roots.includes(otherRoot), false);
+});
+
+test('project path histories and file mappings stay isolated between local and SSH machine identities', async t => {
+  const { a, b } = fixture(t), localOptions = a.options;
+  const native = { id: 'machine-path-project', provider: 'codex', name: 'Machine paths', roots: [{ path: a.root }] };
+  const local = a.state.captureProject(native);
+  a.state.captureThread({ id: 'machine-path-chat', projectId: native.id, name: 'Local path chat' });
+  await a.state.tick(); await b.state.tick(); await b.state.bind(local.sharedId, b.root); await b.state.tick(); await a.state.tick();
+  const remoteMachine = 'access:other-host:22', remoteRoot = '/srv/ssh-only-project';
+  a.switchMachine(remoteMachine, { mode: 'ssh', host: 'other-host', port: 22 });
+  const remote = a.state.captureProject({ ...native, roots: [{ path: remoteRoot }] });
+  a.state.captureThread({ id: 'machine-path-chat', projectId: native.id, name: 'SSH path chat' });
+  await a.state.tick(); await b.state.tick();
+  assert.deepEqual(a.state.fileMapping('machine-path-chat'), { root: remoteRoot, roots: [remoteRoot] });
+  assert.equal(b.state.fileMapping('machine-path-chat').roots.includes(remoteRoot), false);
+  assert.deepEqual(b.state.catalog('projectPath', JSON.stringify([remote.sharedId, a.shared.state.device]), remoteMachine), { roots: [remoteRoot] });
+  a.switchMachine(machine, localOptions); await a.state.tick();
+  const mapping = a.state.fileMapping('machine-path-chat');
+  assert.equal(mapping.root, a.root); assert.ok(mapping.roots.includes(b.root)); assert.equal(mapping.roots.includes(remoteRoot), false);
 });
 
 test('real local pin, message-pin, unread, completion and shortcut stores receive synced metadata', async t => {

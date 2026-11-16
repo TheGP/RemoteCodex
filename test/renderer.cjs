@@ -546,6 +546,32 @@ async function checks() {
   state.pinnedIds.clear(); state.pinnedThreads.clear(); state.pinning.clear();
   resolvePin([recent.id]); await savingPin;
   check(!state.pinnedIds.size, 'A late pin response crossed machines');
+  {
+    const before = { rpc: api.rpc, threads: state.threads, failedPins: state.failedPins };
+    const known = { id: 'startup-known-pin', name: 'Known pinned title', cwd: '/tmp' };
+    const pending = { id: 'startup-pending-pin', name: 'Restored pinned title', cwd: '/tmp' };
+    state.pinnedIds = new Set([known.id, pending.id]); state.pinnedThreads.clear(); state.failedPins = new Set(); state.threads = [known];
+    let releaseLookup;
+    api.rpc = async (method, params) => method === 'thread/list' ? { data: [known], nextCursor: null } : new Promise(resolve => { releaseLookup = resolve; });
+    const tick = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
+    const title = id => $('threads').querySelector(`[data-thread-id="${id}"] strong`)?.textContent;
+    renderThreads();
+    check(title(known.id) === known.name && title(pending.id) === 'Loading conversation…' && !$('threads').textContent.includes('Unavailable conversation'), 'Startup pins falsely reported unavailable or replaced a known title before loading');
+    const loading = loadThreads(); await tick(); renderThreads();
+    check(releaseLookup && title(pending.id) === 'Loading conversation…' && title(known.id) === known.name, 'An in-flight pinned-title lookup showed an unavailable conversation');
+    releaseLookup({ thread: pending }); await loading;
+    check(title(pending.id) === pending.name, 'A completed pin lookup did not restore its title');
+    state.pinnedThreads.delete(pending.id);
+    api.rpc = async method => { if (method === 'thread/list') return { data: [known], nextCursor: null }; throw new Error('Temporary pin lookup failure'); };
+    await loadThreads();
+    check(title(pending.id) === 'Could not load conversation', 'A failed pin lookup stayed loading or claimed the conversation was unavailable');
+    api.rpc = async method => method === 'thread/list' ? { data: [known], nextCursor: null } : new Promise(resolve => { releaseLookup = resolve; });
+    const retry = loadThreads(); await tick(); renderThreads();
+    check(title(pending.id) === 'Loading conversation…', 'Retrying a pin lookup kept a stale failure label');
+    releaseLookup({ thread: pending }); await retry;
+    check(title(pending.id) === pending.name, 'A recovered pinned conversation kept its failure label');
+    api.rpc = before.rpc; state.threads = before.threads; state.failedPins = before.failedPins; state.pinnedIds.clear(); state.pinnedThreads.clear();
+  }
   results.push('pins load beyond pagination, stay unique, filter in search, and handle save failures and machine switches');
   resetThread();
   state.connected = true;
@@ -3018,6 +3044,30 @@ async function checks() {
   if (summaryOpenLink) api.openLink = summaryOpenLink; else delete api.openLink;
   results.push('changed-file summaries expand diffs inline on demand, support multiple files, preserve expansion and fresh code across edits, keep safe HTML and editor context, paginate, and clear on switching chats');
   {
+    const previousPaths = conversationSync.paths, previousMachine = conversationSync.pathsMachine, previousOpen = api.openLink;
+    const oldRoot = '/other computer/Old project', root = '/work/project', turn = 'mapped-diff-turn';
+    state.thread = { id: 'mapped-diff-chat', cwd: root, projectId: 'mapped-project' };
+    conversationSync.paths = { 'mapped-project': { root, roots: [oldRoot, root] } }; conversationSync.pathsMachine = accessKey();
+    const source = { id: 'mapped-edit', type: 'fileChange', status: 'completed', changes: [{ path: oldRoot + '/src/old.ts', kind: { type: 'update' }, diff: '@@ -2 +2 @@\n-old\n+new' }] };
+    const original = JSON.stringify(source);
+    renderItem(source, false, turn);
+    renderItem({ id: 'mapped-rename', type: 'fileChange', status: 'completed', changes: [{ path: root + '/src/old.ts', kind: { type: 'update', move_path: oldRoot + '/src/new.ts' }, diff: '@@ -3 +3 @@\n-old\n+new' }] }, false, turn);
+    const card = $('messages').querySelector('.changed-files'), entry = card.querySelector('.changed-file-entry');
+    check(card.querySelectorAll('.changed-file-entry').length === 1 && entry.dataset.path === root + '/src/new.ts' && entry.querySelector('.changed-file-name').textContent === 'src/new.ts', 'Peer and local changes did not merge into the mapped destination');
+    const links = []; api.openLink = async (href, context) => links.push({ href, context });
+    entry.querySelector('.open-changed-file').click(); await settle();
+    check(links[0].href === root + '/src/new.ts#L2' && links[0].context.threadId === state.thread.id, 'Mapped diff editor lost its local path, first changed line or source conversation');
+    check(JSON.stringify(source) === original && state.items.get(source.id).item.changes[0].path === oldRoot + '/src/old.ts', 'Mapping rewrote historical file-change records');
+    const message = document.createElement('div'); markdown(message, `[Open file](${encodeURI(oldRoot)}/src/old.ts#L77)`);
+    const link = message.querySelector('a');
+    check(link.getAttribute('href').includes('other%20computer') && linkContexts.get(link).threadId === state.thread.id, 'File link mapping changed original text or omitted thread identity');
+    conversationSync.pathsMachine = 'access:another-machine';
+    check(localFilePath(oldRoot + '/src/old.ts') === oldRoot + '/src/old.ts', 'Another machine reused stale project path mappings');
+    conversationSync.paths = previousPaths; conversationSync.pathsMachine = previousMachine; api.openLink = previousOpen; resetThread();
+    results.push('synced project paths map and merge file diffs locally, preserve original records and links, retain first-change editor navigation and isolate other machines');
+  }
+
+  {
     state.thread = { id: 'bulk-diff-chat', cwd: '/work/project' }; $('welcome').hidden = true;
     const bulkTurn = 'bulk-diff-turn';
     const patch = (id, path) => ({ id, type: 'fileChange', status: 'completed', changes: [{ path: '/work/project/' + path, kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-old\n+new' }] });
@@ -3357,6 +3407,92 @@ async function checks() {
   state.options = pinOptions; $('error').hidden = true; resetThread();
   results.push('message pins persist per conversation and machine in a compact fixed row, navigate older history on demand, stay anchored during streaming, preserve focus, and handle failed saves, missing messages, and navigation races');
   }
+  {
+    const before = { rpc: api.rpc, options: state.options, connected: state.connected, models: state.models, threads: state.threads, active: new Map(state.active), owned: new Set(state.owned), pins: preferences.messagePins, drafts: { ...drafts, pending: new Map(drafts.pending) }, agent: agents.current };
+    resetThread(); state.active.clear(); state.queues.clear(); state.connected = true;
+    const options = { mode: 'local', agents: [{ id: 'codex', name: 'Codex', connected: true, methods: ['thread/read', 'thread/turns/list', 'thread/items/read', 'thread/revert'] }] };
+    state.options = options; agents.current = 'codex';
+    const thread = { id: 'fast-pin-chat', name: 'Fast pinned history', cwd: '/tmp' }, other = { id: 'fast-pin-other-chat', name: 'Other fast-pin chat', cwd: '/tmp' };
+    const a = { id: 'fast-pin-a', type: 'agentMessage', text: 'Fetched answer A has the full original message.' }, b = { id: 'fast-pin-b', type: 'userMessage', content: [{ type: 'text', text: 'Fetched question B is separate old history.' }] };
+    const pin = (itemId, turnId) => ({ itemId, turnId, preview: itemId + ' preview only' });
+    const pins = [pin(a.id, 'fast-old-turn'), pin(b.id, 'fast-other-old-turn'), pin('fast-pin-missing', 'missing-turn'), pin('fast-pin-network', 'network-turn'), pin('fast-pin-stale', 'stale-turn'), pin('fast-pin-compat', 'compat-turn')];
+    preferences.messagePins = { [accessKey()]: { [thread.id]: pins } };
+    const calls = []; let releaseContext, releaseDirect;
+    api.rpc = async (method, params) => {
+      calls.push({ method, params: structuredClone(params) });
+      if (method === 'thread/read') return { thread: params.threadId === other.id ? other : thread };
+      if (method === 'thread/items/read') {
+        const id = params.itemIds[0];
+        if (id === 'fast-pin-missing') return { data: [] };
+        if (id === 'fast-pin-network') throw new Error('Pinned message network failure');
+        if (id === 'fast-pin-stale') return new Promise(resolve => { releaseDirect = resolve; });
+        if (id === 'fast-pin-compat') { const error = new Error('Method not found: thread/items/read'); error.code = -32601; throw error; }
+        return { data: [{ turnId: params.turnId, item: id === a.id ? a : b, startedAtMs: Date.UTC(2026, 10, 10, 12) }] };
+      }
+      if (method === 'thread/turns/list') {
+        if (params.threadId === other.id) return { data: [{ id: 'fast-other-latest-turn', items: [{ id: 'fast-other-latest', type: 'agentMessage', text: 'Other conversation output.' }] }], nextCursor: null };
+        if (params.cursor === 'fast-deep-one') return { data: [{ id: 'fast-middle-turn', items: [{ id: 'fast-middle', type: 'agentMessage', text: 'Middle history before the latest output.' }] }], nextCursor: 'fast-deep-two' };
+        if (params.cursor === 'fast-deep-two') return new Promise(resolve => { releaseContext = resolve; });
+        if (params.cursor === 'fast-compat-cursor') return { data: [{ id: 'compat-turn', items: [{ id: 'fast-pin-compat', type: 'agentMessage', text: 'Pinned compatibility history.' }] }], nextCursor: null };
+        return { data: [{ id: 'fast-latest-turn', status: 'inProgress', items: [{ id: 'fast-latest-one', type: 'agentMessage', text: 'Latest output one.' }, { id: 'fast-latest-two', type: 'agentMessage', text: 'Latest output two.' }] }], nextCursor: 'fast-deep-one' };
+      }
+      throw new Error('Pinned navigation must not execute ' + method);
+    };
+    state.threads = [thread, other]; await openThread(thread); state.active.set('fast-pin-background', 'background-turn'); state.owned.add(thread.id);
+    $('prompt').value = 'Keep this unsent pin-navigation draft';
+    const latestOne = state.items.get('fast-latest-one'), latestTwo = state.items.get('fast-latest-two');
+    const jump = async target => $('pinned-messages').querySelectorAll('.jump-pinned-message')[pins.indexOf(target)].onclick();
+    const stable = () => state.options === options && state.thread?.id === thread.id && state.active.get(thread.id) === 'fast-latest-turn' && state.active.get('fast-pin-background') === 'background-turn' && $('prompt').value === 'Keep this unsent pin-navigation draft' && state.items.get('fast-latest-one') === latestOne && state.items.get('fast-latest-two') === latestTwo;
+    const beforeDirect = calls.length;
+    await jump(pins[0]);
+    const fetchedA = state.items.get(a.id);
+    check(calls.length === beforeDirect + 1 && calls.at(-1).method === 'thread/items/read' && JSON.stringify(calls.at(-1).params) === JSON.stringify({ threadId: thread.id, turnId: pins[0].turnId, itemIds: [a.id] }) && state.turnCursor === 'fast-deep-one', 'An old pin paged through deep history instead of issuing one bounded direct item read');
+    check(fetchedA?.pinContext?.classList.contains('pin-context') && fetchedA.pinContext.isConnected && (fetchedA.pinContext.compareDocumentPosition($('messages')) & Node.DOCUMENT_POSITION_FOLLOWING) && fetchedA.body.textContent.includes(a.text) && !$('messages').contains(fetchedA.element) && stable(), 'A direct pin fetch omitted the actual message, inserted it into latest history, or disturbed the running chat/draft');
+    check(!fetchedA.pinContext.querySelector('.load-pin-context').disabled && !fetchedA.pinButton.disabled, 'A fetched answer disabled its pin action or failed to enable surrounding history with an older cursor');
+    state.turnCursor = null; await jump(pins[0]);
+    check(fetchedA.pinContext.querySelector('.load-pin-context').disabled && !fetchedA.pinButton.disabled, 'A missing history cursor disabled the fetched message pin instead of its footer load button');
+    state.turnCursor = 'fast-deep-one';
+    await jump(pins[0]); await jump(pins[1]); await jump(pins[0]);
+    check(calls.slice(beforeDirect).filter(call => call.method === 'thread/items/read').length === 2 && state.items.get(a.id) === fetchedA && fetchedA.element.isConnected && stable(), 'Repeated or cross-pin jumps refetched cached messages or lost the current conversation');
+    await jump(pins[1]); const fetchedB = state.items.get(b.id);
+    check(!fetchedB.pinContext.querySelector('.load-pin-context').disabled && !fetchedB.pinButton.disabled && fetchedB.label.querySelector('.edit-message').disabled, 'A fetched user message mixed up its disabled edit action, enabled pin action, or footer load control');
+    state.turnCursor = null; await jump(pins[1]);
+    check(fetchedB.pinContext.querySelector('.load-pin-context').disabled && !fetchedB.pinButton.disabled, 'A fetched user message disabled its pin action when surrounding history was exhausted');
+    state.turnCursor = 'fast-deep-one'; await jump(pins[0]);
+    for (const [target, errorText] of [[pins[2], 'no longer in the conversation'], [pins[3], 'Pinned message network failure']]) {
+      const count = calls.length; $('error').hidden = true; await jump(target);
+      check(!$('error').hidden && $('error-text').textContent.includes(errorText) && calls.length === count + 1 && calls.at(-1).method === 'thread/items/read' && !state.items.has(target.itemId) && stable(), 'A missing/network-failed direct pin silently failed, walked history, or changed the current draft');
+    }
+    $('error').hidden = true; await jump(pins[0]);
+    const surrounding = [...fetchedA.pinContext.querySelectorAll('button')].find(button => button.textContent === 'Load surrounding history');
+    check(Boolean(surrounding), 'A directly loaded pinned message omitted its explicit surrounding-history action');
+    const pinTop = fetchedA.element.getBoundingClientRect().top;
+    const beforeSurrounding = calls.length, loadingContext = surrounding.onclick(); await settle();
+    check(Boolean(releaseContext) && fetchedA.pinContext?.isConnected && fetchedA.element.isConnected && calls.slice(beforeSurrounding).every(call => call.method === 'thread/turns/list' && call.params.limit === 25) && stable(), 'Loading surrounding history hid the pinned preview too early, changed page size, or reset active work');
+    check(Math.abs(fetchedA.element.getBoundingClientRect().top - pinTop) <= 1 && fetchedA.element.getBoundingClientRect().bottom > $('timeline').getBoundingClientRect().top, 'Loading a surrounding-history page scrolled the pinned message offscreen');
+    releaseContext({ data: [{ id: pins[0].turnId, items: [{ id: 'fast-before-target', type: 'agentMessage', text: 'History immediately before the pin.' }, a, { id: 'fast-after-target', type: 'agentMessage', text: 'History immediately after the pin.' }] }], nextCursor: null });
+    await loadingContext;
+    check(Math.abs(fetchedA.element.getBoundingClientRect().top - pinTop) <= 1, 'Promoting the pinned message into normal history changed its visible position');
+    const ordered = [...$('messages').children].filter(element => element.classList.contains('message')).map(element => element.querySelector('.message-body').textContent.trim());
+    check(state.items.get(a.id) === fetchedA && !fetchedA.pinContext && $('messages').contains(fetchedA.element) && ordered.join('|') === ['History immediately before the pin.', a.text, 'History immediately after the pin.', 'Middle history before the latest output.', 'Latest output one.', 'Latest output two.'].join('|') && ordered.filter(text => text === a.text).length === 1 && stable(), 'Normal history failed to promote a cached pin exactly once at its chronological position');
+    await jump(pins[1]); check(state.items.get(b.id)?.pinContext?.isConnected, 'The other cached pin could not reopen its inline preview');
+    resetThread(); check(!$('timeline').querySelector('.pin-context') && !state.items.has(b.id), 'Resetting a conversation retained its pinned preview/cache');
+    await openThread(thread); await jump(pins[1]); await openThread(other);
+    check(!$('timeline').querySelector('.pin-context') && !state.items.has(b.id), 'Opening another conversation retained the prior pinned preview');
+    await openThread(thread);
+    const staleJump = jump(pins[4]); check(Boolean(releaseDirect), 'The stale pin fixture did not start a direct read');
+    await openThread(other); releaseDirect({ data: [{ turnId: pins[4].turnId, item: { id: pins[4].itemId, type: 'agentMessage', text: 'Stale pinned result must stay hidden.' } }] }); await staleJump;
+    check(state.thread?.id === other.id && !state.items.has(pins[4].itemId) && !$('timeline').querySelector('.pin-context'), 'A late direct pin response leaked into another conversation');
+    await openThread(thread); await jump(pins[1]);
+    state.options = { mode: 'ssh', host: 'another-pin-machine', port: 22 }; resetThread(); setThread({ id: 'fast-pin-machine-chat', cwd: '/srv' });
+    check(!$('timeline').querySelector('.pin-context') && !state.items.has(b.id), 'Changing machines left another machine’s pinned preview visible');
+    state.options = options; await openThread(thread); state.turnCursor = 'fast-compat-cursor';
+    const beforeCompatibility = calls.length; await jump(pins[5]);
+    check(calls[beforeCompatibility].method === 'thread/items/read' && calls[beforeCompatibility + 1]?.method === 'thread/turns/list' && calls[beforeCompatibility + 1].params.limit === 25 && state.items.get(pins[5].itemId)?.body.textContent.includes('Pinned compatibility history.'), 'An explicitly unsupported direct-read method did not fall back to bounded legacy history loading');
+    check(calls.every(call => ['thread/read', 'thread/turns/list', 'thread/items/read'].includes(call.method)), 'Pinned navigation issued a write or agent-restart operation');
+    resetThread(); api.rpc = before.rpc; state.options = before.options; state.connected = before.connected; state.models = before.models; state.threads = before.threads; state.active = before.active; state.owned = before.owned; preferences.messagePins = before.pins; Object.assign(drafts, before.drafts); agents.current = before.agent; $('error').hidden = true;
+  }
+  results.push('deep message pins use one direct read and cached inline previews, load surrounding history only on demand, promote without duplicates/order changes, preserve active drafts, and isolate missing/network/compatibility/stale responses');
   {
     const previousRpc = api.rpc, previousOptions = state.options;
     resetThread(); state.connected = true; state.options = { mode: 'local' }; state.active.clear(); state.queues.clear();
@@ -3847,6 +3983,104 @@ async function checks() {
     state.messageEdit = null; state.queueEdit = null; schedules.editing = null; $('conversation-sync-notice').hidden = true; $('error').hidden = true;
   }
   results.push('open message, queue and schedule editors refresh clean remote drafts without losing focus/caret, preserve concurrent typing, restore cleared fallbacks, and save or cancel against the last-read text/date baseline');
+  {
+    const methods = ['preferences', 'pins', 'conversationSync', 'requestConversation', 'draft', 'saveDraft', 'rpc', 'connect', 'disconnect'];
+    const previousApi = Object.fromEntries(methods.map(method => [method, api[method]]));
+    const before = { options: state.options, connected: state.connected, threads: state.threads, models: state.models, active: new Map(state.active), owned: new Set(state.owned), queues: new Map(state.queues), pinnedIds: new Set(state.pinnedIds), pinnedThreads: new Map(state.pinnedThreads), drafts: { ...drafts, pending: new Map(drafts.pending) }, sync: { ...conversationSync, ownership: new Map(conversationSync.ownership), requesting: conversationSync.requesting }, preferences: { conversationStates: preferences.conversationStates, messagePins: preferences.messagePins, shortcuts: preferences.shortcuts }, projects: projects.data, agent: agents.current };
+    resetThread(); state.active.clear(); state.owned.clear(); state.queues.clear(); state.pinnedIds.clear(); state.pinnedThreads.clear(); drafts.target = null; drafts.suspended = false;
+    const options = { mode: 'local', localCwd: '/local/ownership-project', agents: [{ id: 'codex', name: 'Codex', connected: true, methods: ['thread/read', 'thread/turns/list', 'thread/revert', 'turn/start', 'turn/interrupt'] }, { id: 'zcode', name: 'ZCode', connected: true, methods: ['turn/start'] }] };
+    const thread = { id: 'ownership-chat', name: 'Owned conversation', cwd: '/local/ownership-project' };
+    state.options = options; state.connected = true; state.threads = [thread]; state.models = []; projects.data = []; agents.current = 'codex';
+    const foreign = { id: thread.id, name: 'Other Mac', owned: false, requested: false, waiting: false, busy: true };
+    const sync = { historyEnabled: true, ownership: [foreign], error: null, conflicts: [], catalog: 'ownership-only' }; conversationSync.catalog = sync.catalog;
+    let connects = 0, disconnects = 0, refreshes = 0;
+    let holdHistory = false, releaseHistory, latestReply = 'Final peer reply after ownership handoff';
+    const requests = [], calls = [];
+    api.preferences = async () => ({ ...structuredClone(savedPreferences), conversationStates: { [accessKey()]: { unread: [], completions: {} } }, messagePins: {}, shortcuts: [{ id: 'ownership-fill', label: 'Add context', mode: 'fill', prompt: 'Added context' }] });
+    api.pins = async () => [];
+    api.conversationSync = async () => { refreshes++; return structuredClone(sync); };
+    api.draft = () => ({ ...composerSnapshot(), images: [] }); api.saveDraft = () => {};
+    api.rpc = async (method, params) => {
+      calls.push({ method, params: structuredClone(params) });
+      if (method === 'thread/read') return { thread };
+      if (method === 'thread/turns/list') {
+        const history = { data: [{ id: 'ownership-original-turn', status: 'completed', items: [{ id: 'ownership-question', type: 'userMessage', content: [{ type: 'text', text: 'Original request' }] }, { id: 'ownership-final-reply', type: 'agentMessage', text: latestReply }] }], nextCursor: null };
+        return holdHistory ? new Promise(resolve => { releaseHistory = () => resolve(history); }) : history;
+      }
+      if (method !== 'turn/interrupt') throw new Error('Ownership UI must not execute ' + method);
+      return {};
+    };
+    api.connect = async () => { connects++; throw new Error('Ownership must not reconnect agents'); };
+    api.disconnect = async () => { disconnects++; throw new Error('Ownership must not disconnect agents'); };
+    renderModels(); setThread(thread); state.owned.add(thread.id); state.active.set('ownership-other-chat', 'keep-running-other-turn');
+    let question = renderItem({ id: 'ownership-question', type: 'userMessage', content: [{ type: 'text', text: 'Original request' }] }, false, 'ownership-original-turn');
+    $('prompt').value = 'Keep this ownership draft'; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
+    const notify = async () => { handleNotification({ method: 'conversations/synced', params: {} }); await settle(); check(!conversationSync.refreshing, 'Ownership metadata did not settle'); };
+    const intact = () => state.options === options && state.thread === thread && state.active.get('ownership-other-chat') === 'keep-running-other-turn' && !connects && !disconnects;
+    await notify();
+    check(conversationReadOnly() && !$('conversation-ownership').hidden && $('conversation-owner').textContent.includes('Other Mac') && $('send').disabled && question.label.querySelector('.edit-message').disabled && !$('prompt').disabled && !$('prompt').readOnly && state.owned.has(thread.id), 'Foreign ownership failed to gate native-writable send/edit actions or prevented draft typing');
+    await runShortcut({ mode: 'fill', prompt: 'Added context' });
+    check($('prompt').value === 'Keep this ownership draft\nAdded context' && !shortcutUnavailable({ mode: 'fill' }) && intact(), 'A foreign-owner conversation could not keep typing or use fill shortcuts');
+    const draft = $('prompt').value;
+    await send({ preventDefault() {} });
+    check(calls.length === 0 && $('prompt').value === draft && !state.queues.get(queueKey(thread.id))?.messages.length && intact(), 'Enter bypassed ownership protection, submitted/queued a message, or lost its typed draft');
+    let releaseRequest;
+    api.requestConversation = id => { requests.push(id); return new Promise(resolve => { releaseRequest = resolve; }); };
+    const requesting = $('take-conversation').onclick(), repeated = $('take-conversation').onclick();
+    check(requests.join() === thread.id && $('take-conversation').disabled && $('prompt').value === draft && intact(), 'Repeated ownership clicks sent multiple requests or changed active work');
+    sync.ownership = [{ ...foreign, requested: true, waiting: true }]; releaseRequest(); await Promise.all([requesting, repeated]);
+    check($('take-conversation').disabled && $('take-conversation').textContent === 'Transfer requested' && $('conversation-owner').textContent.includes('Waiting for Other Mac') && $('send').disabled && $('prompt').value === draft && intact(), 'A transfer request did not remain visibly pending while preserving drafts and other active chats');
+    sync.ownership = [{ ...foreign, requested: true, waiting: true, busy: false }]; await notify();
+    check($('send').disabled && conversationReadOnly(), 'Native completion alone enabled sending before history upload and ownership handoff');
+    sync.ownership = [{ ...foreign, owned: true, requested: false, waiting: false, busy: false }]; holdHistory = true;
+    const handingOff = refreshConversationSync(); await settle();
+    check(Boolean(releaseHistory) && state.loading && $('send').disabled && $('prompt').value === draft && calls.filter(call => call.method === 'thread/read').length === 1 && calls.filter(call => call.method === 'thread/turns/list').length === 1 && state.active.get('ownership-other-chat') === 'keep-running-other-turn', 'Ownership handoff enabled sending before reopening final synced history, repeated the history read, or disturbed drafts/other active chats: ' + JSON.stringify({ started: Boolean(releaseHistory), loading: state.loading, disabled: $('send').disabled, draftKept: $('prompt').value === draft, calls: calls.map(call => call.method) }));
+    holdHistory = false; releaseHistory(); await handingOff; question = state.items.get('ownership-question');
+    check(!conversationReadOnly() && $('conversation-ownership').hidden && !$('send').disabled && !question.label.querySelector('.edit-message').disabled && $('prompt').value === draft && intact(), 'Completed ownership handoff failed to enable send/edit or changed the typed draft');
+    check(state.items.get('ownership-final-reply')?.body.textContent.includes('Final peer reply after ownership handoff'), 'Ownership handoff left the old read-only snapshot visible instead of the final peer reply');
+    await notify();
+    check(calls.filter(call => call.method === 'thread/read').length === 1 && calls.filter(call => call.method === 'thread/turns/list').length === 1, 'Unchanged owned metadata repeatedly reloaded conversation history');
+    const displayedReply = state.items.get('ownership-final-reply'), beforeManualReads = calls.length;
+    setTimelineFollowing(false, displayedReply.element);
+    latestReply = 'New completed peer reply received while reading'; sync.ownership = [{ ...foreign, busy: false, updatesAvailable: true }]; await notify();
+    check(!$('conversation-ownership').hidden && !$('load-synced-history').hidden && !$('load-synced-history').disabled && calls.length === beforeManualReads && state.items.get('ownership-final-reply') === displayedReply && !timelineView.following && timelineView.reading === displayedReply.element && $('prompt').value === draft && intact(), 'Incoming remote history silently reloaded a reader’s view instead of offering explicit loading');
+    await $('load-synced-history').onclick();
+    check(calls.length === beforeManualReads + 2 && calls.at(-2).method === 'thread/read' && calls.at(-1).method === 'thread/turns/list' && state.items.get('ownership-final-reply')?.body.textContent.includes(latestReply) && $('prompt').value === draft && conversationReadOnly() && $('send').disabled && intact(), 'Explicit history loading failed to refresh the viewed snapshot, made it writable, sent a message, or disrupted drafts/other work');
+    sync.ownership = [{ ...foreign, owned: true, requested: true, waiting: false, busy: true }]; state.active.set(thread.id, 'ownership-running-turn');
+    $('prompt').value = ''; $('prompt').dispatchEvent(new Event('input', { bubbles: true })); await notify();
+    check(conversationReadOnly() && !$('conversation-ownership').hidden && $('conversation-owner').textContent.includes('Transfer requested') && $('take-conversation').hidden && $('send').textContent === '■' && !$('send').disabled, 'An owned source with a requested transfer lost its Stop action or failed to explain the pending handoff');
+    await $('send').onclick({ preventDefault() {} });
+    const interrupt = calls.filter(call => call.method === 'turn/interrupt');
+    check(interrupt.length === 1 && interrupt[0].params.threadId === thread.id && calls.every(call => ['thread/read', 'thread/turns/list', 'turn/interrupt'].includes(call.method)) && state.active.get('ownership-other-chat') === 'keep-running-other-turn', 'Stopping a pending-transfer source sent a new message or interrupted another chat');
+    $('prompt').value = 'Do not send during handoff'; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
+    await send({ preventDefault() {} });
+    check($('send').disabled && calls.filter(call => call.method === 'turn/interrupt').length === 1 && calls.every(call => ['thread/read', 'thread/turns/list', 'turn/interrupt'].includes(call.method)) && !state.queues.get(queueKey(thread.id))?.messages.length && $('prompt').value === 'Do not send during handoff', 'Requested source ownership allowed a new send or app-owned queue entry');
+    state.active.delete(thread.id); sync.historyEnabled = false; sync.ownership = [foreign]; await notify();
+    check(!conversationReadOnly() && $('conversation-ownership').hidden && !$('send').disabled, 'Disabled history sharing kept stale ownership restrictions');
+    sync.historyEnabled = true; await notify();
+    state.options = { ...options, mode: 'ssh', host: 'remote-agent', port: 22 }; updateBusy();
+    check(!conversationReadOnly() && $('conversation-ownership').hidden && !$('send').disabled, 'Local history ownership incorrectly disabled an SSH conversation');
+    state.options = options;
+    const zcode = { id: 'agent:zcode:thread:ownership-chat', provider: 'zcode', name: 'ZCode ownership is native', cwd: '/local/ownership-project' };
+    conversationSync.ownership.set(zcode.id, { ...foreign, id: zcode.id }); setThread(zcode); updateBusy();
+    check(!conversationReadOnly() && $('conversation-ownership').hidden && !$('send').disabled, 'Codex conversation ownership incorrectly gated a ZCode conversation');
+    setThread(thread); $('prompt').value = 'Retain the request-error draft'; $('prompt').dispatchEvent(new Event('input', { bubbles: true })); sync.ownership = [foreign]; await notify(); $('error').hidden = true;
+    api.requestConversation = async id => { requests.push(id); throw new Error('Transfer request failed'); };
+    await $('take-conversation').onclick();
+    check(!$('error').hidden && $('error-text').textContent.includes('Transfer request failed') && !$('take-conversation').disabled && $('prompt').value === 'Retain the request-error draft' && intact(), 'An ownership request error vanished, locked the button, or changed the draft/other active work');
+    let finishStale;
+    api.requestConversation = id => { requests.push(id); return new Promise(resolve => { finishStale = resolve; }); };
+    $('error').hidden = true; const stale = $('take-conversation').onclick(), beforeStaleRefresh = refreshes;
+    state.options = { ...options, mode: 'ssh', host: 'new-machine', port: 22 }; conversationSync.historyEnabled = false; conversationSync.ownership.clear();
+    setThread({ id: 'ownership-new-machine-chat', name: 'New machine chat', cwd: '/srv' }); $('prompt').value = 'New machine draft';
+    finishStale(); await stale;
+    check(refreshes === beforeStaleRefresh && !conversationSync.ownership.size && $('conversation-ownership').hidden && $('prompt').value === 'New machine draft' && $('error').hidden && state.active.get('ownership-other-chat') === 'keep-running-other-turn' && !connects && !disconnects, 'A stale ownership reply refreshed old metadata or changed the new machine conversation');
+    resetThread();
+    for (const method of methods) { if (previousApi[method] === undefined) delete api[method]; else api[method] = previousApi[method]; }
+    state.options = before.options; state.connected = before.connected; state.threads = before.threads; state.models = before.models; state.active = before.active; state.owned = before.owned; state.queues = before.queues; state.pinnedIds = before.pinnedIds; state.pinnedThreads = before.pinnedThreads;
+    Object.assign(drafts, before.drafts); Object.assign(conversationSync, before.sync); Object.assign(preferences, before.preferences); projects.data = before.projects; agents.current = before.agent; $('conversation-ownership').hidden = true; $('error').hidden = true;
+  }
+  results.push('conversation ownership preserves drafts, gates foreign sends, reloads final handoff history once, offers later peer updates on demand, retains source Stop, and isolates disabled sharing/SSH/ZCode/errors/stale replies');
   api.rpc = originalRpc; state.threads = [branchSource]; await openThread(branchSource); connectionLabels(); status(connectedStatus());
   projects.data = [{ id: branchSource.projectId, name: 'Rapidcode', roots: [{ path: branchSource.cwd }] }];
   await expandProject(projects.data[0], false);
@@ -3918,6 +4152,25 @@ module.exports = async () => {
       globalThis.previewProviders = () => {
         state.options.agents = [{ id: 'codex', name: 'Codex', enabled: true, available: true, connected: true }, { id: 'zcode', name: 'ZCode', available: false, defaultEnabled: false, enabled: false, connected: false }];
         fillSettings(state.options);
+      };
+      globalThis.previewFastPin = async () => {
+        resetThread(); state.options = { mode: 'local', agents: [{ id: 'codex', name: 'Codex', connected: true, methods: ['thread/items/read'] }] }; state.connected = true; state.active.clear(); state.requests.clear(); schedules.tasks = [];
+        const thread = { id: 'preview-fast-pin-chat', name: 'Fast pinned navigation', cwd: '/tmp/project' };
+        setThread(thread); state.threads = [thread]; $('welcome').hidden = true; renderModels();
+        renderItem({ id: 'preview-fast-latest-user', type: 'userMessage', content: [{ type: 'text', text: 'Keep working while I look back at the pinned answer.' }] }, false, 'preview-fast-live-turn');
+        renderItem({ id: 'preview-fast-latest-reply', type: 'agentMessage', text: 'The latest conversation stays here. The older pinned message opens above it.' }, false, 'preview-fast-live-turn');
+        const pin = { itemId: 'preview-fast-old-reply', turnId: 'preview-fast-old-turn', preview: 'Codex: Earlier pinned answer' };
+        preferences.messagePins = { 'access:local': { [thread.id]: [pin] } };
+        state.turnCursor = 'preview-fast-earlier-page'; state.active.set(thread.id, 'preview-fast-live-turn'); state.owned.add(thread.id);
+        $('prompt').value = 'My unsent draft stays here'; renderThreads(); renderMessagePins(); renderRequests(); renderSchedules(); updateBusy();
+        api.rpc = async () => ({ data: [{ turnId: pin.turnId, startedAtMs: Date.UTC(2026, 10, 2, 9, 30), item: { id: pin.itemId, type: 'agentMessage', text: ['This older pinned answer was fetched directly, without loading every conversation turn.', 'Your running task, latest replies and unsent draft stay available below.'].join(String.fromCharCode(10, 10)) } }] });
+        status(connectedStatus()); await jumpToMessagePin(pin);
+      };
+      globalThis.previewOwnership = () => {
+        const id = state.thread.id;
+        conversationSync.historyEnabled = true;
+        conversationSync.ownership = new Map([[id, { id, name: 'Other Mac', owned: false, requested: false, waiting: false, busy: true, updatesAvailable: true }]]);
+        state.active.delete(id); state.owned.delete(id); updateBusy();
       };
       globalThis.previewSync = async () => {
         api.scheduleSharing = async () => ({ enabled: true, host: 'root@warmer', port: 22, key: '', folder: '~/.local/share/remote-codex/schedule-sync', connected: true });
@@ -4004,6 +4257,14 @@ module.exports = async () => {
     await testWindow.webContents.executeJavaScript("document.getElementById('settings-dialog').close(); previewQuestion()");
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'waiting-question.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript('previewFastPin()');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (!await testWindow.webContents.executeJavaScript("document.querySelector('.pin-context')?.checkVisibility() && !document.querySelector('.load-pin-context').disabled && !document.querySelector('.pin-context .message-pin').disabled")) throw new Error('Fast-pin screenshot omitted the inline message or its enabled controls');
+    fs.writeFileSync(path.join(__dirname, '..', 'artifacts', 'fast-pinned-message.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript('previewOwnership()');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (!await testWindow.webContents.executeJavaScript("document.getElementById('conversation-ownership').checkVisibility() && document.getElementById('take-conversation').checkVisibility() && document.getElementById('load-synced-history').checkVisibility() && document.getElementById('send').disabled && document.getElementById('prompt').value === 'My unsent draft stays here'")) throw new Error('Ownership screenshot omitted its read-only panel/actions or changed the draft');
+    fs.writeFileSync(path.join(__dirname, '..', 'artifacts', 'conversation-ownership.png'), (await testWindow.webContents.capturePage()).toPNG());
     return results;
   } finally { testWindow.destroy(); }
 };

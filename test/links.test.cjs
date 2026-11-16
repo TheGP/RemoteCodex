@@ -143,3 +143,44 @@ test('native GitFerry links preserve encoded names, columns, defaults, and repea
   await openFileLink('/remote/文%20%23literal%2520%2B%26.ts:2:3', { ...options, settings: { mode: 'ssh', host: 'my-alias', port: 22 }, sshHost: async settings => settings.host, openExternal: async value => remote.push(new URL(value)) });
   assert.equal(remote[0].searchParams.get('file'), 'ssh://my-alias/remote/文 #literal%20+&.ts');
 });
+
+test('mapped foreign file links retain positions and literal names for local editors and reveal', async t => {
+  const { mapProjectPath } = require('../path-mapping.js');
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-mapped-links-'));
+  t.after(() => fs.rmSync(folder, { recursive: true, force: true }));
+  const root = path.join(folder, 'Local 文 +% project'), name = 'name %20 #+&.ts';
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  const file = path.join(root, 'src', name); fs.writeFileSync(file, 'first\nsecond');
+  const source = '/foreign/My 文 +% project', foreign = source + '/src/' + name;
+  const value = foreign.split('/').map(encodeURIComponent).join('/') + '#L17C9';
+  const opened = [], revealed = [], mapped = [];
+  const options = { cwd: root, settings: { mode: 'local' }, application: () => 'Stub editor', openExternal: async url => opened.push(url), reveal: file => revealed.push(file), mapPath: file => { mapped.push(file); return mapProjectPath(file, { root, roots: [source] }); } };
+  await openFileLink(value, options);
+  assert.equal(opened[0], 'vscode://file' + file.split('/').map(encodeURIComponent).join('/') + ':17:9');
+  await openFileLink(value, { ...options, opener: 'gitferry' });
+  assert.deepEqual(Object.fromEntries(new URL(opened[1]).searchParams), { file, line: '17', column: '9' });
+  await openFileLink(value, { ...options, opener: 'reveal' });
+  assert.deepEqual(revealed, [file]); assert.deepEqual(mapped, [foreign, foreign, foreign]);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'first\nsecond');
+});
+
+test('Windows peer file URLs map before local file checks and diff line clamping', async t => {
+  const { mapProjectPath } = require('../path-mapping.js');
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-mapped-windows-links-'));
+  t.after(() => fs.rmSync(folder, { recursive: true, force: true }));
+  const file = path.join(folder, '文 #+%.ts'); fs.writeFileSync(file, 'first\r\nsecond');
+  const opened = [], mapped = [];
+  const value = 'file:///C:/Peer%20Project/' + encodeURIComponent(path.basename(file)) + '#L90C7';
+  await openFileLink(value, { cwd: folder, settings: { mode: 'local' }, opener: 'gitferry', clampLine: true, application: () => 'Stub editor', openExternal: async url => opened.push(new URL(url)), mapPath: file => { mapped.push(file); return mapProjectPath(file, { root: folder, roots: ['c:\\peer project'] }); } });
+  assert.deepEqual(mapped, ['C:\\Peer Project\\文 #+%.ts']);
+  assert.deepEqual(Object.fromEntries(opened[0].searchParams), { file, line: '2', column: '1' });
+});
+
+test('file mapping cannot bypass link validation or open an editor after mapping fails', async () => {
+  let mappings = 0, opened = 0;
+  const options = { cwd: '/local/project', settings: { mode: 'local' }, application: () => 'Stub editor', openExternal: async () => { opened++; }, mapPath: () => { mappings++; throw new Error('Mapping unavailable'); } };
+  for (const value of ['javascript:alert(1)', 'file://remote-host/path.ts', '/peer/file.ts%00']) await assert.rejects(openFileLink(value, options));
+  assert.equal(mappings, 0); assert.equal(opened, 0);
+  await assert.rejects(openFileLink('/peer/file.ts:8:2', options), /Mapping unavailable/);
+  assert.equal(mappings, 1); assert.equal(opened, 0);
+});

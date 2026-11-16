@@ -51,7 +51,7 @@ class ScheduleBridge {
     this.connecting = opening; return opening;
   }
   async open(options, generation) {
-    // Only these app-owned helpers are installed; credentials and histories stay on the client.
+    // Install only app-owned helpers; credentials stay on the client.
     const files = Object.fromEntries(['shared-schedules-host.cjs', 'scheduler.cjs', 'queues.cjs', 'sync-state.cjs'].map(name => [name, fs.readFileSync(path.join(__dirname, name), 'utf8')]));
     const install = `const fs=require("node:fs"),path=require("node:path"),os=require("node:os");process.umask(63);let input="";process.stdin.on("data",c=>input+=c);process.stdin.on("end",()=>{const files=JSON.parse(input),dir=path.join(os.homedir(),".local/share/remote-codex/schedule-sync/state-v1");fs.mkdirSync(dir,{recursive:true,mode:448});for(const name of ["shared-schedules-host.cjs","scheduler.cjs","queues.cjs","sync-state.cjs"]){if(typeof files[name]!=="string")throw Error("Missing schedule helper");const file=path.join(dir,name);if(fs.existsSync(file)&&fs.readFileSync(file,"utf8")===files[name])continue;const temp=file+"."+process.pid+".tmp";fs.writeFileSync(temp,files[name],{mode:384});fs.renameSync(temp,file);}});`;
     const child = this.spawn(options, "node -e '" + install + "'");
@@ -303,7 +303,7 @@ class SharedSchedules {
         if (!current()) break;
         if (this.blocked(task.threadId) || (this.retry.get(task.id) || 0) > Date.now()) continue;
         this.dispatching.add(task.threadId);
-        let claim, begun = false;
+        let claim, begun = false, historyReservation;
         try {
           const local = this.resolveTask ? await this.resolveTask(task) : task;
           if (!local) continue;
@@ -316,15 +316,19 @@ class SharedSchedules {
           if (this.resolveTask) { claim.task = await this.resolveTask(claim.task); if (!claim.task) continue; }
           const resumed = await this.connection.call('thread/resume', { threadId: task.threadId, excludeTurns: true, ...(claim.task.sourceCwd ? { cwd: claim.task.cwd } : {}) });
           if (!current() || !this.matches(claim.task, resumed.thread) || resumed.thread.status?.type === 'active' || this.blocked(task.threadId)) continue;
+          if (this.beforeSend) historyReservation = await this.beforeSend(task.threadId);
           await this.bridge.call('begin', { id: task.id, token: claim.token }); begun = true;
           let receipt;
           try {
             if (!current()) throw new Error('Agent connection changed before delivery.');
             const message = claim.task.message;
             const result = await this.connection.call('turn/start', message ? { ...message.turnSettings, threadId: task.threadId, input: message.input } : { threadId: task.threadId, input: [{ type: 'text', text: claim.task.prompt }] });
+            if (historyReservation) await this.afterSend?.(task.threadId, historyReservation, result).catch(error => this.failed(error));
             if (!result.turn?.id) throw new Error('Agent did not confirm a turn identity.');
             receipt = { id: task.id, token: claim.token, threadId: task.threadId, cwd: claim.task.cwd, machine, turnId: result.turn.id, status: 'sent', server: this.key, completed: ['completed', 'failed', 'interrupted'].includes(result.turn.status) || this.finished.has(JSON.stringify([machine, task.threadId, result.turn.id])) };
           } catch (error) {
+            if (historyReservation) this.uncertainSend?.(task.threadId, historyReservation);
+            if (historyReservation && current() && !/timeout|timed out|connection|closed|disconnect/i.test(error.message)) this.cancelSend?.(task.threadId, historyReservation).catch(failure => this.failed(failure));
             receipt = { id: task.id, token: claim.token, threadId: task.threadId, machine, status: 'unconfirmed', server: this.key };
             this.log('schedule.delivery.unconfirmed', { threadId: task.threadId, error: error.message });
           }
@@ -335,6 +339,7 @@ class SharedSchedules {
           this.retry.set(task.id, Date.now() + 60000); this.log('schedule.delivery.deferred', { threadId: task.threadId, error: error.message });
         } finally {
           if (claim && !begun) {
+            if (historyReservation) await this.cancelSend?.(task.threadId, historyReservation).catch(error => this.failed(error));
             await this.bridge.call('release', { id: task.id, token: claim.token }).catch(error => this.failed(error));
             this.locks.delete(claim.token);
           }

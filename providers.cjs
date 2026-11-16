@@ -2,10 +2,10 @@ const { EventEmitter } = require('node:events');
 const { CodexConnection, connectionOptions: codexOptions } = require('./transport.cjs');
 const { ZCodeConnection, connectionOptions: zcodeOptions, zcodeMethods } = require('./zcode.cjs');
 
-const rendererMethods = Object.freeze(['thread/list', 'thread/read', 'thread/resume', 'thread/start', 'thread/fork', 'thread/revert', 'thread/archive', 'thread/turns/list', 'thread/items/list', 'thread/name/set', 'thread/settings/update', 'thread/metadata/update', 'project/list', 'project/create', 'project/update', 'project/move', 'turn/start', 'turn/steer', 'turn/interrupt', 'model/list', 'account/read', 'account/rateLimits/read', 'fs/readDirectory', 'skills/list', 'collaborationMode/list', 'thread/compact/start', 'review/start', 'mcpServerStatus/list', 'queue/delete', 'queue/resume']);
+const rendererMethods = Object.freeze(['thread/list', 'thread/read', 'thread/resume', 'thread/start', 'thread/fork', 'thread/revert', 'thread/archive', 'thread/turns/list', 'thread/items/list', 'thread/items/read', 'thread/name/set', 'thread/settings/update', 'thread/metadata/update', 'project/list', 'project/create', 'project/update', 'project/move', 'turn/start', 'turn/steer', 'turn/interrupt', 'model/list', 'account/read', 'account/rateLimits/read', 'fs/readDirectory', 'skills/list', 'collaborationMode/list', 'thread/compact/start', 'review/start', 'mcpServerStatus/list', 'queue/delete', 'queue/resume']);
 const providers = Object.freeze({
   codex: {
-    id: 'codex', name: 'Codex', methods: [...rendererMethods.filter(method => !method.startsWith('queue/')), 'fs/readFile'],
+    id: 'codex', name: 'Codex', methods: [...rendererMethods.filter(method => !method.startsWith('queue/')), 'fs/readFile', 'thread/unsubscribe', 'experimentalFeature/list', 'thread/goal/get'],
     options(value) {
       const { codexPath, ...options } = codexOptions({ ...value, codexPath: value.executablePath ?? value.codexPath });
       return { ...options, executablePath: codexPath };

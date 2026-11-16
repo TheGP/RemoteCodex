@@ -10,6 +10,7 @@ const { QueueStore } = require('./queues.cjs');
 const { PreferencesStore } = require('./preferences.cjs');
 const { readImage } = require('./images.cjs');
 const { openWebLink, openFileLink, parseFileLink } = require('./links.cjs');
+const { mapProjectPath } = require('./path-mapping.js');
 const { generateTitle, titleKey, readThreadForTitle } = require('./titles.cjs');
 const { ScheduleStore, Scheduler } = require('./scheduler.cjs');
 const { SharedSchedules } = require('./shared-schedules.cjs');
@@ -117,7 +118,13 @@ app.whenReady().then(async () => {
     machine: scheduleMachine, options: () => settings, connection, changed: conversationsChanged,
     log: (event, details) => diagnostic.write(event, details)
   });
+  conversations.historyBlocked = id => editLocks.has(id) || scheduler.dispatching.has(id);
+  conversations.history.background = true;
   shared.resolveTask = task => conversations.scheduledTask(task);
+  shared.beforeSend = id => conversations.history.begin(id);
+  shared.afterSend = (id, reservation, result) => conversations.history.started(id, reservation, result);
+  shared.uncertainSend = (id, reservation) => conversations.history.uncertain(id, reservation);
+  shared.cancelSend = (id, reservation) => conversations.history.end(id, reservation);
   registerDraftIpc(ipcMain, drafts, checkSender, error => diagnostic.write('draft.failed', { error: error.message }), (target, stale) => conversations.captureDraft(target, false, stale));
   const releaseEditors = provider => {
     for (const [threadId, token] of editLocks) if (!provider || agentTarget(threadId, 'thread').provider === provider) {
@@ -132,13 +139,28 @@ app.whenReady().then(async () => {
   const recoverAgents = () => { if (connection.ready) connection.recover().catch(error => diagnostic.write('provider.recovery.failed', { error: error.message })); };
   const scheduleTimer = setInterval(() => { tickSchedules(); recoverAgents(); }, 15000); scheduleTimer.unref();
   powerMonitor.on('resume', () => { shared.receiptChecks.clear(); tickSchedules(); });
-  app.on('before-quit', () => { clearInterval(scheduleTimer); conversations.sync.close(); shared.close(); });
+  app.on('before-quit', () => { clearInterval(scheduleTimer); conversations.history.close(); conversations.sync.close(); shared.close(); });
   ipcMain.handle('conversation-sync', event => { checkSender(event); return conversations.status(); });
+  ipcMain.handle('request-conversation', async (event, id) => {
+    checkSender(event);
+    if (typeof id !== 'string' || !id || id.length > 200 || !conversations.history.enabled) throw new Error('Select a local Codex conversation first.');
+    if (conversations.history.importing.has(id)) throw new Error('Wait for this conversation’s history to finish loading before taking ownership.');
+    const session = connection.session, machine = scheduleMachine(), namespace = shared.key;
+    const current = () => { if (session !== connection.session || machine !== scheduleMachine() || namespace !== shared.key) throw new Error('Conversation connection changed.'); };
+    if (!conversations.catalog('thread', id)?.project && !conversations.history.record(id)?.workspace) {
+      const selected = await dialog.showOpenDialog(window, { title: 'Choose this conversation’s folder on this computer', properties: ['openDirectory'], defaultPath: settings.localCwd });
+      current(); if (selected.canceled) return conversations.status();
+      const root = fs.realpathSync(selected.filePaths[0]);
+      if (!fs.statSync(root).isDirectory()) throw new Error('Choose an existing folder.');
+      conversations.sync.state.localHistory[id] = { ...conversations.history.record(id), workspace: root }; conversations.sync.save();
+    }
+    current(); await conversations.history.request(id); setImmediate(tickSchedules); return conversations.status();
+  });
   ipcMain.handle('resolve-sync-conflict', async (event, key, choice, version) => { checkSender(event); await conversations.sync.resolve(key, choice, version); return conversations.status(); });
   ipcMain.handle('map-sync-project', (event, id, root) => {
     checkSender(event);
     const binding = conversations.binding(id);
-    if (binding && binding.root !== root && (shared.running || editLocks.size || [...agents.values()].some(agent => agent.wakeLock.id !== null))) throw new Error('Finish running tasks and close message editors before changing an existing project folder.');
+    if (conversations.history.importing.size || binding && binding.root !== root && (shared.running || editLocks.size || [...agents.values()].some(agent => agent.wakeLock.id !== null))) throw new Error('Finish loading history, running tasks and message edits before changing the project folder.');
     return conversations.bind(id, root);
   });
   ipcMain.handle('schedule-sharing', event => { checkSender(event); return shared.settings(); });
@@ -146,7 +168,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('save-schedule-sharing', async (event, value) => {
     checkSender(event);
     if (scheduler.running || editLocks.size) throw new Error('Close message editors and wait for scheduled delivery before changing sharing.');
-    if (conversations.sync.running || serverKey(sharingOptions(value)) !== shared.key && conversations.sync.pending()) throw new Error('Finish syncing conversation changes before changing the sync destination.');
+    if (conversations.sync.running || conversations.history.running || conversations.history.importing.size || serverKey(sharingOptions(value)) !== shared.key && conversations.sync.pending()) throw new Error('Finish syncing conversation changes before changing the sync destination.');
     const result = await shared.configure(value); setImmediate(tickSchedules); return result;
   });
   ipcMain.handle('sync-schedules', async event => { checkSender(event); await Promise.all([shared.tick(), conversations.tick()]); return shared.settings(); });
@@ -239,7 +261,8 @@ app.whenReady().then(async () => {
     let target = href.trim();
     if (!/^https?:/i.test(target)) {
       const { file, line, column } = parseFileLink(target, context?.cwd);
-      target = file + (line ? `:${line}${column ? ':' + column : ''}` : '');
+      if (context?.machine !== scheduleMachine()) throw new Error('The conversation’s machine changed. Open the file link again.');
+      target = mapProjectPath(file, conversations.fileMapping(context?.threadId)) + (line ? `:${line}${column ? ':' + column : ''}` : '');
     }
     Menu.buildFromTemplate([{ label: 'Copy link', click: () => clipboard.writeText(target) }]).popup({ window });
   });
@@ -247,12 +270,13 @@ app.whenReady().then(async () => {
   ipcMain.handle('open-link', (event, href, context) => {
     checkSender(event);
     if (typeof href === 'string' && /^https?:/i.test(href.trim())) return openWebLink(href, url => shell.openExternal(url));
-    const options = settings; const session = connection.session;
-    const current = () => { if (settings !== options || connection.session !== session || context?.machine !== scheduleMachine()) throw new Error('The conversation’s machine changed. Open the file link again.'); };
+    const options = settings; const session = connection.session, namespace = shared.key;
+    const mapping = conversations.fileMapping(context?.threadId);
+    const current = () => { if (settings !== options || connection.session !== session || context?.machine !== scheduleMachine() || shared.key !== namespace || conversations.fileMapping(context?.threadId)?.root !== mapping?.root) throw new Error('The conversation’s machine changed. Open the file link again.'); };
     current();
     const opener = preferences.read().fileOpener || 'vscode';
     const opening = fileOpens.then(() => openFileLink(href, {
-      cwd: context?.cwd, settings: options, opener, current, clampLine: context?.clampLine === true,
+      cwd: context?.cwd, settings: options, opener, mapPath: file => mapProjectPath(file, mapping), current, clampLine: context?.clampLine === true,
       readFile: async file => {
         current();
         const result = await connection.connectionFor(connection.providerFor({}, context)).call('fs/readFile', { path: file });
@@ -286,6 +310,7 @@ app.whenReady().then(async () => {
       if (changes.providers.some(provider => agents.has(provider) && agents.get(provider).wakeLock.id !== null)) throw new Error('Finish or stop this agent’s running tasks before changing its settings.');
       if (JSON.stringify(next) !== JSON.stringify(settings)) saveSettings(next);
       const result = changes.providers.length ? await connection.reconfigure(next) : await connection.recover();
+      conversations.history.restore();
       setImmediate(tickSchedules);
       return { ...result, connected: connection.ready, options: publicSettings() };
     }
@@ -294,6 +319,7 @@ app.whenReady().then(async () => {
     try {
       const result = await connection.connect(next);
       saveSettings(next);
+      conversations.history.restore();
       setImmediate(tickSchedules);
       return { ...result, options: publicSettings() };
     } catch (error) {
@@ -307,13 +333,23 @@ app.whenReady().then(async () => {
     if (!methods.has(method)) throw new Error('Unsupported agent operation.');
     if (!connection.ready) throw new Error('Connect to a coding agent first.');
     const rpcMachine = scheduleMachine(), rpcSession = connection.session, rpcSyncKey = shared.key;
+    if (shared.enabled && params?.threadId) {
+      if (['thread/read', 'thread/turns/list', 'thread/items/read', 'thread/items/list', 'thread/fork'].includes(method)) await conversations.history.read(params.threadId);
+      if (['thread/resume', 'turn/steer', 'turn/interrupt', 'thread/revert', 'thread/archive', 'thread/name/set', 'thread/settings/update', 'thread/metadata/update'].includes(method)) await conversations.history.verify(params.threadId, method === 'turn/interrupt');
+      if (connection.session !== rpcSession || scheduleMachine() !== rpcMachine || shared.key !== rpcSyncKey) throw new Error('Conversation connection changed. Try again.');
+    }
     if (shared.enabled && method === 'thread/list' && params?.projectId?.includes('sync-project:')) return { data: conversations.threads([], params.projectId, params.searchTerm), nextCursor: null };
     if (shared.enabled && ['thread/resume', 'turn/start', 'turn/steer', 'thread/revert', 'review/start'].includes(method) && params?.threadId) {
       const binding = conversations.threadBinding(params.threadId);
       if (binding && ['thread/resume', 'turn/start'].includes(method)) {
         params = { ...params, cwd: binding.root };
+        if (binding.provider === 'codex' && method === 'thread/resume') params.runtimeWorkspaceRoots = [binding.root];
         if (params.sandboxPolicy?.type === 'workspaceWrite') params.sandboxPolicy = { ...params.sandboxPolicy, writableRoots: [binding.root] };
       }
+    }
+    if (method === 'thread/resume' && settings.mode === 'local') {
+      const local = conversations.history.record(params.threadId);
+      if (typeof local?.goalsEnabled === 'boolean') params = { ...params, config: { ...params.config, 'features.goals': local.goalsEnabled } };
     }
     if (scheduler.dispatching.has(params?.threadId) && ['turn/start', 'thread/resume', 'thread/archive', 'thread/revert'].includes(method)) {
       diagnostic.write('rpc.scheduler.busy', { method, threadId: params.threadId });
@@ -350,18 +386,24 @@ app.whenReady().then(async () => {
     if (method === 'thread/name/set') manualNames.add(JSON.stringify([settings.provider, settings.mode, settings.host, settings.port, params.threadId]));
     if (shared.enabled && method === 'project/list' && !params?.cursor) conversations.nativeProjects.clear();
     let result;
+    const reservation = params?.threadId && ['turn/start', 'review/start', 'thread/compact/start'].includes(method) ? await conversations.history.begin(params.threadId) : null;
     try { result = await connection.call(method, params, undefined, context); }
     catch (error) {
-      if (shared.enabled && params?.threadId && conversations.catalog('thread', params.threadId) && /not found|does not exist|no such|unknown thread/i.test(error.message)) throw new Error('This conversation’s history is on another computer. Connect to its shared coding-agent server to continue it; syncing status does not copy native history.');
+      if (reservation) {
+        conversations.history.uncertain(params.threadId, reservation);
+        if (connection.ready && !/timeout|timed out|connection|closed|disconnect/i.test(error.message)) await conversations.history.end(params.threadId, reservation).catch(failure => conversations.sync.failed(failure));
+      }
+      if (shared.enabled && params?.threadId && conversations.catalog('thread', params.threadId) && /not found|does not exist|no such|unknown thread/i.test(error.message)) throw new Error(conversations.history.enabled ? 'This conversation’s history has not finished syncing. Keep its owning computer open and try again.' : 'This coding agent’s history is on another computer. Connect to its shared server to continue it.');
       throw error;
     }
+    if (reservation) await conversations.history.started(params.threadId, reservation, result).catch(error => conversations.sync.failed(error));
     if (shared.enabled && shared.key === rpcSyncKey && scheduleMachine() === rpcMachine && connection.session === rpcSession) {
       try {
         if (method === 'project/list') result.data = result.nextCursor ? result.data.map(project => conversations.captureProject(project)) : conversations.projects(result.data);
         if (result.project) result.project = conversations.captureProject(result.project, true);
         if (method === 'thread/list') result.data = conversations.threads(result.data, params?.projectId, params?.searchTerm);
         if (result.thread) {
-          conversations.captureThread(result.thread);
+          result.thread = conversations.captureThread(result.thread);
           const record = conversations.catalog('thread', result.thread.id), binding = record?.project && conversations.binding(record.project);
           if (binding) result.thread = { ...result.thread, cwd: binding.root, projectId: binding.nativeId };
         }
@@ -400,7 +442,9 @@ app.whenReady().then(async () => {
     if (['connection/closed', 'provider/closed'].includes(message.method)) shared.receiptChecks.clear();
     if (message.method === 'connection/closed') releaseEditors();
     if (message.method === 'provider/closed') releaseEditors(message.provider);
-    if (message.method === 'turn/completed' && shared.enabled) { shared.completed(message.params); setImmediate(tickSchedules); }
+    if (message.method === 'turn/completed' && shared.enabled) { shared.completed(message.params); conversations.history.completed(message.params).catch(error => conversations.sync.failed(error)); setImmediate(tickSchedules); }
+    if (message.method === 'thread/compacted' && shared.enabled) { conversations.history.queue.set(message.params.threadId, { id: message.params.threadId }); setImmediate(tickSchedules); }
+
     if (['turn/started', 'turn/completed', 'thread/status/changed', 'error', 'connection/closed'].includes(message.method)) {
       const params = message.params || {};
       diagnostic.write('native.' + message.method, { provider: message.provider, threadId: params.threadId, turnId: params.turn?.id || params.turnId, status: params.turn?.status || params.status?.type, willRetry: params.willRetry, error: params.turn?.error?.message || params.error?.message || params.message });

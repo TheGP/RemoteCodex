@@ -4,12 +4,14 @@ const { randomUUID } = require('node:crypto');
 const { ConversationSync } = require('./conversation-sync.cjs');
 const { stateKey, hash } = require('./sync-state.cjs');
 const { agentTarget, agentId } = require('./agent-pool.cjs');
+const { HistoryManager } = require('./history-manager.cjs');
 
 class ConversationState {
   constructor({ directory, shared, pins, drafts, preferences, machine, options, connection, changed, log }) {
     Object.assign(this, { shared, pins, drafts, preferences, machine, options, connection, changed });
     this.sync = new ConversationSync({ directory, shared, apply: entry => this.apply(entry), changed, log });
     this.nativeProjects = new Map();
+    this.history = new HistoryManager(this);
   }
   binding(id, machine = this.machine()) {
     this.sync.load(); return this.sync.state.bindings[JSON.stringify([machine, id])];
@@ -20,13 +22,38 @@ class ConversationState {
     return Object.entries(this.sync.state.bindings).find(([key, value]) => JSON.parse(key)[0] === machine && value.nativeId === nativeId)?.[1].id;
   }
   catalog(kind, id, machine = this.machine()) { this.sync.load(); return this.sync.state.entries[stateKey(kind, machine, id)]?.value; }
+  captureProjectPath(id, root) {
+    const machine = this.machine(), device = this.shared.state.device, key = JSON.stringify([id, device]);
+    const pending = this.sync.state.pending.findLast(op => op.key === stateKey('projectPath', machine, key));
+    const previous = pending ? pending.value : this.catalog('projectPath', key);
+    const roots = [...new Set([root, ...previous?.roots || []])].slice(0, 100);
+    this.sync.capture('projectPath', machine, key, { roots });
+  }
+  projectPaths(id) {
+    const binding = this.binding(id);
+    if (!binding) return null;
+    const roots = this.sync.entries('projectPath', this.machine()).filter(entry => JSON.parse(entry.id)[0] === id).flatMap(entry => entry.value.roots);
+    for (const op of this.sync.state.pending) if (op.kind === 'projectPath' && op.machine === this.machine() && JSON.parse(op.id)[0] === id && op.value) roots.push(...op.value.roots);
+    return { root: binding.root, roots: [...new Set(roots)] };
+  }
+  fileMapping(threadId) {
+    if (!this.shared.enabled || !threadId) return null;
+    const project = this.catalog('thread', threadId)?.project;
+    if (!project) return null;
+    const mapping = this.projectPaths(project);
+    if (!mapping) throw new Error('Choose this shared project’s folder on this computer before opening files.');
+    return mapping;
+  }
   captureProject(project, update = false) {
     if (!project?.id || !project.roots?.[0]?.path || !this.shared.enabled && (!update || !this.sync.canCapture())) return project;
     this.sync.load();
     const machine = this.machine(), provider = project.provider || agentTarget(project.id, 'project').provider;
     const id = this.projectId(project.id) || randomUUID();
+    const previousRoot = this.binding(id)?.root;
+    if (previousRoot) this.captureProjectPath(id, previousRoot);
     const key = JSON.stringify([machine, id]), binding = { id, nativeId: project.id, root: project.roots[0].path, provider };
     if (JSON.stringify(this.sync.state.bindings[key]) !== JSON.stringify(binding)) { this.sync.state.bindings[key] = binding; this.sync.save(); }
+    this.captureProjectPath(id, binding.root);
     const record = { name: project.name, provider };
     if (update || !this.catalog('project', id)) this.sync.capture('project', machine, id, record, !update);
     this.nativeProjects.set(project.id, project);
@@ -45,25 +72,37 @@ class ConversationState {
   }
   captureThread(thread) {
     if (!this.shared.enabled || !thread?.id || thread.remoteOnly) return thread;
+    this.sync.load();
+    if (this.sync.state.entries[stateKey('thread', this.machine(), thread.id)]?.value === null) return thread;
+    thread = this.history.decorate(thread);
+    const access = this.history.owners.get(thread.id);
+    if (this.history.enabled && this.history.record(thread.id) && (!access || access.owner !== this.shared.state.device)) {
+      const saved = this.catalog('thread', thread.id);
+      return { ...thread, name: saved?.name || thread.name, updatedAt: saved?.updatedAt || thread.updatedAt };
+    }
     const previous = this.catalog('thread', thread.id);
-    const project = Object.hasOwn(thread, 'projectId') ? this.projectId(thread.projectId) || null : previous?.project || null;
+    const project = Object.hasOwn(thread, 'projectId') ? this.projectId(thread.projectId) || (this.history.record(thread.id) ? previous?.project : null) || null : previous?.project || null;
     if (previous && previous.updatedAt > (thread.updatedAt || 0)) return thread;
     const value = { id: thread.id, name: thread.name || null, preview: (thread.preview || '').slice(0, 500), createdAt: thread.createdAt || 0, updatedAt: thread.updatedAt || 0, provider: thread.provider || agentTarget(thread.id, 'thread').provider, project };
     const key = stateKey('thread', this.machine(), thread.id);
     const pending = this.sync.state.pending.findLast(op => op.key === key);
     if (JSON.stringify(pending?.value || previous) !== JSON.stringify(value)) this.sync.capture('thread', this.machine(), thread.id, value);
+    this.history.observe(thread);
     return thread;
   }
   threads(data, projectId, search = '') {
     if (!this.shared.enabled) return data;
-    data.forEach(thread => this.captureThread(thread));
+    this.sync.load();
+    data = data.filter(thread => this.sync.state.entries[stateKey('thread', this.machine(), thread.id)]?.value !== null);
+    data = data.map(thread => this.captureThread(thread));
     const ids = new Set(data.map(thread => thread.id));
     for (const { id, value } of this.sync.entries('thread', this.machine())) {
       if (ids.has(id)) continue;
       const binding = value.project && this.binding(value.project);
       const localProject = value.project ? binding?.nativeId || agentId(value.provider, 'project', 'sync-project:' + value.project) : null;
       if ((localProject || null) !== (projectId || null) || search && !(value.name || value.preview).toLowerCase().includes(search.toLowerCase())) continue;
-      data.push({ ...value, id, projectId: localProject, cwd: binding?.root || '', sharedProject: value.project, needsFolder: Boolean(value.project && !binding), remoteOnly: true, status: { type: 'notLoaded' } });
+      const local = this.history.record(id);
+      data.push({ ...value, id, projectId: localProject, cwd: binding?.root || local?.workspace || (local?.nativeId ? this.options().localCwd : '') || '', sharedProject: value.project, needsFolder: Boolean(value.project && !binding), remoteOnly: !local?.nativeId, status: { type: 'notLoaded' } });
     }
     return data;
   }
@@ -80,21 +119,31 @@ class ConversationState {
     if (other && other !== id) {
       delete this.sync.state.bindings[JSON.stringify([machine, other])];
       for (const entry of this.sync.entries('thread', machine)) if (entry.value.project === other) this.sync.capture('thread', machine, entry.id, { ...entry.value, project: id });
+      const pathId = JSON.stringify([other, this.shared.state.device]);
+      const pending = this.sync.state.pending.findLast(op => op.kind === 'projectPath' && op.machine === machine && op.id === pathId);
+      for (const source of (pending ? pending.value : this.catalog('projectPath', pathId))?.roots || []) this.captureProjectPath(id, source);
       this.sync.capture('project', machine, other, null);
     }
+    const previousRoot = this.binding(id)?.root;
+    if (previousRoot) this.captureProjectPath(id, previousRoot);
     this.sync.state.bindings[JSON.stringify([machine, id])] = { id, nativeId: project.id, root, provider: record.provider };
+    this.captureProjectPath(id, root);
     this.nativeProjects.set(project.id, project); this.sync.save();
     await this.sync.hydrate(); this.changed(); return { ...project, sharedId: id };
   }
   threadBinding(threadId) {
     const record = this.shared.enabled && this.catalog('thread', threadId);
-    if (!record?.project) return null;
+    if (!record?.project) {
+      const local = this.history.record(threadId);
+      return local?.workspace ? { root: local.workspace, provider: 'codex', nativeId: null } : null;
+    }
     const binding = this.binding(record.project);
     if (!binding) throw new Error('Choose this shared project’s folder on this computer before running messages.');
     return binding;
   }
   async scheduledTask(task) {
     if (this.activeNamespace !== this.shared.key || this.activeMachine !== this.machine() || this.activeSession !== this.connection.session) return null;
+    if (!this.history.canRun(task.threadId)) return null;
     const record = this.catalog('thread', task.threadId, task.machine);
     const project = record?.project || this.projectId(task.message?.thread.projectId, task.machine);
     if (!project) return task.message?.thread.projectId || !record && task.originDevice !== this.shared.state.device ? null : task;
@@ -211,12 +260,15 @@ class ConversationState {
         this.activeNamespace = namespace; this.activeMachine = machine; this.activeSession = session;
       } finally { this.bootstrapping = false; }
     }
+    for (const [key, binding] of Object.entries(this.sync.state.bindings)) if (JSON.parse(key)[0] === this.machine()) this.captureProjectPath(binding.id, binding.root);
     await this.sync.tick();
+    await this.history.tick();
   }
   status() {
     const conflicts = this.shared.enabled ? this.sync.conflicts().map(({ key, remote, local, version }) => ({ key, version, kind: JSON.parse(key)[0], local: local?.text ?? JSON.stringify(local, null, 2), remote: remote?.value?.text ?? JSON.stringify(remote?.value, null, 2) })) : [];
     const catalog = this.shared.enabled ? JSON.stringify(Object.values(this.sync.state.entries).filter(entry => ['project', 'thread'].includes(entry.kind)).map(entry => entry.revision)) : '';
-    return { enabled: this.shared.enabled, error: this.sync.error, conflicts, catalog };
+    const paths = this.shared.enabled ? Object.fromEntries(Object.entries(this.sync.state.bindings).filter(([key]) => JSON.parse(key)[0] === this.machine()).map(([, binding]) => [binding.nativeId, this.projectPaths(binding.id)])) : {};
+    return { paths, enabled: this.shared.enabled, error: this.sync.error, conflicts, catalog, historyEnabled: this.history.enabled, ownership: this.history.status() };
   }
 }
 module.exports = { ConversationState };

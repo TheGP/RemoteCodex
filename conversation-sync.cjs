@@ -87,7 +87,7 @@ class ConversationSync {
     if (this.nextBlobGc && now < this.nextBlobGc) return;
     if (!fs.existsSync(this.directory)) { this.nextBlobGc = now + blobGraceMs; return; }
     const refs = new Set();
-    const remember = value => { for (const image of value?.images || []) refs.add(image.hash); };
+    const remember = value => { for (const image of [...value?.images || [], ...value?.blobs || []]) refs.add(image.hash); };
     const rememberState = state => {
       for (const entry of Object.values(state.entries || {})) remember(entry.value);
       for (const op of state.pending || []) remember(op.value);
@@ -144,9 +144,9 @@ class ConversationSync {
       if (operations.length) {
         for (const op of operations) op.sent = true;
         this.save();
-        const hashes = [...new Set(operations.flatMap(op => (op.value?.images || []).map(image => image.hash)))];
-        if (hashes.length) {
-          const { missing } = await this.shared.bridge.call('blob-prepare', { hashes });
+        const hashes = [...new Set(operations.flatMap(op => [...op.value?.images || [], ...op.value?.blobs || []].map(image => image.hash)))];
+        for (let offset = 0; offset < hashes.length; offset += 500) {
+          const { missing } = await this.shared.bridge.call('blob-prepare', { hashes: hashes.slice(offset, offset + 500) });
           for (const id of missing) await this.shared.bridge.call('blob-put', { hash: id, data: fs.readFileSync(this.blobFile(id)).toString('base64') });
         }
         this.save();
@@ -154,7 +154,7 @@ class ConversationSync {
         for (const result of results) {
           const op = this.state.pending.find(op => op.opId === result.opId);
           if (!op) continue;
-          if (result.conflict || result.seeded && ['draft', 'shortcuts'].includes(op.kind) && !isDeepStrictEqual(op.value, result.current?.value)) {
+          if (result.conflict || result.seeded && ['draft', 'shortcuts', 'history'].includes(op.kind) && !isDeepStrictEqual(op.value, result.current?.value)) {
             if (['unread', 'completion'].includes(op.kind)) {
               this.state.pending = this.state.pending.filter(item => item !== op);
               for (const next of this.state.pending) if (next.parent === op.opId) { next.base = result.current?.revision || 0; delete next.parent; }
