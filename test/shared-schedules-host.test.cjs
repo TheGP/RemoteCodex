@@ -302,3 +302,27 @@ test('dismissing an expired uncertain send unblocks its chat and preserves cance
   assert.equal(f.b('claim', { id: original.id }, later + 4), null);
   assert.deepEqual(f.a('list', {}, later + 5), []);
 });
+
+test('the SSH helper acknowledges partial uploads without storing an incomplete blob', async t => {
+  const { spawn } = require('node:child_process');
+  const { once } = require('node:events');
+  const { createInterface } = require('node:readline');
+  const { hash } = require('../sync-state.cjs');
+  const f = fixture(t), data = Buffer.alloc(128 * 1024, 42), id = hash(data);
+  const child = spawn(process.execPath, ['--no-warnings', require.resolve('../shared-schedules-host.cjs'), f.file]);
+  const closed = once(child, 'close');
+  const output = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  child.stderr.resume();
+  t.after(() => child.kill());
+  const request = JSON.stringify({ id: 1, method: 'blob-put', owner: 'upload-test', params: { hash: id, data: data.toString('base64') } }) + '\n';
+  child.stdin.write(request.slice(0, 1000));
+  assert.deepEqual(JSON.parse((await output.next()).value), { progress: true });
+  assert.deepEqual(f.a('blob-prepare', { hashes: [id] }).missing, [id]);
+  child.stdin.end(request.slice(1000));
+  let response;
+  do { response = JSON.parse((await output.next()).value); } while (response.progress);
+  assert.equal(response.id, 1); assert.deepEqual(response.result, {});
+  assert.deepEqual(f.a('blob-prepare', { hashes: [id] }).missing, []);
+  assert.deepEqual(Buffer.from(f.a('blob-get', { hash: id }).data, 'base64'), data);
+  assert.deepEqual(await closed, [0, null]);
+});

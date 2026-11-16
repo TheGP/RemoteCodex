@@ -34,9 +34,11 @@ function writePrivate(file, value) {
 }
 
 class ScheduleBridge {
-  constructor(owner, spawnProcess = spawn) {
+  constructor(owner, spawnProcess = spawn, { transferOnly = false } = {}) {
     this.owner = owner; this.spawnProcess = spawnProcess; this.pending = new Map(); this.sequence = 0; this.generation = 0;
+    this.transferOnly = transferOnly; this.transferCount = 0;
   }
+  get busy() { return Boolean(this.connecting || this.pending.size || this.transferCount); }
   spawn(options, command) {
     const args = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=8', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2', '-p', String(options.port)];
     if (options.key) args.push('-i', options.key.replace(/^~(?=[/\\])/, os.homedir()));
@@ -44,8 +46,9 @@ class ScheduleBridge {
     return this.spawnProcess(process.platform === 'win32' ? 'ssh.exe' : '/usr/bin/ssh', args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
   }
   async connect(options) {
-    if (this.child) return;
     if (this.connecting) return this.connecting;
+    if (this.child) return;
+    this.options = options;
     const generation = this.generation;
     const opening = this.open(options, generation).finally(() => { if (this.connecting === opening) this.connecting = null; });
     this.connecting = opening; return opening;
@@ -78,6 +81,8 @@ class ScheduleBridge {
     process.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-2000); });
     process.on('close', () => fail(new Error(stderr.trim() || 'Schedule server disconnected.')));
     process.stdout.on('data', chunk => {
+      if (this.child !== process) return;
+      if (this.transferOnly) for (const request of this.pending.values()) request.progress();
       buffer += decoder.write(chunk);
       if (Buffer.byteLength(buffer) > 64 * 1024 * 1024) return fail(new Error('Schedule server response exceeds 64 MB.'));
       let index;
@@ -99,17 +104,54 @@ class ScheduleBridge {
     } catch (error) { if (this.child === process) this.close(error); throw error; }
   }
   now() { return Date.now() + (this.clockOffset || 0); }
+  transfer(method, params) {
+    // Bulk JSON must never sit ahead of editing, ownership or storage requests.
+    const generation = this.generation, options = this.options;
+    if (!this.transfers) {
+      this.transfers = new ScheduleBridge(this.owner, this.spawnProcess, { transferOnly: true });
+      this.transfers.spawn = (options, command) => this.spawn(options, command);
+    }
+    const bridge = this.transfers;
+    this.transferCount++;
+    const operation = (this.transferring || Promise.resolve()).then(async () => {
+      if (this.generation !== generation) throw new Error('Schedule storage connection changed.');
+      await bridge.connect(options);
+      if (this.generation !== generation) throw new Error('Schedule storage connection changed.');
+      return bridge.call(method, params);
+    }).finally(() => { this.transferCount--; });
+    this.transferring = operation.catch(() => {});
+    return operation;
+  }
   call(method, params = {}) {
     if (!this.child) return Promise.reject(new Error('Schedule server is offline.'));
+    if (!this.transferOnly && (method === 'blob-put' || method === 'blob-get')) return this.transfer(method, params);
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => this.close(new Error('Schedule server request timed out.')), 20000);
-      this.pending.set(id, { resolve, reject, timer });
-      try { this.child.stdin.write(JSON.stringify({ id, method, params, owner: this.owner }) + '\n'); }
+      const request = { resolve, reject, progress: () => {
+        clearTimeout(request.timer);
+        request.timer = setTimeout(() => this.close(new Error(`Schedule server request timed out (${method}).`)), 20000);
+      } };
+      this.pending.set(id, request); request.progress();
+      try {
+        const child = this.child, data = Buffer.from(JSON.stringify({ id, method, params, owner: this.owner }) + '\n');
+        if (!this.transferOnly) { child.stdin.write(data); return; }
+        // Follow pipe backpressure and renew the inactivity deadline as bytes move.
+        const write = offset => {
+          if (this.child !== child || !this.pending.has(id)) return;
+          child.stdin.write(data.subarray(offset, offset + 64 * 1024), error => {
+            if (this.child !== child || !this.pending.has(id)) return;
+            if (error) { this.close(error); return; }
+            request.progress();
+            if (offset + 64 * 1024 < data.length) write(offset + 64 * 1024);
+          });
+        };
+        write(0);
+      }
       catch (error) { this.close(error); }
     });
   }
   close(error = new Error('Schedule server disconnected.')) {
+    this.transfers?.close(error); this.transfers = null;
     this.generation++; this.installing?.kill(); this.installing = null; this.connecting = null;
     const child = this.child; this.child = null; child?.kill();
     for (const request of this.pending.values()) { clearTimeout(request.timer); request.reject(error); }
@@ -150,7 +192,7 @@ class SharedSchedules {
   failed(error) { if (this.error === error.message) return; this.log('schedule.sync.failed', { error: error.message }); this.error = error.message; this.changed(); }
   async configure(value) {
     const options = sharingOptions(value);
-    if (this.running || this.changing || this.bridge.connecting || this.bridge.pending?.size || this.locks.size || this.state.receipts.length) throw new Error('Wait for schedule sync to finish and close message editors before changing sharing.');
+    if (this.running || this.changing || this.bridge.busy || this.bridge.connecting || this.bridge.pending?.size || this.locks.size || this.state.receipts.length) throw new Error('Wait for schedule sync to finish and close message editors before changing sharing.');
     if (serverKey(options) !== this.key && this.store.tasks.some(task => task.status === 'pending' && task.sharedTo === this.key && !task.sharedImported)) throw new Error('Finish uploading scheduled messages before choosing another server or folder.');
     if (serverKey(options) !== this.key && this.tasks().some(task => ['pending', 'claimed', 'sending', 'unconfirmed'].includes(task.status) || task.active)) throw new Error('Cancel or finish shared schedules before choosing another server or folder.');
     this.changing = true;

@@ -204,7 +204,7 @@ function run() {
   if (!path.isAbsolute(file) || /[\x00-\x1f\x7f]/.test(file)) throw new Error('Use an absolute server database path.');
   const store = new SharedScheduleDatabase(file);
   const decoder = new (require('node:string_decoder').StringDecoder)('utf8');
-  let buffer = '';
+  let buffer = '', lastProgress = 0;
   process.stdin.on('data', chunk => {
     buffer += decoder.write(chunk);
     if (Buffer.byteLength(buffer) > 64 * 1024 * 1024) { process.stderr.write('Shared schedule request exceeds 64 MB.\n'); process.exit(1); }
@@ -217,6 +217,11 @@ function run() {
         const response = store.request(request.method, request.params, request.owner);
         process.stdout.write(JSON.stringify({ id: request.id, ...response }) + '\n');
       } catch (error) { process.stdout.write(JSON.stringify({ id: request?.id ?? null, error: error.message }) + '\n'); }
+    }
+    // A flushed client pipe can still contain megabytes queued inside SSH.
+    // Report bytes arriving here so slow uploads retain an inactivity deadline.
+    if (buffer.length && Date.now() - lastProgress >= 1000) {
+      lastProgress = Date.now(); process.stdout.write('{"progress":true}\n');
     }
   });
   process.stdin.on('end', () => { store.close(); });
