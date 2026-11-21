@@ -301,6 +301,162 @@ async function checks() {
   }
   results.push('failed history loads and same-chat refreshes clear obsolete pagination cursors; retries load and page only the correct conversation');
 
+  {
+    const previousRpc = api.rpc;
+    const first = { id: 'cached-timeline-a', name: 'Cached timeline', cwd: '/tmp', path: '/tmp/a.jsonl' };
+    const second = { id: 'cached-timeline-b', name: 'Other timeline', cwd: '/tmp', path: '/tmp/b.jsonl' };
+    const turn = index => ({ id: 'cache-turn-' + index, status: 'completed', items: [
+      { id: 'cache-message-' + index, type: 'agentMessage', text: ('Message ' + index + '\n\n').repeat(28) }
+    ] });
+    const latest = [turn(9), turn(8), turn(7)];
+    latest[0].items.push({ id: 'cache-tool', type: 'commandExecution', command: 'git status', status: 'completed', aggregatedOutput: 'Test output shown on expand' });
+    const older = [turn(6), turn(5), turn(4), turn(3)];
+    let releaseRefresh, holdRefresh = false;
+    const calls = [];
+    state.connected = true;
+    api.rpc = async (method, params) => {
+      calls.push({ method, params });
+      if (method === 'thread/read') return { thread: params.threadId === first.id ? first : second };
+      if (params.threadId !== first.id) return { data: [], nextCursor: null, receivedSequence: 1 };
+      if (params.cursor === 'gap') return { data: [turn(10), ...latest, ...older, turn(2)], nextCursor: 'gap-older', receivedSequence: 3 };
+      if (params.cursor) return { data: older, nextCursor: 'still-older', receivedSequence: 1 };
+      if (holdRefresh) return new Promise(resolve => { releaseRefresh = resolve; });
+      return { data: latest, nextCursor: 'older', receivedSequence: 1 };
+    };
+    try {
+      await openThread(first);
+      const request = calls.find(call => call.method === 'thread/turns/list');
+      check(request.params.limit === initialTurnLimit && initialTurnLimit < olderTurnLimit, 'Cold open requested a full older-message page');
+      const tool = state.items.get('cache-tool');
+      check(!tool.body.textContent && !tool.element.open, 'Cold open rendered collapsed tool output');
+      tool.group.open = true; tool.element.open = true; tool.element.ontoggle();
+      check(tool.body.textContent.includes('Test output shown on expand'), 'Expanding an older tool did not render its output');
+      await loadOlderTurns();
+      const middle = state.items.get('cache-message-5').element;
+      setTimelineFollowing(false, middle);
+      $('timeline').scrollTop += middle.getBoundingClientRect().top - $('timeline').getBoundingClientRect().top - 15;
+      const top = $('timeline').scrollTop, offset = middle.getBoundingClientRect().top;
+      check(top > 0 && !timelineAtBottom(), 'Timeline test did not move into the older history');
+
+      await openThread(second);
+      holdRefresh = true;
+      const reopened = openThread(first);
+      check(middle.isConnected && state.items.get('cache-message-5').element === middle && !$('timeline').classList.contains('loading') && Math.abs($('timeline').scrollTop - top) < 1, 'Revisiting a cached chat did not immediately restore its viewed position');
+      for (let i = 0; i < 20 && !releaseRefresh; i++) await Promise.resolve();
+      check(typeof releaseRefresh === 'function', 'Revisiting did not request the latest history');
+      releaseRefresh({ data: [turn(10), ...latest], nextCursor: 'new-older', receivedSequence: 2 });
+      await reopened;
+      check(state.items.has('cache-message-10') && middle.isConnected && state.items.get('cache-tool') === tool && state.turnCursor === 'still-older' && Math.abs(middle.getBoundingClientRect().top - offset) < 1 && !timelineView.following, 'Refreshing new turns lost the cached older page, expanded tool, or reading position');
+      await openThread(second);
+      releaseRefresh = null;
+      const withGap = openThread(first);
+      for (let i = 0; i < 20 && !releaseRefresh; i++) await Promise.resolve();
+      releaseRefresh({ data: [turn(13), turn(12), turn(11)], nextCursor: 'gap', receivedSequence: 3 });
+      await withGap;
+      check(state.items.has('cache-message-13') && !state.items.has('cache-message-2') && middle.isConnected && state.turnCursor === 'still-older' && Math.abs(middle.getBoundingClientRect().top - offset) < 1, 'Catching up across a history page replaced the cached reading position or its older cursor');
+    } finally {
+      holdRefresh = false;
+      api.rpc = previousRpc; state.historyView = null;
+      recentTimelines.delete(first.id); recentTimelines.delete(second.id); resetThread();
+    }
+  }
+  results.push('conversation switches immediately restore cached messages and older reading positions, refresh new turns, and defer collapsed tool output');
+
+  {
+    const previous = { rpc: api.rpc, options: state.options, models: [...$('model').options], threads: state.threads };
+    const created = { id: 'live-timeline', cwd: '/tmp' };
+    const saved = { ...created, path: '/tmp/live-timeline.jsonl' };
+    const away = { id: 'away-from-timeline', cwd: '/tmp' };
+    const split = { id: 'agent:zcode:split-timeline', cwd: '/tmp' };
+    const gap = { id: 'agent:zcode:gap-timeline', cwd: '/tmp' };
+    const reply = { id: 'live-timeline-reply', type: 'agentMessage', text: 'Long reply\n\n'.repeat(120) };
+    const initial = { id: 'live-turn', status: 'completed', items: [reply] };
+    const sent = { id: 'live-sent', type: 'userMessage', content: [{ type: 'text', text: 'A follow-up' }] };
+    const splitItem = (id, historyRowId) => ({ id, historyRowId, type: 'agentMessage', text: `${id}\n\n`.repeat(120) });
+    const olderItem = splitItem('old-native-row', 9);
+    let latestItem = splitItem('new-native-row', 12);
+    let sends = 0, nativeRows = 50;
+    const gapCursors = [];
+    const page = (data, nextCursor = null) => ({ data, nextCursor, receivedSequence: 2 });
+    state.connected = true; state.options = { mode: 'local', localCwd: '/tmp' };
+    api.rpc = async (method, params) => {
+      if (method === 'thread/start') return { thread: created };
+      if (method === 'turn/start') return { turn: { id: ++sends === 1 ? initial.id : 'follow-up', status: 'completed' } };
+      if (method === 'thread/read') return { thread: [saved, split, gap, away].find(thread => thread.id === params.threadId) };
+      if (method !== 'thread/turns/list') throw new Error('Unexpected timeline request: ' + method);
+      if (params.threadId === split.id) {
+        return params.cursor === 'middle-native-turn'
+          ? page([{ id: 'split-native-turn', status: 'completed', items: [olderItem] }], 'prior-native-turn')
+          : page([{ id: 'split-native-turn', status: 'completed', historyStartRowId: 12, items: [latestItem] }], 'middle-native-turn');
+      }
+      if (params.threadId === gap.id) {
+        gapCursors.push(params.cursor);
+        const end = params.cursor ? Number(params.cursor) - 1 : nativeRows;
+        const start = Math.max(1, end - 199);
+        const items = Array.from({ length: end - start + 1 }, (_, index) => {
+          const row = start + index;
+          return { id: 'gap-row-' + row, type: 'agentMessage', historyRowId: row, text: 'Native row ' + row };
+        });
+        return page([{ id: 'growing-native-turn', status: 'completed', historyEndRowId: end, ...(start > 1 ? { historyStartRowId: start } : {}), items }], start > 1 ? String(start) : null);
+      }
+      if (params.threadId !== created.id) return page([]);
+      return page(sends === 1 ? [initial] : [{ id: 'follow-up', status: 'completed', items: [sent] }, initial]);
+    };
+    try {
+      resetThread('/tmp');
+      $('model').replaceChildren(new Option('Codex', ''));
+      $('prompt').value = 'First prompt';
+      check(!(await send())?.failed && sends === 1, 'Timeline fixture could not start a conversation');
+      handleNotification({ method: 'item/completed', params: { threadId: created.id, turnId: initial.id, item: reply }, receivedSequence: 1 });
+      const live = state.items.get(reply.id).element;
+      setTimelineFollowing(false, live); $('timeline').scrollTop = 220;
+      const top = $('timeline').scrollTop;
+      await openThread(away);
+      const returning = openThread(created);
+      check(live.isConnected && top > 0 && $('timeline').scrollTop === top, 'First return to a newly created chat lost its live messages or position');
+      await returning;
+      check(state.items.has(reply.id) && $('timeline').scrollTop === top, 'The newly assigned history path reset the new chat’s reading position');
+
+      $('prompt').value = 'A follow-up';
+      check(!(await send())?.failed && sends === 2 && [...state.items.keys()].some(id => id.startsWith('pending-')), 'Timeline fixture did not show a provisional send');
+      await openThread(away);
+      handleNotification({ method: 'item/completed', params: { threadId: created.id, turnId: 'follow-up', item: sent }, receivedSequence: 2 });
+      await openThread(created);
+      check(state.items.has(sent.id) && ![...state.items.keys()].some(id => id.startsWith('pending-')), 'Returning after a background confirmation duplicated the sent message');
+
+      await openThread(split); await loadOlderTurns();
+      const oldRow = state.items.get(olderItem.id).element;
+      oldRow.scrollIntoView({ block: 'start' }); setTimelineFollowing(false, oldRow);
+      const offset = oldRow.getBoundingClientRect().top;
+      await openThread(away); await openThread(split);
+      check(state.items.get(olderItem.id).element === oldRow && state.turnCursor === 'prior-native-turn', 'Refreshing an unchanged split turn rebuilt the already loaded part or rewound its cursor');
+      latestItem = { ...latestItem, text: latestItem.text + ' updated' };
+      await openThread(away); await openThread(split);
+      check(state.items.has(olderItem.id) && state.items.get(latestItem.id).body.textContent.includes('updated') && state.turnCursor === 'prior-native-turn'
+        && Math.abs(state.items.get(olderItem.id).element.getBoundingClientRect().top - offset) < 1, 'Refreshing changed rows dropped the older part of a split ZCode turn or moved its reading position');
+
+      await openThread(gap);
+      await openThread(away); nativeRows = 440; gapCursors.length = 0;
+      await openThread(gap);
+      check(gapCursors.join() === ',241' && state.items.size === 440 && state.items.has('gap-row-100') && !state.turnCursor,
+        'Warm refresh accepted a split-turn ID match without fetching and joining the missing rows');
+
+      await openThread(away); nativeRows = 1600; gapCursors.length = 0;
+      await openThread(gap);
+      check(gapCursors.length === historyRefreshPageLimit + 1 && state.items.size === 200 && state.turnCursor === '1401' && !$('older-turns').hidden,
+        'Page budget fallback kept the cached cursor instead of a contiguous native history window');
+      await loadOlderTurns();
+      check(state.items.has('gap-row-1350') && state.turnCursor === '1201', 'Older messages could not continue after a bounded refresh');
+    } finally {
+      resetThread();
+      api.rpc = previous.rpc; state.options = previous.options; state.threads = previous.threads;
+      $('model').replaceChildren(...previous.models);
+      for (const thread of [created, away, split, gap]) recentTimelines.delete(thread.id);
+      state.owned.delete(created.id); state.active.delete(created.id);
+    }
+  }
+  results.push('the first switch from a new chat preserves its reading position, recent sends display once, and split ZCode turns keep their earlier rows and cursor');
+
   state.connected = true;
   const thread = { id: 'renderer-review', cwd: '/tmp', preview: 'Renderer test', updatedAt: 1 };
   let resolveHistory;
@@ -1606,16 +1762,17 @@ async function checks() {
   sourceTurns = structuredClone(initialSourceTurns); await openThread(branchSource);
   const editRecord = state.items.get(editPrompt.id);
   editRecord.label.querySelector('.edit-message').click();
-  check($('edit-message-dialog').open && $('edited-message').value === 'Original question $kept-skill' && $('edited-message-attachments').textContent.includes('1'), 'Earlier message editor lost its text or attachment');
+  check($('edit-message-form').parentElement === editRecord.element && editRecord.body.hidden && document.activeElement === $('edited-message')
+    && $('edited-message').value === 'Original question $kept-skill' && !$('edited-message-attachments').hidden, 'Inline message editor did not replace the selected bubble or lost its text, attachment, or focus');
   $('edited-message').value = 'Changed question $kept-skill';
   const resendNewline = new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true, cancelable: true }); $('edited-message').dispatchEvent(resendNewline);
-  check(!resendNewline.defaultPrevented && $('edit-message-dialog').open, 'Shift+Enter submitted the earlier-message editor');
+  check(!resendNewline.defaultPrevented && !$('edit-message-form').hidden, 'Shift+Enter submitted the earlier-message editor');
   const resendSubmitHandler = $('edit-message-form').onsubmit; let resendKeyboardSave;
   $('edit-message-form').onsubmit = event => { resendKeyboardSave = resendSubmitHandler(event); return resendKeyboardSave; };
   const resendEnter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }); $('edited-message').dispatchEvent(resendEnter);
   check(resendEnter.defaultPrevented && resendKeyboardSave, 'Enter did not submit the earlier-message editor');
   await resendKeyboardSave; $('edit-message-form').onsubmit = resendSubmitHandler;
-  check(!$('edit-message-dialog').open, 'Earlier-message editor stayed open after a successful Enter submission');
+  check($('edit-message-form').hidden, 'Earlier-message editor stayed open after a successful Enter submission');
   check(branchCalls.filter(call => call.method === 'thread/revert').at(-1).params.beforeTurnId === 'second-source-turn' && branchNumber === 1, 'Edit forked a conversation instead of reverting the selected turn');
   check(branchCalls.findLast(call => call.method === 'thread/revert').context?.repairReasoning === true && branchCalls.findLast(call => call.method === 'turn/start').context?.repairReasoning === true, 'Edit/resend did not request repair before reverting and sending');
   check(editedSubmission.threadId === branchSource.id && state.thread.id === branchSource.id && editedSubmission.input[0].text === 'Changed question $kept-skill', 'Edited prompt did not stay in the current conversation');
@@ -1631,14 +1788,18 @@ async function checks() {
   check(branchCalls.filter(call => call.method === 'thread/revert').at(-1).params.beforeTurnId === 'first-source-turn' && state.thread.id === branchSource.id && !$('messages').textContent.includes('First question'), 'Editing the first turn retained old history or changed conversations');
   sourceTurns = structuredClone(initialSourceTurns); await openThread(branchSource);
   const beforeCancel = branchCalls.length;
-  state.items.get(firstPrompt.id).label.querySelector('.edit-message').click(); $('cancel-message-edit').click();
+  const firstRecord = state.items.get(firstPrompt.id), editFirst = firstRecord.label.querySelector('.edit-message');
+  editFirst.click();
+  const cancelEdit = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+  $('edited-message').dispatchEvent(cancelEdit);
   await settle();
-  check(branchCalls.length === beforeCancel, 'Cancelling an edit created a branch');
+  check(branchCalls.length === beforeCancel && cancelEdit.defaultPrevented && $('edit-message-form').hidden && !firstRecord.body.hidden
+    && document.activeElement === editFirst, 'Escaping an inline edit changed history or failed to restore the original message and focus');
   state.items.get(firstPrompt.id).label.querySelector('.edit-message').click();
   state.options = { mode: 'ssh', host: 'another-edit-machine', port: 22 };
   await $('edit-message-form').onsubmit({ preventDefault() {} });
   check(branchCalls.length === beforeCancel, 'A stale editor sent to a different machine');
-  $('edit-message-dialog').close(); await settle(); state.options = { mode: 'local' };
+  closeMessageEdit({ save: true }); await settle(); state.options = { mode: 'local' };
   sourceTurns = structuredClone(initialSourceTurns); await openThread(branchSource);
   const originalRpc = api.rpc;
   api.rpc = async (method, params) => { if (method === 'turn/start') throw new Error('Send not confirmed'); return originalRpc(method, params); };
@@ -1668,8 +1829,8 @@ async function checks() {
   api.rpc = async (method, params) => { if (method === 'thread/revert') throw new Error('Revert unavailable'); return originalRpc(method, params); };
   state.items.get(firstPrompt.id).label.querySelector('.edit-message').click(); $('edited-message').value = 'Draft after revert failure';
   await $('edit-message-form').onsubmit({ preventDefault() {} });
-  check(state.thread.id === branchSource.id && $('edit-message-dialog').open && $('edited-message').value === 'Draft after revert failure' && !state.commandBusy, 'Failed revert changed the source or lost the editor draft');
-  $('edit-message-dialog').close(); await settle(); $('error').hidden = true;
+  check(state.thread.id === branchSource.id && !$('edit-message-form').hidden && $('edited-message').value === 'Draft after revert failure' && !state.commandBusy, 'Failed revert changed the source or lost the editor draft');
+  closeMessageEdit({ save: true }); await settle(); $('error').hidden = true;
   api.rpc = originalRpc; sourceTurns = structuredClone(initialSourceTurns); await openThread(branchSource);
   {
     const models = state.models, options = state.options, metadata = state.options.agents, editLock = api.editLock, catalog = modes.catalog, plan = modes.plan;
@@ -1690,11 +1851,11 @@ async function checks() {
       };
       if (phase === 'before-edit') { state.models = []; renderModels(); }
       await $('edit-message-form').onsubmit({ preventDefault() {} });
-      check(!branchCalls.slice(before).some(call => ['thread/revert', 'turn/start'].includes(call.method)) && sourceTurns.length === initialSourceTurns.length && $('edit-message-dialog').open && $('edited-message').value === 'Preserve this unavailable-model edit' && $('edit-message-error').textContent.includes(phase.startsWith('plan') ? 'Plan mode is unavailable' : 'model is unavailable'), 'Unavailable edit settings rewrote history, lost the editor draft, or failed to explain the block: ' + phase);
+      check(!branchCalls.slice(before).some(call => ['thread/revert', 'turn/start'].includes(call.method)) && sourceTurns.length === initialSourceTurns.length && !$('edit-message-form').hidden && $('edited-message').value === 'Preserve this unavailable-model edit' && $('edit-message-error').textContent.includes(phase.startsWith('plan') ? 'Plan mode is unavailable' : 'model is unavailable'), 'Unavailable edit settings rewrote history, lost the editor draft, or failed to explain the block: ' + phase);
       check(!phase.endsWith('before-edit') || locks === 0, 'Unavailable edit acquired a writer lock before validation');
       state.models = models; state.options = options; state.options.agents = metadata; renderModels(); $('model').value = model; updateBusy();
       modes.catalog = catalog; modes.plan = plan;
-      $('edit-message-dialog').close(); await settle();
+      closeMessageEdit({ save: true }); await settle();
     }
     api.editLock = editLock;
   }
@@ -1703,8 +1864,8 @@ async function checks() {
   const beforeUnsupported = branchCalls.length;
   state.items.get(firstPrompt.id).label.querySelector('.edit-message').click(); $('edited-message').value = 'Keep this legacy draft';
   await $('edit-message-form').onsubmit({ preventDefault() {} });
-  check(branchCalls.length === beforeUnsupported && $('edit-message-dialog').open && $('edited-message').value === 'Keep this legacy draft' && !$('edit-message-error').hidden && $('edit-message-error').textContent.includes('history format') && branchNumber === 1, 'Unsupported history silently forked, hid its error, or discarded the editor draft');
-  branchSource.historyMode = 'paginated'; $('edit-message-dialog').close(); await settle(); $('error').hidden = true;
+  check(branchCalls.length === beforeUnsupported && !$('edit-message-form').hidden && $('edited-message').value === 'Keep this legacy draft' && !$('edit-message-error').hidden && $('edit-message-error').textContent.includes('history format') && branchNumber === 1, 'Unsupported history silently forked, hid its error, or discarded the editor draft');
+  branchSource.historyMode = 'paginated'; closeMessageEdit({ save: true }); await settle(); $('error').hidden = true;
   state.active.set(branchSource.id, 'edit-active-task'); updateBusy();
   check(state.items.get(firstPrompt.id).label.querySelector('.edit-message').disabled, 'A running task allowed its history to be rewritten');
   state.owned.add(branchSource.id); $('prompt').value = 'Keep this queued follower'; await send();
@@ -1728,7 +1889,7 @@ async function checks() {
   finishEditLock('stale-lock'); await staleEdit;
   check(branchCalls.length === beforeStaleEdit && state.commandBusy, 'A delayed edit crossed connections or cleared a newer operation');
   state.commandBusy = false; state.options = { mode: 'local' }; api.editLock = savedEditLock;
-  $('edit-message-dialog').close(); await settle();
+  closeMessageEdit({ save: true }); await settle();
   results.push('in-place edits preserve pinned identity and queued drafts, block active history rewrites, retain unsupported-format drafts, and ignore delayed responses after switching machines');
   let resolveFork;
   api.rpc = (method, params) => method === 'thread/fork' ? new Promise(resolve => { resolveFork = resolve; }) : originalRpc(method, params);
@@ -1784,10 +1945,10 @@ async function checks() {
     latest.label.querySelector('.edit-message').click();
     $('edited-message').value = 'Retry the edited query';
     await $('edit-message-form').onsubmit({ preventDefault() {} });
-    check($('edit-message-dialog').open && calls.length === 0, 'Unavailable ZCode attempted an edit or closed the editor');
+    check(!$('edit-message-form').hidden && calls.length === 0, 'Unavailable ZCode attempted an edit or closed the editor');
     provider.connected = true; renderModels();
     await $('edit-message-form').onsubmit({ preventDefault() {} });
-    check($('edit-message-dialog').open && $('edited-message').value === 'Retry the edited query' && $('edit-message-error').textContent.includes('Sign in through ZCode'), 'A rejected ZCode edit lost the draft or hid the authentication error');
+    check(!$('edit-message-form').hidden && $('edited-message').value === 'Retry the edited query' && $('edit-message-error').textContent.includes('Sign in through ZCode'), 'A rejected ZCode edit lost the draft or hid the authentication error');
     failure = "Error invoking remote method 'rpc': Error: Edit may have been submitted; check conversation history before retrying. Timeout.";
     await $('edit-message-form').onsubmit({ preventDefault() {} });
     check($('resend-message').disabled && $('cancel-message-edit').textContent === 'Check history', 'Unconfirmed ZCode edit could be resent before checking history');
@@ -1797,7 +1958,7 @@ async function checks() {
     await $('edit-message-form').onsubmit({ preventDefault() {} });
     await $('cancel-message-edit').onclick(); await settle();
     check(calls.map(call => call.method).join(',') === 'thread/read,thread/turns/list' &&
-      !$('edit-message-dialog').open && savedEdit?.draft.text === 'Retry the edited query' && savedEdit.target.itemId === itemId,
+      $('edit-message-form').hidden && savedEdit?.draft.text === 'Retry the edited query' && savedEdit.target.itemId === itemId,
       'Checking history resent an uncertain edit or discarded its saved draft');
     showThreadMenu(thread, 100, 100);
     check(!$('recover-edit-drafts').hidden, 'The conversation menu did not expose saved edit recovery');
@@ -1812,12 +1973,12 @@ async function checks() {
     api.moveDraft = () => { throw new Error('Partial turns must not migrate legacy edit drafts'); };
     history = 'split';
     await restoreLastDraft();
-    check(!$('edit-message-dialog').open && savedEdit.target.itemId === turnId && $('prompt').value === 'Keep separate composer draft',
+    check($('edit-message-form').hidden && savedEdit.target.itemId === turnId && $('prompt').value === 'Keep separate composer draft',
       'A draft was rebound before the full legacy turn was known');
     history = 'both';
     savedEdit = exactDraft;
     await restoreLastDraft();
-    check($('edit-message-dialog').open && state.messageEdit.itemId === itemId && $('edited-message').value === 'Retry the edited query',
+    check(!$('edit-message-form').hidden && state.messageEdit.itemId === itemId && $('edited-message').value === 'Retry the edited query',
       'Draft recovery picked the first message instead of the saved ZCode message');
     check($('edited-message-attachments').textContent.includes('1 attachment'), 'The editor did not show the retained ZCode attachment');
     $('edited-message').value = '';
@@ -1825,7 +1986,7 @@ async function checks() {
     await $('edit-message-form').onsubmit({ preventDefault() {} });
     check(calls.map(call => call.method).join(',') === 'thread/edit,thread/read,thread/turns/list' &&
       calls[0].params.beforeTurnId === turnId && calls[0].params.itemId === itemId &&
-      !$('edit-message-dialog').open && state.thread.id === thread.id && state.active.get(thread.id) === turnId &&
+      $('edit-message-form').hidden && state.thread.id === thread.id && state.active.get(thread.id) === turnId &&
       calls[0].params.input.length === 0 && !savedEdit, 'ZCode failed to submit an attachment-only edit exactly once or reload its replacement turn');
     await settle();
     Object.assign(api, draftMethods);
@@ -2334,6 +2495,40 @@ async function checks() {
     await target.ondrop(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer, clientY }));
   };
   renderThreads();
+  {
+    const source = orderRow('order-c').querySelector('.thread');
+    const transfer = orderDrag('order-c');
+    const over = (row, position) => {
+      const rect = row.getBoundingClientRect();
+      row.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: transfer, clientY: rect.top + rect.height * position }));
+    };
+    const first = orderRow('order-a'), second = orderRow('order-b');
+    const observer = new MutationObserver(() => {});
+    observer.observe(first, { attributes: true, attributeFilter: ['class'] });
+    over(first, 0.25);
+    check(observer.takeRecords().length === 1 && first.classList.contains('drop-before'), 'Drag did not set the first drop marker');
+    over(first, 0.25);
+    check(!observer.takeRecords().length, 'Holding the same drag position rewrote the drop marker');
+    observer.disconnect();
+    over(second, 0.75);
+    check(!first.classList.contains('drop-before') && second.classList.contains('drop-after') && $('threads').querySelectorAll('.drop-before,.drop-after').length === 1, 'Moving to a new drop target left a second marker behind');
+    const incoming = { ...orderedChats[0], id: 'arrived-during-drag' };
+    state.threads.push(incoming); renderThreads();
+    check(source.isConnected && second.isConnected && !orderIds().includes(incoming.id), 'A refresh replaced the rows during the active drag');
+    source.dispatchEvent(new DragEvent('dragend', { bubbles: true }));
+    await settle();
+    check(!source.isConnected && orderIds().includes(incoming.id) && !$('threads').querySelector('.drop-before,.drop-after'), 'Ending the drag did not render the deferred list and clear the marker');
+    state.threads.pop(); renderThreads();
+
+    const staleTargetDrag = orderDrag('order-c');
+    const staleTarget = orderRow('order-a');
+    const clientY = staleTarget.getBoundingClientRect().top;
+    state.threads = state.threads.map(thread => thread.id === 'order-a' ? { ...thread, projectId: memeProject.id } : thread);
+    renderThreads();
+    await staleTarget.ondrop(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: staleTargetDrag, clientY }));
+    check(!threadDrag.source && !preferences.threadOrders[accessKey()]?.[rapidProject.id], 'Dropping on a stale row reordered a conversation that left the project');
+    state.threads = [...orderedChats]; renderThreads();
+  }
   await orderDrop('order-c', 'order-a');
   check(orderIds().join() === 'order-pin-a,order-pin-b,order-c,order-a,order-b,order-d', 'Dragging above a conversation did not reorder inside the project');
   await orderDrop('order-a', 'order-d', true);
@@ -3394,9 +3589,9 @@ async function checks() {
   $('cancel-queue-edit').click(); await new Promise(resolve => setTimeout(resolve, 0));
   state.items.get('draft-edit-prompt').label.querySelector('.edit-message').click();
   $('edited-message').value = 'Unfinished earlier-message edit'; $('edited-message').dispatchEvent(new Event('input', { bubbles: true }));
-  $('edit-message-dialog').close(); await new Promise(resolve => setTimeout(resolve, 0));
+  closeMessageEdit({ save: true }); await new Promise(resolve => setTimeout(resolve, 0));
   await restoreLastDraft();
-  check($('edit-message-dialog').open && $('edited-message').value === 'Unfinished earlier-message edit' && $('prompt').value === rawDraft, 'Restart did not restore the editor independently of the composer draft');
+  check(!$('edit-message-form').hidden && $('edited-message').value === 'Unfinished earlier-message edit' && $('prompt').value === rawDraft, 'Restart did not restore the editor independently of the composer draft');
   $('cancel-message-edit').click(); await new Promise(resolve => setTimeout(resolve, 0));
   results.push('unsent composer and editor drafts save every change, survive restart and chat/project/machine switches, retain images and settings, migrate first-send drafts, clear only after success, and never auto-send');
   results.push('unsent prompts have a yellow idle indicator immediately and across chat switches/restarts; working spinners and unread state survive, whitespace clears it, and cached markers stay scoped to their machine');
@@ -4692,7 +4887,12 @@ async function checks() {
     const sync = { error: null, conflicts: [], catalog: 'open-editors-only' }; conversationSync.catalog = sync.catalog;
     api.conversationSync = async () => structuredClone(sync);
     api.draft = target => structuredClone(saved.get(key(target)) || null);
-    api.saveDraft = (target, patch, expected) => { writes.push({ target: structuredClone(target), patch: structuredClone(patch), expected: structuredClone(expected) }); saved.set(key(target), { ...saved.get(key(target)), ...structuredClone(patch) }); };
+    let failMessageWrite = false;
+    api.saveDraft = (target, patch, expected) => {
+      if (failMessageWrite && target.kind === 'edit-message') throw new Error('Disk write failed');
+      writes.push({ target: structuredClone(target), patch: structuredClone(patch), expected: structuredClone(expected) });
+      saved.set(key(target), { ...saved.get(key(target)), ...structuredClone(patch) });
+    };
     api.clearDraft = (target, expected) => { clears.push({ target: structuredClone(target), expected: structuredClone(expected) }); saved.delete(key(target)); }; api.draftIndicators = async () => [];
     api.editLock = async (_threadId, token) => token ? undefined : 'synced-editor-lock';
     api.rpc = async method => { throw new Error('Open-editor metadata sync must not execute agent operations: ' + method); };
@@ -4700,11 +4900,12 @@ async function checks() {
     const notify = async () => { handleNotification({ method: 'conversations/synced', params: {} }); await settle(); check(!conversationSync.refreshing, 'Open-editor metadata refresh did not settle'); };
     const lastWrite = kind => writes.filter(write => write.target.kind === kind).at(-1);
     const lastClear = kind => clears.filter(clear => clear.target.kind === kind).at(-1);
-    const record = renderItem({ id: 'metadata-editor-prompt', type: 'userMessage', content: [{ type: 'text', text: 'Original message fallback' }] }, false, 'metadata-editor-turn');
+    const promptItem = { id: 'metadata-editor-prompt', type: 'userMessage', content: [{ type: 'text', text: 'Original message fallback' }] };
+    const record = renderItem(promptItem, false, 'metadata-editor-turn');
     const messageTarget = editorTarget('edit-message', thread, 'metadata-editor-turn');
     saved.set(key(messageTarget), { text: 'Saved message local' });
     openMessageEdit(record); $('edited-message').setSelectionRange(3, 3);
-    check($('edit-message-dialog').open && $('edited-message').value === 'Saved message local', 'The real message editor did not restore its saved draft baseline');
+    check(!$('edit-message-form').hidden && $('edited-message').value === 'Saved message local', 'The real message editor did not restore its saved draft baseline');
     saved.set(key(messageTarget), { text: 'Remote message sync' }); await notify();
     check($('edited-message').value === 'Remote message sync' && document.activeElement === $('edited-message') && $('edited-message').selectionStart === 3, 'A clean open message editor missed a remote update or lost focus/caret');
     $('edited-message').value = 'Typed after remote'; $('edited-message').dispatchEvent(new Event('input', { bubbles: true }));
@@ -4725,7 +4926,28 @@ async function checks() {
     check(JSON.stringify(lastWrite('edit-message').expected) === JSON.stringify({ text: null }), 'An editor recreated after a remote clear used fallback text as if it were a saved draft');
     saved.set(key(messageTarget), { text: 'Unseen remote message before cancellation' });
     $('cancel-message-edit').click(); await settle();
-    check(!$('edit-message-dialog').open && JSON.stringify(lastClear('edit-message').expected) === JSON.stringify({ text: 'After the remote clear' }) && !saved.has(key(messageTarget)), 'Cancelling a stale message editor did not clear against its visible baseline');
+    check($('edit-message-form').hidden && JSON.stringify(lastClear('edit-message').expected) === JSON.stringify({ text: 'After the remote clear' }) && !saved.has(key(messageTarget)), 'Cancelling a stale message editor did not clear against its visible baseline');
+
+    openMessageEdit(record);
+    failMessageWrite = true;
+    const failedText = 'Unsaved edit survives failed writes';
+    $('edited-message').value = failedText; $('edited-message').dispatchEvent(new Event('input', { bubbles: true }));
+    check($('edit-message-draft-status').textContent.includes('Disk write failed') && !$('edit-message-draft-status').hidden, 'A failed inline draft write did not show its status');
+    resetThread(); setThread(thread);
+    const rebuilt = renderItem(promptItem, false, 'metadata-editor-turn');
+    openMessageEdit(rebuilt);
+    saved.set(key(messageTarget), { text: 'Remote text while local storage is unavailable' }); await notify();
+    check($('edited-message').value === failedText && !$('edit-message-draft-status').hidden, 'Navigation or sync replaced an unwritten edit');
+    failMessageWrite = false;
+    $('edited-message').dispatchEvent(new Event('input', { bubbles: true }));
+    check($('edit-message-draft-status').hidden && lastWrite('edit-message').patch.text === failedText && lastWrite('edit-message').expected.text === null,
+      'The next successful save did not persist the retained text against its last read baseline');
+    failMessageWrite = true;
+    $('edited-message').value = 'Discard this failed edit'; $('edited-message').dispatchEvent(new Event('input', { bubbles: true }));
+    $('cancel-message-edit').click(); openMessageEdit(rebuilt);
+    check($('edited-message').value === 'Original message fallback' && $('edit-message-draft-status').hidden, 'Cancel left an old failed edit in memory');
+    $('cancel-message-edit').click(); failMessageWrite = false;
+
     const message = { draftId: 'metadata-queued-editor', text: 'Original queued fallback', images: [], input: [{ type: 'text', text: 'Original queued fallback' }] };
     const queue = { key: queueKey(thread.id), machine: accessKey(), thread, paused: true, messages: [message] }; state.queues.set(queue.key, queue);
     const queueTarget = editorTarget('edit-queue', thread, message.draftId); saved.set(key(queueTarget), { text: 'Saved queued local' });
@@ -4961,7 +5183,7 @@ module.exports = async () => {
     await testWindow.webContents.executeJavaScript("document.getElementById('thread-menu').hidden = true; document.querySelector('.edit-message').click()");
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(path.join(artifacts, 'edit-message.png'), (await testWindow.webContents.capturePage()).toPNG());
-    await testWindow.webContents.executeJavaScript("document.getElementById('edit-message-dialog').close(); document.getElementById('thread-menu').hidden = true");
+    await testWindow.webContents.executeJavaScript("document.getElementById('cancel-message-edit').click(); document.getElementById('thread-menu').hidden = true");
     for (const theme of ['purple', 'claude-code', 'light']) {
       await testWindow.webContents.executeJavaScript(`(async () => { document.getElementById('theme-select').value = ${JSON.stringify(theme)}; await document.getElementById('theme-select').onchange(); })()`);
       await new Promise(resolve => setTimeout(resolve, 100));

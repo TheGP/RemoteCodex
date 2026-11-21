@@ -2,6 +2,24 @@
 
 A desktop GUI for running Codex locally or on your server over SSH. Conversations are on the left, messages and tool activity on the right. Consecutive tool calls and thinking steps collapse into one live activity line; click it to expand or collapse the full log. Supports macOS and Windows.
 
+[Download the latest release](https://github.com/TheGP/RemoteCodex/releases/latest)
+
+## Screenshots
+
+**Workspace**
+
+![Remote Codex workspace with project conversations, a pinned reply, and prompt shortcuts](docs/screenshots/workspace.png)
+
+**Inline file diff**
+
+![Expanded code diff showing changed lines, word highlights, and counts excluding tests](docs/screenshots/inline-diff.png)
+
+**Edit & resend**
+
+![An earlier prompt being edited in its message bubble with Cancel and Save & resend controls](docs/screenshots/edit-and-resend.png)
+
+## Coding agents
+
 Coding agents use a shared provider interface. The model menu groups models by agent. Each chat keeps its own agent, and registered agents run simultaneously; choosing a model for a new chat never restarts another chat. Codex and ZCode use their installed runtimes; existing Codex pins, drafts, and queues keep their original identities. Claude Code remains a planned integration target. Architecture notes and the adapter contract are in [docs/providers.md](docs/providers.md).
 
 **Settings → Coding agents** enables Codex and ZCode independently. ZCode starts disabled; enable it after installing and signing in to its CLI. Executable paths are optional under local settings; use an absolute CLI executable or `.cjs` entry path when automatic discovery is unsuitable. Changing an agent's settings waits for its running tasks to finish while other agents' chats keep running. You can disable every agent and keep the app offline. ZCode offers **Ask before changes** and **Full access** using its native permission modes.
@@ -42,7 +60,7 @@ Pinned conversation titles use a muted yellow color. Queued messages have a six-
 
 Prompt typing batches draft writes after a 200 ms pause, with a save at least once per second during continuous typing. Switching chats, changing settings, sending, blurring the prompt, and closing flush immediately. Unsent composer drafts save separately for each conversation, new-chat project/folder, and machine. An idle conversation with unsent text or attachments shows a yellow dot; hover it to see **Unsent prompt**. Running chats keep their progress spinner. The dot survives chat switches and restarting, and clears when the draft is sent or removed. Text, attachments, model, reasoning, access, Plan mode, and send-time choice restore after restarting; the last unfinished chat or editor reopens without sending anything. Queue-editor and earlier-message editor text also survive restarting; Cancel explicitly discards that editor draft. Drafts clear after a successful send, queue save, or scheduled save; an unconfirmed send keeps its draft. Draft data is stored privately under the app data directory’s `drafts/` folder, with image files saved separately from text so typing does not rewrite them.
 
-In text-editing dialogs, including queued messages and **Edit & resend**, **Enter** submits the form and **Shift+Enter** adds a new line. A failed save keeps the editor open.
+In message editors, **Enter** submits and **Shift+Enter** adds a new line. **Edit & resend** opens inside the message bubble. Switching chats keeps the edit draft. If a disk write fails, the editor shows the error and keeps the text in memory for the current app session.
 
 Conversations show a spinner while Codex is working, a green dot when an unseen reply finishes, and a red dot if an unseen turn fails. App-owned runs interrupted by a restart also show a red **Interrupted** marker; they do not resume automatically. Runs on a shared server are left running. Completion dots and manual unread markers are saved in `preferences.json` separately for each machine and survive app restarts and updates. Existing manual unread markers migrate from browser storage automatically. Replies stay read while the app is focused and the latest messages are visible. Opening the conversation, returning to the app, or scrolling to the latest reply clears its marker. These indicators work for pinned and recent conversations.
 

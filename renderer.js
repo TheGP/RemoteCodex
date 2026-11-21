@@ -14,13 +14,16 @@ const drafts = { target: null, snapshot: null, images: [], suspended: false, res
 const composerAutosaveDelay = 3000;
 const editorDrafts = new Map();
 const timelineView = { following: true, reading: null };
+const recentTimelines = new Map();
+const initialTurnLimit = 8, olderTurnLimit = 25;
+const cachedTimelineLimit = 4, historyRefreshPageLimit = 4;
 const pinnedMessages = { saving: false, jumping: null };
 const conversationSync = { paths: {}, pathsMachine: null, status: null, statusOptions: null, refreshing: false, again: false, ownership: new Map(), historyEnabled: false };
 const observedTurns = new Map();
 const pinIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 9V3H8v6l-3 3v2h14v-2l-3-3M12 14v7"/></svg>';
 for (let hours = 1; hours < 24; hours++) $('send-time').add(new Option(`${hours} hour${hours === 1 ? '' : 's'}`, String(hours)));
 for (let days = 1; days <= 7; days++) $('send-time').add(new Option(`${days} day${days === 1 ? '' : 's'}`, String(days * 24)));
-const threadDrag = { source: null, pending: new Set(), orderPending: new Set(), type: 'application/x-remote-codex-thread' };
+const threadDrag = { source: null, marker: null, renderPending: false, pending: new Set(), orderPending: new Set(), type: 'application/x-remote-codex-thread' };
 const projectDrag = { source: null, pending: null, type: 'application/x-remote-codex-project' };
 const queueDrag = { source: null, type: 'application/x-remote-codex-queue' };
 const usage = { threads: new Map(), account: null, reading: null, generation: 0, updatedAt: 0, error: null, timer: null, model: null };
@@ -184,9 +187,13 @@ function saveComposerDraft(deferred = false) {
     return true;
   } catch (error) { failed(error); return false; }
 }
-function clearDraft(target, expected = target && editorDrafts.get(JSON.stringify(target))?.expected) {
-  if (!api.clearDraft || !target) return;
-  try { api.clearDraft(target, expected); editorDrafts.delete(JSON.stringify(target)); cacheDraftIndicator(target, false); } catch (error) { showError(`Could not clear saved draft: ${error.message}`); }
+const editorDraftKey = target => JSON.stringify([target.machine, target.kind, target.threadId, target.itemId]);
+function clearDraft(target, expected = target && editorDrafts.get(editorDraftKey(target))?.expected) {
+  if (!target) return;
+  const key = editorDraftKey(target);
+  if (target.kind === 'edit-message') editorDrafts.delete(key);
+  if (!api.clearDraft) return;
+  try { api.clearDraft(target, expected); editorDrafts.delete(key); cacheDraftIndicator(target, false); } catch (error) { showError(`Could not clear saved draft: ${error.message}`); }
 }
 function cacheDraftIndicator(target, pending) {
   if (target?.kind !== 'composer' || !target.threadId) return;
@@ -197,26 +204,32 @@ function cacheDraftIndicator(target, pending) {
 }
 function editorTarget(kind, thread, itemId) { return { machine: accessKey(), kind, threadId: thread.id, cwd: thread.cwd, projectId: thread.projectId || null, itemId }; }
 function editorText(target, text) {
+  const key = editorDraftKey(target);
+  const previous = editorDrafts.get(key);
+  if (previous?.unsaved) return previous.unsaved.text;
   try {
     const saved = api.draft?.(target);
-    editorDrafts.set(JSON.stringify(target), { fallback: text, expected: { text: saved?.text ?? null, ...(target.kind === 'edit-schedule' ? { runAt: saved?.runAt ?? null } : {}) } });
+    editorDrafts.set(key, { fallback: text, expected: { text: saved?.text ?? null, ...(target.kind === 'edit-schedule' ? { runAt: saved?.runAt ?? null } : {}) } });
     return saved?.text ?? text;
   } catch (error) { showError(`Could not restore editor draft: ${error.message}`); return text; }
 }
 function saveEditorDraft(target, text, settings = {}) {
   if (!target || !api.saveDraft) return;
+  const key = editorDraftKey(target), previous = editorDrafts.get(key);
   try {
-    const key = JSON.stringify(target), previous = editorDrafts.get(key);
     api.saveDraft(target, { text, ...settings }, previous?.expected);
     editorDrafts.set(key, { fallback: previous?.fallback ?? text, expected: { text, ...settings } });
-  } catch (error) { showError(`Could not save editor draft: ${error.message}`); }
+  } catch (error) {
+    if (target.kind === 'edit-message') editorDrafts.set(key, { ...previous, unsaved: { text, error: error.message } });
+    else showError(`Could not save editor draft: ${error.message}`);
+  }
 }
 function refreshEditorDrafts(before) {
-  const editors = [['edit-message-dialog', 'edited-message', state.messageEdit], ['edit-queue-dialog', 'queued-text', state.queueEdit], ['edit-schedule-dialog', 'scheduled-text', schedules.editing]];
-  for (const [dialog, input, editor] of editors) {
-    if (!$(dialog).open || !editor?.draftTarget || editor.saving) continue;
-    const key = JSON.stringify(editor.draftTarget), previous = editorDrafts.get(key);
-    if (!previous || previous !== before.get(key)) continue;
+  const editors = [[!$('edit-message-form').hidden && !state.resending, 'edited-message', state.messageEdit], [$('edit-queue-dialog').open, 'queued-text', state.queueEdit], [$('edit-schedule-dialog').open, 'scheduled-text', schedules.editing]];
+  for (const [open, input, editor] of editors) {
+    if (!open || !editor?.draftTarget || editor.saving) continue;
+    const key = editorDraftKey(editor.draftTarget), previous = editorDrafts.get(key);
+    if (!previous || previous.unsaved || previous !== before.get(key)) continue;
     const saved = api.draft(editor.draftTarget), value = saved?.text ?? previous.fallback, control = $(input);
     if (control.value !== value) {
       const { selectionStart, selectionEnd, selectionDirection, scrollTop } = control;
@@ -631,7 +644,7 @@ function updateSendButton() {
   $('send').title = stop ? 'Stop task' : busy ? 'Send after the current turn finishes' : 'Send message';
   $('send').setAttribute('aria-label', stop ? 'Stop task' : 'Send message');
   $('send').disabled = !stop && modelUnavailable() || agentMetadata(selectedProvider())?.connected === false || !state.connected || state.connecting || state.sending || state.commandBusy || state.loading || interrupting || queueLocked(state.queues.get(queueKey(state.thread?.id))) || state.images.some(image => !image.url);
-  if (!stop && conversationReadOnly()) $('send').disabled = true;
+  if (!stop && (state.messageEdit || conversationReadOnly())) $('send').disabled = true;
   $('send-time').disabled = $('send').disabled;
   renderConversationAccess();
 }
@@ -659,10 +672,10 @@ function updateBusy() {
   $('attach-images').disabled = state.sending || state.loading;
   $('prompt').disabled = state.loading || state.connecting || drafts.suspended;
   $('prompt').readOnly = state.sending || Boolean(state.commandBusy);
-  $('timeline').classList.toggle('loading', state.loading);
+  $('timeline').classList.toggle('loading', state.loading && !state.historyView);
   $('activity').classList.toggle('busy', busy && !waiting);
   $('activity').classList.toggle('waiting', Boolean(waiting));
-  $('activity').textContent = state.sending ? 'Sending…' : state.loading ? 'Loading conversation…' : waiting || (compact ? 'Compacting context…' : busy ? `${agentName()} is working ${isLocal() ? 'locally' : 'on the server'}…` : '');
+  $('activity').textContent = state.sending ? 'Sending…' : state.loading ? (state.historyView ? 'Refreshing conversation…' : 'Loading conversation…') : waiting || (compact ? 'Compacting context…' : busy ? `${agentName()} is working ${isLocal() ? 'locally' : 'on the server'}…` : '');
   $('model').disabled = state.loading || busy;
   $('effort').disabled = state.loading || busy;
   $('permissions').disabled = state.loading || busy;
@@ -670,9 +683,6 @@ function updateBusy() {
   $('plan-mode').hidden = !modes.plan;
   $('browse-workspace').disabled = !state.connected || state.sending || state.loading;
   $('choose-project').disabled = !state.connected || state.sending || state.loading;
-  $('resend-message').disabled = Boolean(state.resending || state.messageEdit?.uncertain);
-  $('cancel-message-edit').disabled = Boolean(state.resending);
-  $('edited-message').readOnly = Boolean(state.resending);
   renderQueue();
   renderSchedules();
   renderThreadIndicators();
@@ -684,13 +694,18 @@ function updateBusy() {
 function updateMessageEdits() {
   const turns = new Set();
   const nativeEdit = supportsNativeEdit(state.thread);
+  const readOnly = conversationReadOnly();
+  const running = state.active.has(state.thread?.id);
+  $('resend-message').disabled = Boolean(state.resending || state.messageEdit?.uncertain || readOnly || running);
+  $('cancel-message-edit').disabled = Boolean(state.resending);
+  $('edited-message').readOnly = Boolean(state.resending);
   for (const button of $('timeline').querySelectorAll('.edit-message')) {
     const turnId = button.dataset.turnId;
     button.hidden = turns.has(turnId) || Boolean(nativeEdit && button.dataset.canEdit !== 'true');
     if (!button.hidden) turns.add(turnId);
-    button.disabled = conversationReadOnly() || state.sending || state.commandBusy || state.loading || state.active.has(state.thread?.id)
+    button.disabled = readOnly || state.sending || state.commandBusy || state.loading || state.historyLoadFailed || running
       || (nativeEdit ? Boolean(state.nativeQueues.get(state.thread?.id)?.items.length) : !state.connected || modelUnavailable() || !supports('thread/revert'));
-    button.title = state.active.has(state.thread?.id) ? 'Stop the running task before editing' : 'Edit and resend in this conversation';
+    button.title = running ? 'Stop the running task before editing' : 'Edit and resend in this conversation';
   }
 }
 function supportsNativeEdit(thread) {
@@ -871,6 +886,10 @@ async function saveMessagePin(pin, pinned) {
   } finally { pinnedMessages.saving = false; renderMessagePins(); scrollToBottom(); }
 }
 function hidePinContext() {
+  if (pinnedMessages.context?.contains($('edit-message-form'))) {
+    closeMessageEdit({ save: true });
+    updateBusy();
+  }
   pinnedMessages.context?.remove(); pinnedMessages.context = null;
 }
 function showPinContext(record) {
@@ -940,6 +959,8 @@ async function jumpToMessagePin(pin, context = false) {
   finally { if (pinnedMessages.jumping === operation) { pinnedMessages.jumping = null; if (pinnedMessages.context) pinnedMessages.context.querySelector('.load-pin-context').disabled = !state.turnCursor; renderMessagePins(); } }
 }
 function renderThreads() {
+  if (threadDrag.source) { threadDrag.renderPending = true; return; }
+  threadDrag.renderPending = false;
   const focusedThread = $('threads').contains(document.activeElement) ? document.activeElement.closest('.thread')?.dataset.threadId : null;
   const fragment = document.createDocumentFragment();
   const search = $('search').value.trim().toLowerCase();
@@ -961,6 +982,7 @@ function renderThreads() {
     const label = document.createElement('div'); label.className = 'list-heading thread-group'; label.textContent = text; target.append(label);
   };
   const row = (thread, target = fragment) => {
+    const projectId = thread.projectId || null;
     const container = document.createElement('div'); container.className = 'thread-row' + (state.pinnedIds.has(thread.id) ? ' pinned-thread' : '');
     const button = document.createElement('button');
     button.className = 'thread' + (state.thread?.id === thread.id ? ' selected' : '');
@@ -978,14 +1000,15 @@ function renderThreads() {
     };
     button.draggable = state.connected && !threadDrag.orderPending.has(JSON.stringify([accessKey(), thread.projectId]));
     button.ondragstart = event => {
-      if (!button.draggable || threadDrag.pending.has(queueKey(thread.id)) || state.archiving?.threadId === thread.id || !event.dataTransfer) { event.preventDefault(); return; }
+      if (!state.connected || !button.draggable || threadDrag.pending.has(queueKey(thread.id)) || state.archiving?.threadId === thread.id || !event.dataTransfer) { event.preventDefault(); return; }
       clearThreadDrag();
       clearProjectDrag();
-      threadDrag.source = { thread, options: state.options, token: crypto.randomUUID() };
+      const searchGroups = $('threads').querySelectorAll('[data-search-hidden]');
+      threadDrag.source = { threadId: thread.id, projectId, button, searchGroups, options: state.options, token: crypto.randomUUID() };
       event.dataTransfer.setData(threadDrag.type, threadDrag.source.token);
       event.dataTransfer.setData('text/plain', titleOf(thread)); event.dataTransfer.effectAllowed = 'move';
       button.classList.add('dragging'); $('thread-menu').hidden = true;
-      for (const group of $('threads').querySelectorAll('[data-search-hidden]')) group.hidden = false;
+      for (const group of searchGroups) group.hidden = false;
     };
     button.ondragend = clearThreadDrag;
     if (thread.projectId) bindThreadOrder(container, thread);
@@ -1008,7 +1031,7 @@ function renderThreads() {
     const hiddenBySearch = Boolean(search && !members.length);
     if (!hiddenBySearch) hasProjectGroups = true;
     const group = document.createElement('section'); group.className = 'project-group'; group.dataset.projectId = project.id;
-    if (hiddenBySearch) { group.dataset.searchHidden = 'true'; group.hidden = !threadDrag.source; }
+    if (hiddenBySearch) { group.dataset.searchHidden = 'true'; group.hidden = true; }
     if (!project.needsFolder) bindThreadDrop(group, project.id);
     const header = document.createElement('div'); header.className = 'project-heading';
     if (!project.needsFolder) bindProjectDrag(group, header, project);
@@ -1477,11 +1500,14 @@ function readMissingPin(threadId) {
   return request;
 }
 function resetThread(folder) {
+  closeMessageEdit({ save: true });
+  rememberTimeline();
+  state.historyView = null;
   setTimelineFollowing(true);
   pinnedMessages.jumping = null; state.olderHistory = null; $('older-turns').disabled = false;
   saveComposerDraft(); drafts.target = null;
   clearQueueDrag();
-  imageLoads.clear(); $('image-preview-dialog').close();
+  imageLoads.clear(); historyImageObserver.disconnect(); $('image-preview-dialog').close();
   state.selection++;
   const project = projects.data.find(project => project.id === projects.selected);
   if (typeof folder === 'string') $('workspace').value = folder;
@@ -1494,7 +1520,7 @@ function resetThread(folder) {
   state.historyLoadFailed = false;
   state.thread = null;
   $('send-time').value = '0';
-  state.items.clear();
+  state.items = new Map();
   state.turnCursor = null;
   $('messages').replaceChildren();
   $('welcome').hidden = false;
@@ -1563,27 +1589,165 @@ $('cancel-note').onclick = () => $('note-dialog').close();
 $('note-dialog').oncancel = event => { if (noteEditor.saving) event.preventDefault(); };
 $('note-dialog').onclose = () => { noteEditor.target = null; };
 
+function timelinePosition() {
+  return { top: $('timeline').scrollTop, following: timelineView.following && timelineAtBottom(), reading: timelineView.reading };
+}
+function restoreTimelinePosition(position) {
+  setTimelineFollowing(position.following, position.reading?.isConnected ? position.reading : null);
+  if (position.following) scrollToBottom();
+  else $('timeline').scrollTop = position.top;
+}
+function rememberTimeline() {
+  const view = state.historyView;
+  if (!view || view.options !== state.options || view.threadId !== state.thread?.id || state.historyLoadFailed) return;
+  const rows = [...$('messages').children];
+  const pending = rows.filter(row => row.dataset.itemId?.startsWith('pending-'));
+  const items = pending.length ? new Map(state.items) : state.items;
+  for (const row of pending) items.delete(row.dataset.itemId);
+  recentTimelines.delete(view.threadId);
+  recentTimelines.set(view.threadId, {
+    view, items, rows: pending.length ? rows.filter(row => !row.dataset.itemId?.startsWith('pending-')) : rows, context: pinnedMessages.context,
+    cursor: state.turnCursor, position: timelinePosition()
+  });
+  if (recentTimelines.size > cachedTimelineLimit) recentTimelines.delete(recentTimelines.keys().next().value);
+}
+function restoreCachedTimeline(cached) {
+  state.historyView = cached.view;
+  state.items = cached.items;
+  state.turnCursor = cached.cursor;
+  $('older-turns').hidden = !cached.cursor;
+  $('messages').replaceChildren(...cached.rows);
+  if (cached.context) { pinnedMessages.context = cached.context; $('messages').before(cached.context); }
+}
+async function readInitialTurns(threadId, view, current) {
+  const params = { threadId, sortDirection: 'desc', itemsView: 'full' };
+  const latest = await rpc('thread/turns/list', { ...params, limit: initialTurnLimit });
+  if (!view?.turns.size || !current()) return latest;
+  let history = latest;
+  const seen = new Set();
+  const cachedEnds = new Map();
+  const overlaps = turn => {
+    if (!view.turns.has(turn.id)) return false;
+    if (turn.historyStartRowId == null) return true;
+    if (!cachedEnds.has(turn.id)) {
+      const cached = view.turns.get(turn.id);
+      let end = cached?.historyEndRowId ?? cached?.items?.at(-1)?.historyRowId ?? -Infinity;
+      if (view.dirtyTurns.has(turn.id)) {
+        for (const record of state.items.values()) {
+          if (record.container === $('messages') && record.turnId === turn.id && Number.isSafeInteger(record.item.historyRowId)) end = Math.max(end, record.item.historyRowId);
+        }
+      }
+      cachedEnds.set(turn.id, end);
+    }
+    // A ZCode turn can span multiple windows of native rows.
+    return turn.historyStartRowId <= cachedEnds.get(turn.id) + 1;
+  };
+  while (history.nextCursor && !seen.has(history.nextCursor) && seen.size < historyRefreshPageLimit && !history.data.some(overlaps)) {
+    seen.add(history.nextCursor);
+    const page = await rpc('thread/turns/list', { ...params, cursor: history.nextCursor, limit: olderTurnLimit });
+    if (!current()) return latest;
+    history = { ...history, data: [...history.data, ...page.data], nextCursor: page.nextCursor };
+  }
+  const overlap = history.data.findLastIndex(overlaps);
+  if (overlap < 0) return { ...latest, replaceCached: true };
+  if (overlap === history.data.length - 1) return history;
+  const boundary = history.data[overlap], cachedStart = view.turns.get(boundary.id)?.historyStartRowId;
+  if (cachedStart != null && (boundary.historyStartRowId == null || boundary.historyStartRowId < cachedStart)) return history;
+  return { ...history, data: history.data.slice(0, overlap + 1), keepCursor: true };
+}
+function mergeHistoryTurn(older, newer) {
+  const start = newer.historyStartRowId;
+  if (!older || start == null || older.historyStartRowId >= start) return newer;
+  return { ...older, historyEndRowId: newer.historyEndRowId, items: [...older.items.filter(item => item.historyRowId < start), ...newer.items] };
+}
+function newHistoryView(thread, turns = new Map()) {
+  return { options: state.options, threadId: thread.id, path: thread.path, cwd: thread.cwd, turns, dirtyTurns: new Set() };
+}
+function applyInitialTurns(history, thread, view) {
+  const freshTurns = new Map();
+  for (const turn of [...history.data].reverse()) freshTurns.set(turn.id, mergeHistoryTurn(freshTurns.get(turn.id), turn));
+  const fresh = [...freshTurns.values()];
+  const older = view ? [...view.turns.keys()] : [];
+  const overlap = older.indexOf(fresh[0]?.id);
+  const boundary = fresh[0];
+  let cachedBoundary = view?.turns.get(boundary?.id);
+  if (boundary?.historyStartRowId != null && view?.dirtyTurns.has(boundary.id)) {
+    const items = [...state.items.values()]
+      .filter(record => record.container === $('messages') && record.turnId === boundary.id && record.item.historyRowId < boundary.historyStartRowId)
+      .map(record => record.item).sort((a, b) => a.historyRowId - b.historyRowId);
+    if (items.length) cachedBoundary = { ...(cachedBoundary || boundary), historyStartRowId: cachedBoundary?.historyStartRowId, items };
+  }
+  const mergedBoundary = boundary && mergeHistoryTurn(cachedBoundary, boundary);
+  const keepOlder = overlap > 0 || mergedBoundary !== boundary;
+  if (boundary) fresh[0] = mergedBoundary;
+  let keep = Math.max(0, overlap), unchanged = 0;
+  if (overlap >= 0) {
+    while (unchanged < fresh.length && older[keep] === fresh[unchanged].id && !view.dirtyTurns.has(older[keep]) && JSON.stringify(view.turns.get(older[keep])) === JSON.stringify(fresh[unchanged])) {
+      keep++; unchanged++;
+    }
+  }
+  const position = state.historyView ? timelinePosition() : null;
+  const messages = $('messages'), timeline = $('timeline');
+  const replacing = older.length > keep || state.historyView && !view;
+  const anchor = position && !position.following && replacing
+    ? position.reading || [...messages.children].find(row => row.getBoundingClientRect().bottom > timeline.getBoundingClientRect().top)
+    : null;
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  if (state.historyView && overlap < 0) {
+    hidePinContext(); messages.replaceChildren(); state.items.clear();
+  } else if (replacing) {
+    const removed = new Set(older.slice(keep));
+    for (const row of [...messages.children]) if (removed.has(row.dataset.turnId)) row.remove();
+    for (const [id, record] of state.items) if (record.container === messages && removed.has(record.turnId)) state.items.delete(id);
+  }
+  const turns = new Map(older.slice(0, keep).map(id => [id, view.turns.get(id)]));
+  for (const turn of fresh.slice(unchanged)) {
+    turns.set(turn.id, turn);
+    for (const item of turn.items || []) renderItem(item, false, turn.id, messages, true);
+  }
+  state.historyView = newHistoryView(thread, turns);
+  for (const id of older.slice(0, Math.max(0, overlap))) if (view.dirtyTurns.has(id)) state.historyView.dirtyTurns.add(id);
+  if (!keepOlder && !history.keepCursor) state.turnCursor = history.nextCursor;
+  $('older-turns').hidden = !state.turnCursor;
+  if (position) {
+    const anchorId = anchor?.dataset.itemId;
+    const replacement = anchor?.isConnected ? anchor : anchorId ? state.items.get(anchorId)?.element : [...messages.children].find(row => row.dataset.turnId === anchor?.dataset.turnId);
+    restoreTimelinePosition(position);
+    if (replacement && anchorTop !== undefined) timeline.scrollTop += replacement.getBoundingClientRect().top - anchorTop;
+  } else scrollToBottom(true);
+  observeHistoryImages();
+}
+
 async function openThread(thread, allowBusy = false, refreshHistory = false) {
   if (!state.connected || state.sending || state.commandBusy && !allowBusy) return;
   if (thread.needsFolder) {
     const project = projects.data.find(project => project.id === thread.projectId);
     if (project) return chooseSharedProjectFolder(project);
   }
+  closeMessageEdit({ save: true });
+  const switching = state.thread?.id !== thread.id;
+  if (switching) rememberTimeline();
+  const stored = recentTimelines.get(thread.id);
+  const cached = switching && !refreshHistory && stored?.view.options === state.options ? stored : null;
+  recentTimelines.delete(thread.id);
   setTimelineFollowing(true);
   pinnedMessages.jumping = null; state.olderHistory = null; $('older-turns').disabled = false;
   state.turnCursor = null; $('older-turns').hidden = true;
   if (state.thread?.id !== thread.id) { saveComposerDraft(); drafts.target = null; }
   const selection = ++state.selection;
-  imageLoads.clear(); $('image-preview-dialog').close();
+  imageLoads.clear(); historyImageObserver.disconnect(); $('image-preview-dialog').close();
   $('error').hidden = true;
   if (state.thread?.id !== thread.id) { state.images = []; renderImages(); }
   state.loading = true;
   state.historyLoadFailed = false;
-  state.items.clear();
+  state.historyView = null;
+  state.items = new Map();
   state.historyEvents = [];
-  $('messages').replaceChildren();
+  if (cached) restoreCachedTimeline(cached);
+  else $('messages').replaceChildren();
   try {
     setThread(thread);
+    if (cached) { restoreTimelinePosition(cached.position); observeHistoryImages(); }
     const shared = !isLocal() && state.options?.sharedServer && threadProvider(thread) === 'codex';
     let result;
     try {
@@ -1598,11 +1762,10 @@ async function openThread(thread, allowBusy = false, refreshHistory = false) {
     }
     if (selection !== state.selection) return;
     setThread(result.thread);
-    const history = await rpc('thread/turns/list', { threadId: thread.id, limit: 25, sortDirection: 'desc', itemsView: 'full' });
+    const view = cached && (cached.view.path == null || cached.view.path === result.thread.path) && cached.view.cwd === result.thread.cwd ? cached.view : null;
+    const history = await readInitialTurns(thread.id, view, () => selection === state.selection);
     if (selection !== state.selection) return;
-    state.turnCursor = history.nextCursor;
     if (history.data[0]?.id) observedTurns.set(queueKey(thread.id), history.data[0].id);
-    $('older-turns').hidden = !state.turnCursor;
     state.active.delete(thread.id);
     compacting.delete(thread.id);
     for (const turn of [...history.data].reverse()) {
@@ -1611,48 +1774,66 @@ async function openThread(thread, allowBusy = false, refreshHistory = false) {
         const last = turn.items?.at(-1);
         if (last?.type === 'contextCompaction' && Number.isFinite(last.startedAtMs) && last.completedAtMs == null) compacting.set(thread.id, { itemId: last.id, turnId: turn.id });
       }
-      for (const item of turn.items || []) renderItem(item, false, turn.id);
     }
+    applyInitialTurns(history, result.thread, history.replaceCached ? null : view);
     const buffered = state.historyEvents;
     state.historyEvents = null;
     for (const event of buffered) {
       if (event.receivedSequence > history.receivedSequence) handleNotification(event);
     }
-    await Promise.allSettled([...$('messages').querySelectorAll('img')].map(image => image.decode()));
-    if (selection !== state.selection) return;
-    scrollToBottom(true);
-    if (!isManuallyUnread(thread.id)) setUnread(thread.id, false);
-    setCompletion(thread.id); renderThreadIndicators();
+    if (timelineView.following) {
+      scrollToBottom();
+      if (!isManuallyUnread(thread.id)) setUnread(thread.id, false);
+      setCompletion(thread.id); renderThreadIndicators();
+    }
   } catch (error) {
-    if (selection === state.selection) state.historyLoadFailed = true;
+    if (selection !== state.selection) return;
+    state.historyLoadFailed = true;
+    state.turnCursor = null; $('older-turns').hidden = true;
     throw error;
   } finally {
     if (selection === state.selection) { state.loading = false; state.historyEvents = null; updateBusy(); flushQueue(thread.id).catch(showError); }
   }
 }
-function imagePath(source) {
+function imagePath(source, workspace = state.thread?.cwd || $('workspace').value || '/') {
   if (source.startsWith('sandbox:')) source = source.slice(8);
   if (/^[a-z]:[\\/]/i.test(source)) source = 'file:///' + source.replace(/\\/g, '/');
-  const cwd = (state.thread?.cwd || $('workspace').value || '/').replace(/\\/g, '/');
+  const cwd = workspace.replace(/\\/g, '/');
   const base = 'file://' + (cwd.startsWith('/') ? '' : '/') + encodeURI(cwd).replace(/#/g, '%23').replace(/\?/g, '%3F').replace(/\/$/, '') + '/';
   const url = new URL(source, base);
   if (url.protocol !== 'file:' || url.hostname) throw new Error('Only images on the connected machine are supported.');
   return decodeURIComponent(url.pathname).replace(/^\/([a-z]:\/)/i, '$1');
 }
-function messageImage(source, alt = 'Image') {
+const pendingHistoryImages = new WeakMap();
+const historyImageObserver = new IntersectionObserver(entries => {
+  for (const { target, isIntersecting } of entries) {
+    if (!isIntersecting || !target.isConnected) continue;
+    historyImageObserver.unobserve(target);
+    const load = pendingHistoryImages.get(target);
+    pendingHistoryImages.delete(target);
+    target.removeAttribute('data-deferred-image');
+    if (load) target.imageReady = load();
+  }
+}, { root: $('timeline'), rootMargin: '160px 0px' });
+function observeHistoryImages() {
+  historyImageObserver.disconnect();
+  for (const figure of $('timeline').querySelectorAll('[data-deferred-image]')) historyImageObserver.observe(figure);
+}
+function messageImage(source, alt = 'Image', defer = false) {
   const figure = document.createElement('figure'); figure.className = 'message-figure';
   const image = document.createElement('img'); image.className = 'message-image'; image.alt = alt;
   const caption = document.createElement('figcaption'); caption.textContent = 'Loading image…';
   figure.append(caption);
   const options = state.options;
-  const ready = (async () => {
+  const cwd = state.thread?.cwd || $('workspace').value || '/', provider = selectedProvider();
+  const load = async () => {
     if (typeof source !== 'string' || !source) throw new Error('Image source is missing.');
     let url = source;
     if (!source.startsWith('data:')) {
-      const file = imagePath(source);
+      const file = imagePath(source, cwd);
       if (!imageLoads.has(file)) {
         if (imageLoads.size >= 20) imageLoads.delete(imageLoads.keys().next().value);
-        const request = api.readImage(file, { provider: selectedProvider() }).catch(error => { if (imageLoads.get(file) === request) imageLoads.delete(file); throw error; });
+        const request = api.readImage(file, { provider }).catch(error => { if (imageLoads.get(file) === request) imageLoads.delete(file); throw error; });
         imageLoads.set(file, request);
       }
       url = await imageLoads.get(file);
@@ -1668,13 +1849,15 @@ function messageImage(source, alt = 'Image') {
     image.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); image.click(); } };
     figure.replaceChildren(image);
     if (atBottom && figure.isConnected) scrollToBottom();
-  })().catch(error => { if (options === state.options) { caption.textContent = `Could not load image: ${error.message}`; figure.replaceChildren(caption); } });
-  figure.imageReady = ready;
+  };
+  const start = () => load().catch(error => { if (options === state.options) { caption.textContent = `Could not load image: ${error.message}`; figure.replaceChildren(caption); } });
+  if (defer) { figure.dataset.deferredImage = ''; pendingHistoryImages.set(figure, start); historyImageObserver.observe(figure); }
+  else figure.imageReady = start();
   return figure;
 }
 $('close-image-preview').onclick = () => $('image-preview-dialog').close();
 $('image-preview-dialog').onclose = () => $('image-preview').removeAttribute('src');
-function markdown(element, text) {
+function markdown(element, text, deferImages = false) {
   const images = [];
   const renderer = new marked.Renderer();
   renderer.link = function(token) {
@@ -1704,7 +1887,7 @@ function markdown(element, text) {
   for (const link of element.querySelectorAll('a[href]')) linkContexts.set(link, { machine: accessKey(), threadId: state.thread?.id, provider: threadProvider(state.thread), cwd: state.thread?.cwd || $('workspace').value });
   for (const placeholder of element.querySelectorAll('[data-codex-image]')) {
     const token = images[Number(placeholder.dataset.codexImage)];
-    if (token) placeholder.replaceWith(messageImage(token.href, token.text || 'Image')); else placeholder.remove();
+    if (token) placeholder.replaceWith(messageImage(token.href, token.text || 'Image', deferImages)); else placeholder.remove();
   }
 }
 function diffWordRanges(before, after) {
@@ -1937,7 +2120,30 @@ function renderFileSummary(turnId) {
   for (const entry of entries.values()) entry.remove();
   updateToggleTitle();
 }
-function renderItem(item, prepend = false, turnId = null, container = $('messages')) {
+function renderToolBody(record, deferImages) {
+  const { item, body } = record;
+  if (item.type === 'commandExecution') {
+    body.textContent = (item.command || 'Command') + '\n\n' + (item.aggregatedOutput || (isLocal() ? 'Running locally…' : 'Running on the server…'));
+  } else if (item.type === 'fileChange') {
+    body.textContent = item.changes?.map(change => `${change.path}\n${change.diff || ''}`).join('\n\n') || '';
+  } else if (item.type === 'reasoning') {
+    body.textContent = (item.summary || []).join('\n');
+  } else if (item.type === 'contextCompaction') {
+    body.textContent = 'Condenses earlier messages so the conversation can continue.';
+  } else {
+    const output = item.result || item.output || item.contentItems || item.arguments || item;
+    const content = Array.isArray(output) ? output : output.content || [];
+    const images = Array.isArray(content) ? content.filter(part => ['image', 'input_image', 'inputImage'].includes(part.type)) : [];
+    body.textContent = JSON.stringify(output, (key, value) => value && ['image', 'input_image', 'inputImage'].includes(value.type) ? { type: value.type, image: '[Image data]' } : value, 2);
+    for (const part of images) body.append(messageImage(part.image_url || part.imageUrl || part.url || (part.data ? `data:${part.mimeType};base64,${part.data}` : null), 'Tool image', deferImages));
+    if (!deferImages && images.length && !record.hasImages) {
+      record.element.open = true;
+      record.group.open = true;
+      record.hasImages = true;
+    }
+  }
+}
+function renderItem(item, prepend = false, turnId = null, container = $('messages'), fromHistory = false) {
   if (!item?.id) return;
   const anchor = timelineView.reading;
   const anchorTop = anchor?.isConnected && anchor.checkVisibility() ? anchor.getBoundingClientRect().top : null;
@@ -1946,6 +2152,7 @@ function renderItem(item, prepend = false, turnId = null, container = $('message
   if (!isMessage && !['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'reasoning', 'webSearch', 'collabAgentToolCall', 'functionCallOutput', 'contextCompaction'].includes(item.type)) return;
   if (!record) {
     const element = document.createElement(isMessage ? 'article' : 'details');
+    element.dataset.itemId = item.id;
     element.className = isMessage ? `message ${item.type}` : 'tool';
     const label = document.createElement(isMessage ? 'div' : 'summary');
     label.className = 'message-label';
@@ -1997,7 +2204,7 @@ function renderItem(item, prepend = false, turnId = null, container = $('message
     record.body.replaceChildren();
     for (const part of item.content || []) {
       if (part.type === 'text') record.body.append(document.createTextNode(part.text));
-      else if (part.type === 'image' || part.type === 'localImage') record.body.append(messageImage(part.url || part.path, 'Attached image'));
+      else if (part.type === 'image' || part.type === 'localImage') record.body.append(messageImage(part.url || part.path, 'Attached image', fromHistory));
     }
   } else if (isMessage) {
     if (record.label.dataset.type !== item.type) {
@@ -2009,34 +2216,32 @@ function renderItem(item, prepend = false, turnId = null, container = $('message
     if (item.type === 'imageView' || item.type === 'imageGeneration') {
       record.body.replaceChildren();
       const source = item.path || item.savedPath || (item.result ? `data:image/png;base64,${item.result}` : null);
-      if (source) record.body.append(messageImage(source, item.type === 'imageView' ? 'Image preview' : 'Generated image'));
+      if (source) record.body.append(messageImage(source, item.type === 'imageView' ? 'Image preview' : 'Generated image', fromHistory));
       else record.body.textContent = item.failure?.message || (item.status === 'inProgress' ? 'Generating image…' : 'Image is unavailable.');
-    } else markdown(record.body, item.type === 'exitedReviewMode' ? item.review : item.text);
+    } else markdown(record.body, item.type === 'exitedReviewMode' ? item.review : item.text, fromHistory);
   } else if (item.type === 'commandExecution') {
     const command = item.command || 'Command';
     record.label.textContent = `${item.status === 'inProgress' ? '◌' : item.exitCode ? '×' : '✓'} ${command.split(/\r?\n/)[0]}`;
     record.label.title = 'Expand command and output';
-    record.body.textContent = command + '\n\n' + (item.aggregatedOutput || (isLocal() ? 'Running locally…' : 'Running on the server…'));
   } else if (item.type === 'fileChange') {
     record.label.textContent = `Files · ${item.status || 'Updating'}`;
-    record.body.textContent = item.changes?.map(change => `${change.path}\n${change.diff || ''}`).join('\n\n') || '';
   } else if (item.type === 'reasoning') {
     record.label.textContent = 'Thinking';
-    record.body.textContent = (item.summary || []).join('\n');
   } else if (item.type === 'contextCompaction') {
     record.label.textContent = 'Context compaction';
-    record.body.textContent = 'Condenses earlier messages so the conversation can continue.';
   } else {
     record.label.textContent = item.type === 'functionCallOutput' ? `${item.namespace || ''} ${item.name || 'Tool result'}` : `${item.server || ''} ${item.tool || item.type} · ${item.status || ''}`;
-    const output = item.result || item.output || item.contentItems || item.arguments || item;
-    const content = Array.isArray(output) ? output : output.content || [];
-    const images = Array.isArray(content) ? content.filter(part => ['image', 'input_image', 'inputImage'].includes(part.type)) : [];
-    record.body.textContent = JSON.stringify(output, (key, value) => value && ['image', 'input_image', 'inputImage'].includes(value.type) ? { type: value.type, image: '[Image data]' } : value, 2);
-    for (const part of images) record.body.append(messageImage(part.image_url || part.imageUrl || part.url || (part.data ? `data:${part.mimeType};base64,${part.data}` : null), 'Tool image'));
-    if (images.length && !record.hasImages) {
-      record.element.open = true;
-      record.group.open = true;
-      record.hasImages = true;
+  }
+  if (!isMessage) {
+    if (fromHistory && !record.element.open) {
+      record.element.ontoggle = () => {
+        if (!record.element.open) return;
+        record.element.ontoggle = null;
+        renderToolBody(record, true);
+      };
+    } else {
+      record.element.ontoggle = null;
+      renderToolBody(record, fromHistory);
     }
   }
   if (isMessage) {
@@ -2251,7 +2456,7 @@ async function executeSlash(value) {
   finally { state.commandBusy = false; updateBusy(); }
 }
 function editQueuedMessage(queue, message) {
-  if (state.dispatching.has(queue.key) || queue.saving || queueLocked(queue)) return;
+  if (state.dispatching.has(queue.key) || queue.saving || queue.editing || queueLocked(queue)) return;
   if (!message.draftId) { message.draftId = crypto.randomUUID(); api.saveQueue({ key: queue.key, machine: queue.machine, thread: queue.thread, messages: queue.messages, paused: queue.paused }).catch(showError); }
   const draftTarget = editorTarget('edit-queue', queue.thread, message.draftId);
   state.queueEdit = { queue, message, draftTarget }; queue.editing = true;
@@ -2263,7 +2468,7 @@ $('edit-queue-form').onsubmit = async event => {
   event.preventDefault();
   const target = state.queueEdit; const text = $('queued-text').value.trim();
   if (!target || target.queue.saving || (!text && !target.message.images.length)) return;
-  const expected = editorDrafts.get(JSON.stringify(target.draftTarget))?.expected;
+  const expected = editorDrafts.get(editorDraftKey(target.draftTarget))?.expected;
   const previous = { text: target.message.text, input: target.message.input };
   target.message.text = text;
   target.message.input = [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...target.message.input.filter(part => part.type !== 'text' && part.type !== 'skill'), ...skillInputs(text, target.message.input.filter(part => part.type === 'skill'), target.queue.thread.cwd)];
@@ -2472,7 +2677,7 @@ $('edit-schedule-form').onsubmit = async event => {
   event.preventDefault();
   const target = schedules.editing;
   if (!target || target.saving || state.options !== target.options || state.selection !== target.selection) return;
-  const expected = editorDrafts.get(JSON.stringify(target.draftTarget))?.expected;
+  const expected = editorDrafts.get(editorDraftKey(target.draftTarget))?.expected;
   target.saving = true;
   for (const id of ['scheduled-text', 'scheduled-time', 'save-schedule-edit', 'cancel-schedule-edit']) $(id).disabled = true;
   try {
@@ -2598,13 +2803,13 @@ function renderQueue() {
     bindQueueDrop(row, queue, message); row.append(handle);
     const label = document.createElement('button'); label.type = 'button'; label.className = 'queued-copy';
     label.title = 'Edit queued message';
-    label.disabled = state.dispatching.has(queue.key) || Boolean(queue.saving) || queueLocked(queue);
+    label.disabled = state.dispatching.has(queue.key) || Boolean(queue.saving || queue.editing) || queueLocked(queue);
     label.onclick = () => editQueuedMessage(queue, message);
     label.textContent = (queue.paused ? 'Waiting · ' : 'Queued · ') + (message.text || `${message.images.length} image(s)`);
     row.append(label);
     const action = (text, run) => {
       const button = document.createElement('button'); button.type = 'button'; button.className = 'subtle'; button.textContent = text;
-      button.disabled = state.sending || state.dispatching.has(queue.key) || Boolean(queue.saving) || queueLocked(queue) || !state.connected;
+      button.disabled = state.sending || state.dispatching.has(queue.key) || Boolean(queue.saving || queue.editing) || queueLocked(queue) || !state.connected;
       button.onclick = () => { if (!queueLocked(queue)) return run().catch(showError); }; row.append(button);
     };
     action('Edit', async () => editQueuedMessage(queue, message));
@@ -2779,7 +2984,7 @@ async function flushQueue(threadId, repairReasoning = false) {
 }
 function shortcutUnavailable(shortcut) {
   if (shortcut?.mode === 'fill') return state.connecting || state.sending || state.loading || state.commandBusy || drafts.suspended;
-  return conversationReadOnly() || modelUnavailable() || !state.connected || state.connecting || state.loading || state.commandBusy || queueLocked(state.queues.get(queueKey(state.thread?.id)));
+  return Boolean(state.messageEdit) || conversationReadOnly() || modelUnavailable() || !state.connected || state.connecting || state.loading || state.commandBusy || queueLocked(state.queues.get(queueKey(state.thread?.id)));
 }
 function promptSkillNames(text) { return [...new Set(text.split(/\s+/).filter(token => /^\$[a-zA-Z_][\w:.-]*$/.test(token)).map(token => token.slice(1)))]; }
 async function resolvePromptSkills(text, required = false) {
@@ -2925,7 +3130,7 @@ async function enqueueMessage(message, paused = false) {
 }
 async function send(event, steer = false, action = null) {
   event?.preventDefault();
-  if (state.connecting || queueLocked(state.queues.get(queueKey(state.thread?.id)))) return;
+  if (state.messageEdit || state.connecting || queueLocked(state.queues.get(queueKey(state.thread?.id)))) return;
   const shortcut = typeof action?.shortcut === 'string';
   const rawText = shortcut ? action.shortcut : $('prompt').value; const text = rawText.trim();
   if (!action && !steer && /^\/[a-z-]*(?:\s|$)/i.test(text)) { await executeSlash(text); return; }
@@ -2969,6 +3174,7 @@ async function send(event, steer = false, action = null) {
       state.owned.add(result.thread.id);
       modes.threads.set(result.thread.id, message.mode === 'plan');
       setThread(result.thread);
+      state.historyView = newHistoryView(result.thread);
       state.threads.unshift(result.thread); renderThreads();
       message.thread = result.thread;
       if (delayHours) {
@@ -3081,6 +3287,8 @@ async function archiveConversation(thread) {
   try {
     await rpc('thread/archive', { threadId: thread.id });
     if (state.archiving !== operation || state.options !== operation.options) return;
+    recentTimelines.delete(thread.id);
+    if (state.historyView?.threadId === thread.id) state.historyView = null;
     state.titling.delete(thread.id); clearTitleRetry(thread.id);
     state.listGeneration++;
     state.threads = state.threads.filter(entry => entry.id !== thread.id);
@@ -3100,22 +3308,57 @@ function openMessageEdit(record) {
   const queue = state.queues.get(queueKey(state.thread.id));
   if (state.active.has(state.thread.id) || state.dispatching.has(queueKey(state.thread.id)) || queue?.saving || queueLocked(queue)) { showError('Wait for the running task before editing earlier messages.'); return; }
   if (nativeEdit && state.nativeQueues.get(state.thread.id)?.items.length) { showError('Send or remove queued messages before editing.'); return; }
+  if (state.messageEdit?.record === record || state.messageEdit?.uncertain) { $('edited-message').focus(); return true; }
+  closeMessageEdit({ save: true, resumeQueue: false });
   const draftTarget = editorTarget('edit-message', state.thread, nativeEdit ? record.item.id : record.turnId);
   const content = record.item.content || [];
   const attachmentCount = nativeEdit ? record.item.attachmentCount || 0 : content.filter(part => part.type !== 'text' && part.type !== 'skill').length;
-  state.messageEdit = { thread: state.thread, turnId: record.turnId, itemId: record.item.id, content, attachmentCount, options: state.options, queue, draftTarget };
+  state.messageEdit = { record, thread: state.thread, turnId: record.turnId, itemId: record.item.id, content, attachmentCount, options: state.options, queue, draftTarget };
   if (queue) queue.editing = true;
   $('edit-message-error').textContent = ''; $('edit-message-error').hidden = true;
-  $('edited-message').value = editorText(draftTarget, state.messageEdit.content.filter(part => part.type === 'text').map(part => part.text).join('\n'));
-  $('edited-message-attachments').textContent = attachmentCount ? `${attachmentCount} attachment(s) will be kept.` : '';
+  $('edited-message').value = editorText(draftTarget, content.filter(part => part.type === 'text').map(part => part.text).join('\n'));
+  renderMessageDraftStatus(draftTarget);
+  $('edited-message-attachments').textContent = `${attachmentCount} attachment${attachmentCount === 1 ? '' : 's'} will be kept.`;
+  $('edited-message-attachments').hidden = !attachmentCount;
   $('cancel-message-edit').textContent = 'Cancel';
-  $('resend-message').disabled = false;
-  $('edit-message-dialog').showModal(); $('edited-message').focus();
+  record.body.hidden = true;
+  record.body.after($('edit-message-form'));
+  $('edit-message-form').hidden = false;
+  updateBusy();
+  $('edited-message').focus();
   return true;
+}
+function saveMessageEdit() {
+  const target = state.messageEdit?.draftTarget;
+  if (!target || state.resending) return;
+  const draft = editorDrafts.get(editorDraftKey(target));
+  const text = $('edited-message').value;
+  if (draft?.unsaved || text !== (draft?.expected?.text ?? draft?.fallback)) saveEditorDraft(target, text);
+  renderMessageDraftStatus(target);
+}
+function renderMessageDraftStatus(target) {
+  const notice = $('edit-message-draft-status');
+  const unsaved = editorDrafts.get(editorDraftKey(target))?.unsaved;
+  notice.textContent = unsaved ? `Draft kept in this window. Could not save it to disk. ${unsaved.error}` : '';
+  notice.hidden = !unsaved;
+}
+function closeMessageEdit({ save = false, focus = false, resumeQueue = true } = {}) {
+  const target = state.messageEdit;
+  if (!target) return;
+  if (save) saveMessageEdit();
+  state.messageEdit = null;
+  $('edit-message-form').hidden = true;
+  $('edit-message-form').remove();
+  target.record.body.hidden = false;
+  if (focus) target.record.label.querySelector('.edit-message')?.focus({ preventScroll: true });
+  if (target.queue) {
+    target.queue.editing = false;
+    if (resumeQueue) queueMicrotask(() => { if (target.options === state.options && state.connected && !state.commandBusy) flushQueue(target.thread.id).catch(showError); });
+  }
 }
 async function resendMessage(target, text) {
   if (!target || target.uncertain || state.sending || state.commandBusy || state.loading || target.options !== state.options || target.thread.id !== state.thread?.id) return;
-  const expected = editorDrafts.get(JSON.stringify(target.draftTarget))?.expected;
+  const expected = editorDrafts.get(editorDraftKey(target.draftTarget))?.expected;
   const thread = target.thread; const machine = accessKey(); const key = queueKey(thread.id);
   const nativeEdit = supportsNativeEdit(thread);
   const operation = {}; state.resending = operation; state.commandBusy = true; updateBusy();
@@ -3134,6 +3377,7 @@ async function resendMessage(target, text) {
     await ensureWritable(thread.id);
     if (!current()) return;
     if (state.active.has(thread.id)) throw new Error('Stop the running task before editing earlier messages.');
+    if (nativeEdit && state.nativeQueues.get(thread.id)?.items.length) throw new Error('Send or remove queued messages before editing.');
     queue = state.queues.get(key);
     if (queue?.messages.length) await pauseQueue(queue, 'history-edit');
     if (!current()) return;
@@ -3143,7 +3387,7 @@ async function resendMessage(target, text) {
       editAccepted = true;
       if (!current()) return;
       clearDraft(target.draftTarget, expected);
-      $('edit-message-dialog').close();
+      closeMessageEdit();
       await openThread(result.thread, true);
       if (current() && result.turn?.error?.message) showError(result.turn.error.message);
       return;
@@ -3158,7 +3402,7 @@ async function resendMessage(target, text) {
     saved = true;
     if (!current()) return;
     clearDraft(target.draftTarget, expected);
-    $('edit-message-dialog').close();
+    closeMessageEdit();
     await openThread(result.thread, true);
     if (!current()) return;
     await submitMessage(message, false, true);
@@ -3173,7 +3417,7 @@ async function resendMessage(target, text) {
         $('cancel-message-edit').textContent = 'Check history';
       }
       const message = editAccepted ? `The edit was sent, but the conversation could not reload. ${error.message}` : reverted ? saved ? `Edited message was not confirmed; its draft is saved in this conversation's paused queue. Check history before retrying. ${error.message}` : `History was updated, but the draft could not be saved. Keep the edited text before closing. ${error.message}` : error.message || String(error);
-      if ($('edit-message-dialog').open) { $('edit-message-error').textContent = message; $('edit-message-error').hidden = false; }
+      if (state.messageEdit === target) { $('edit-message-error').textContent = message; $('edit-message-error').hidden = false; }
       else showError(message);
     }
   } finally {
@@ -3264,6 +3508,8 @@ async function connect(options) {
   state.connected = false;
   state.nativeQueues.clear();
   state.options = options;
+  recentTimelines.clear();
+  state.historyView = null;
   conversationSync.ownership.clear(); conversationSync.historyEnabled = false;
   usage.generation++; usage.threads.clear(); usage.account = null; usage.reading = null; usage.updatedAt = 0; usage.error = null;
   state.commandBusy = false; state.branching = null; state.resending = null; state.archiving = null;
@@ -3276,7 +3522,7 @@ async function connect(options) {
   slash.generation++; slash.skills = []; slash.cwd = null; slash.loading = false; modes.catalog = []; modes.threads.clear(); state.models = [];
   $('edit-queue-dialog').close();
   closeScheduledEditor();
-  $('thread-menu').hidden = true; $('rename-dialog').close(); $('edit-message-dialog').close();
+  $('thread-menu').hidden = true; $('rename-dialog').close(); closeMessageEdit({ save: true });
   restoreAccess();
   restoreUnread();
   state.threads = [];
@@ -3384,6 +3630,8 @@ function handleNotification(message, reconciledRetry) {
   }
   if (method === 'provider/closed') {
     const provider = message.provider || params.provider;
+    for (const threadId of recentTimelines.keys()) if (identityProvider(threadId) === provider) recentTimelines.delete(threadId);
+    if (state.historyView && identityProvider(state.historyView.threadId) === provider) state.historyView = null;
     for (const threadId of activeChecks.keys()) if (identityProvider(threadId) === provider) activeChecks.delete(threadId);
     for (const threadId of state.nativeQueues.keys()) if (identityProvider(threadId) === provider) state.nativeQueues.delete(threadId);
     const agent = agentMetadata(provider); if (agent) agent.connected = false;
@@ -3405,6 +3653,8 @@ function handleNotification(message, reconciledRetry) {
   }
   if (method === 'connection/closed') {
     activeChecks.clear();
+    recentTimelines.clear();
+    state.historyView = null;
     clearQueueDrag(false);
     clearThreadDrag();
     clearProjectDrag(); $('project-menu').hidden = true;
@@ -3483,6 +3733,13 @@ function handleNotification(message, reconciledRetry) {
   }
   if (!state.thread || params.threadId !== state.thread.id) return;
   if (state.historyEvents && (method.startsWith('item/') || method === 'turn/completed' || method === 'turn/started')) { state.historyEvents.push(message); return; }
+  if (state.historyView?.threadId === state.thread.id && (method.startsWith('item/') || method === 'turn/completed' || method === 'turn/started')) {
+    const turnId = params.turnId || params.turn?.id || state.items.get(params.itemId)?.turnId;
+    if (turnId) {
+      if (!state.historyView.turns.has(turnId)) state.historyView.turns.set(turnId, null);
+      state.historyView.dirtyTurns.add(turnId);
+    }
+  }
   if (method === 'item/started' || method === 'item/completed') {
     if (params.item.type === 'userMessage') {
       for (const [key, record] of state.items) if (key.startsWith('pending-')) { record.element.remove(); state.items.delete(key); }
@@ -3842,10 +4099,27 @@ function applyProject(threadId, projectId) {
   renderThreads();
 }
 function clearThreadDrag() {
+  const source = threadDrag.source;
+  if (!source) return;
   threadDrag.source = null;
-  for (const element of $('threads').querySelectorAll('.drop-target,.dragging')) element.classList.remove('drop-target', 'dragging');
-  for (const element of $('threads').querySelectorAll('.thread-row.drop-before,.thread-row.drop-after')) element.classList.remove('drop-before', 'drop-after');
-  for (const group of $('threads').querySelectorAll('[data-search-hidden]')) group.hidden = true;
+  source.button.classList.remove('dragging');
+  setThreadDropMarker();
+  for (const group of source.searchGroups) group.hidden = true;
+  if (threadDrag.renderPending) queueMicrotask(() => { if (threadDrag.renderPending) renderThreads(); });
+}
+function setThreadDropMarker(element, className) {
+  const previous = threadDrag.marker;
+  if (previous?.element === element && previous?.className === className) return;
+  if (previous) previous.element.classList.remove(previous.className);
+  threadDrag.marker = element ? { element, className } : null;
+  if (element) element.classList.add(className);
+}
+function clearThreadDropMarkerOnLeave(event, element) {
+  if (threadDrag.marker?.element === element && (!(event.relatedTarget instanceof Node) || !element.contains(event.relatedTarget))) setThreadDropMarker();
+}
+function currentDraggedThread(threadId, projectId) {
+  const current = state.threads.find(thread => thread.id === threadId) || state.pinnedThreads.get(threadId);
+  return current && (current.projectId || null) === projectId && state.archiving?.threadId !== threadId ? current : null;
 }
 function sortProjectThreads(threads, projectId) {
   const ids = preferences.threadOrders[accessKey()]?.[projectId] || [];
@@ -3855,23 +4129,29 @@ function sortProjectThreads(threads, projectId) {
   return threads.sort((a, b) => Number(state.pinnedIds.has(b.id)) - Number(state.pinnedIds.has(a.id)) || position(a) - position(b));
 }
 function bindThreadOrder(row, thread) {
+  const projectId = thread.projectId;
   const valid = event => {
     const source = threadDrag.source;
-    return state.connected && source && source.options === state.options && source.thread.id !== thread.id && source.thread.projectId === thread.projectId && state.pinnedIds.has(source.thread.id) === state.pinnedIds.has(thread.id) && !threadDrag.orderPending.has(JSON.stringify([accessKey(), thread.projectId])) && !state.pinning.has(source.thread.id) && !state.pinning.has(thread.id) && state.archiving?.threadId !== thread.id && event.dataTransfer?.types.includes(threadDrag.type);
+    return state.connected && source && source.options === state.options && source.threadId !== thread.id && source.projectId === projectId && state.pinnedIds.has(source.threadId) === state.pinnedIds.has(thread.id) && !threadDrag.orderPending.has(JSON.stringify([accessKey(), projectId])) && !state.pinning.has(source.threadId) && !state.pinning.has(thread.id) && state.archiving?.threadId !== thread.id && event.dataTransfer?.types.includes(threadDrag.type);
   };
-  const after = event => event.clientY >= row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2;
+  const after = event => {
+    const rect = row.getBoundingClientRect();
+    return event.clientY >= rect.top + rect.height / 2;
+  };
   row.ondragover = event => {
     if (!valid(event)) return;
     event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move';
-    for (const element of $('threads').querySelectorAll('.thread-row.drop-before,.thread-row.drop-after')) element.classList.remove('drop-before', 'drop-after');
-    row.classList.add(after(event) ? 'drop-after' : 'drop-before');
+    setThreadDropMarker(row, after(event) ? 'drop-after' : 'drop-before');
   };
-  row.ondragleave = event => { if (!(event.relatedTarget instanceof Node) || !row.contains(event.relatedTarget)) row.classList.remove('drop-before', 'drop-after'); };
+  row.ondragleave = event => clearThreadDropMarkerOnLeave(event, row);
   row.ondrop = async event => {
     if (!valid(event) || event.dataTransfer.getData(threadDrag.type) !== threadDrag.source.token) return;
     event.preventDefault(); event.stopPropagation();
-    const source = threadDrag.source; const below = after(event); clearThreadDrag();
-    try { await reorderThread(source.thread, thread, below, source.options); } catch (error) { if (source.options === state.options) showError(error); }
+    const source = threadDrag.source;
+    const from = currentDraggedThread(source.threadId, source.projectId), to = currentDraggedThread(thread.id, projectId);
+    const below = after(event); clearThreadDrag();
+    if (!from || !to) return;
+    try { await reorderThread(from, to, below, source.options); } catch (error) { if (source.options === state.options) showError(error); }
   };
 }
 async function reorderThread(source, target, after, options = state.options) {
@@ -3900,17 +4180,21 @@ async function reorderThread(source, target, after, options = state.options) {
   } finally { threadDrag.orderPending.delete(key); if (machine === accessKey()) renderThreads(); }
 }
 function bindThreadDrop(target, projectId) {
-  const valid = event => state.connected && threadDrag.source && threadDrag.source.options === state.options && event.dataTransfer?.types.includes(threadDrag.type) && (threadDrag.source.thread.projectId || null) !== projectId && (!projectId || projects.data.some(project => project.id === projectId));
+  const valid = event => state.connected && threadDrag.source && threadDrag.source.options === state.options && event.dataTransfer?.types.includes(threadDrag.type) && threadDrag.source.projectId !== projectId && (!projectId || projects.data.some(project => project.id === projectId));
   target.ondragover = event => {
     if (!valid(event)) return;
-    event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; target.classList.add('drop-target');
+    event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move';
+    setThreadDropMarker(target, 'drop-target');
   };
-  target.ondragleave = event => { if (!(event.relatedTarget instanceof Node) || !target.contains(event.relatedTarget)) target.classList.remove('drop-target'); };
+  target.ondragleave = event => clearThreadDropMarkerOnLeave(event, target);
   target.ondrop = async event => {
     if (!valid(event) || event.dataTransfer.getData(threadDrag.type) !== threadDrag.source.token) return;
     event.preventDefault(); event.stopPropagation();
-    const source = threadDrag.source; clearThreadDrag();
-    try { await moveThreadToProject(source.thread, projectId, source.options); } catch (error) { showError(error); }
+    const source = threadDrag.source;
+    const thread = currentDraggedThread(source.threadId, source.projectId);
+    clearThreadDrag();
+    if (!thread) return;
+    try { await moveThreadToProject(thread, projectId, source.options); } catch (error) { showError(error); }
   };
 }
 async function moveThreadToProject(thread, projectId, options = state.options) {
@@ -4021,8 +4305,9 @@ $('clone-conversation').onclick = () => cloneConversation(state.contextThread);
 $('archive-conversation').onclick = () => archiveConversation(state.contextThread);
 async function dismissMessageEdit() {
   const target = state.messageEdit;
-  if (!target?.uncertain) clearDraft(target?.draftTarget);
-  $('edit-message-dialog').close();
+  if (!target || state.resending) return;
+  if (!target.uncertain) clearDraft(target.draftTarget);
+  closeMessageEdit({ focus: true }); updateBusy();
   if (target?.uncertain && target.options === state.options && state.thread?.id === target.thread.id && state.connected) {
     try {
       await openThread(target.thread);
@@ -4061,21 +4346,18 @@ $('copy-edit-draft').onclick = async () => {
   } catch { $('edit-drafts-status').textContent = 'Could not copy the draft.'; }
 };
 $('cancel-message-edit').onclick = dismissMessageEdit;
-$('edit-message-dialog').oncancel = event => {
-  event.preventDefault();
-  if (!state.resending) void dismissMessageEdit();
-};
-$('edited-message').oninput = () => saveEditorDraft(state.messageEdit?.draftTarget, $('edited-message').value);
-$('edit-message-dialog').onclose = () => {
-  if ($('edit-message-dialog').open) return;
-  const target = state.messageEdit; state.messageEdit = null;
-  if (target?.queue) { target.queue.editing = false; if (target.options === state.options && state.connected && !state.commandBusy) flushQueue(target.thread.id).catch(showError); }
+$('edited-message').oninput = saveMessageEdit;
+$('edit-message-form').onkeydown = event => {
+  if (event.key !== 'Escape' || event.isComposing || state.resending) return;
+  event.preventDefault(); event.stopPropagation();
+  void dismissMessageEdit();
 };
 $('edit-message-form').onsubmit = async event => {
   event.preventDefault();
   const target = state.messageEdit; const text = $('edited-message').value.trim();
   if (!target || target.uncertain || !text && !target.attachmentCount) return;
   saveEditorDraft(target.draftTarget, $('edited-message').value);
+  renderMessageDraftStatus(target.draftTarget);
   await resendMessage(target, text);
 };
 $('rename-conversation').onclick = openRename;
@@ -4130,7 +4412,7 @@ $('composer').addEventListener('change', () => saveComposerDraft());
 addEventListener('beforeunload', () => {
   saveComposerDraft();
   if ($('edit-queue-dialog').open) saveEditorDraft(state.queueEdit?.draftTarget, $('queued-text').value);
-  if ($('edit-message-dialog').open) saveEditorDraft(state.messageEdit?.draftTarget, $('edited-message').value);
+  saveMessageEdit();
   if ($('edit-schedule-dialog').open) saveScheduledDraft();
 });
 $('refresh').onclick = () => refreshProjects().catch(showError);
@@ -4140,6 +4422,7 @@ $('more-threads').onclick = async () => {
 };
 $('search').oninput = () => {
   clearTimeout(searchTimer);
+  clearThreadDrag();
   if (!state.connected) { renderThreads(); return; }
   state.listGeneration++;
   $('search-progress').hidden = false;
@@ -4155,12 +4438,17 @@ function loadOlderTurns() {
   const operation = { selection }; state.olderHistory = operation;
   $('older-turns').disabled = true;
   operation.promise = (async () => { try {
-    const result = await rpc('thread/turns/list', { threadId: state.thread.id, cursor: state.turnCursor, limit: 25, sortDirection: 'desc', itemsView: 'full' });
+    const result = await rpc('thread/turns/list', { threadId: state.thread.id, cursor: state.turnCursor, limit: olderTurnLimit, sortDirection: 'desc', itemsView: 'full' });
     if (selection !== state.selection) return;
     const height = $('timeline').scrollHeight, top = $('timeline').scrollTop;
     const anchor = timelineView.reading || pinnedMessages.context?.querySelector('.message');
     const anchorTop = anchor?.isConnected && anchor.checkVisibility() ? anchor.getBoundingClientRect().top : null;
-    for (const turn of result.data) for (const item of [...(turn.items || [])].reverse()) renderItem(item, true, turn.id);
+    for (const turn of result.data) for (const item of [...(turn.items || [])].reverse()) renderItem(item, true, turn.id, $('messages'), true);
+    if (state.historyView?.threadId === state.thread.id) {
+      const turns = new Map([...result.data].reverse().map(turn => [turn.id, turn]));
+      for (const [id, turn] of state.historyView.turns) turns.set(id, turn ? mergeHistoryTurn(turns.get(id), turn) : turns.get(id) || turn);
+      state.historyView.turns = turns;
+    }
     state.turnCursor = result.nextCursor;
     $('older-turns').hidden = !result.nextCursor;
     if (anchorTop !== null && anchor.isConnected && anchor.checkVisibility()) $('timeline').scrollTop += anchor.getBoundingClientRect().top - anchorTop;
@@ -4175,7 +4463,7 @@ document.addEventListener('keydown', unreadShortcut);
 $('threads').addEventListener('keydown', conversationArrow);
 document.addEventListener('keydown', event => {
   if (event.key !== 'Enter' || event.shiftKey || event.altKey || event.isComposing || event.keyCode === 229) return;
-  const editor = event.target?.closest?.('dialog[open] textarea');
+  const editor = event.target?.closest?.('dialog[open] textarea, #edit-message-form textarea');
   if (!editor?.form || editor.disabled || editor.readOnly) return;
   event.preventDefault();
   if (event.repeat) return;
@@ -4207,7 +4495,7 @@ $('timeline').addEventListener('wheel', event => {
   if (event.deltaY < 0 && !timelineView.reading) setTimelineFollowing(false);
 }, { passive: true });
 $('timeline').addEventListener('scroll', () => {
-  if (timelineView.reading || state.loading) return;
+  if (timelineView.reading || state.loading && !state.historyView) return;
   setTimelineFollowing(timelineAtBottom());
 });
 document.addEventListener('click', event => { if (!event.target.closest('#composer')) hideSlash(); $('thread-menu').hidden = true; $('project-menu').hidden = true; });

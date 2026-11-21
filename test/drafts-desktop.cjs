@@ -128,11 +128,17 @@ app.whenReady().then(async () => {
     console.log('PASS unsent draft dots update while typing, persist across restart and navigation, and disappear when the prompt is cleared');
     await evaluate("document.querySelector('.edit-message').click(); document.getElementById('edited-message').value = 'Unfinished history edit'; document.getElementById('edited-message').dispatchEvent(new Event('input', { bubbles: true }));");
     await close(); await open();
-    assert.equal(await evaluate("document.getElementById('edit-message-dialog').open"), true);
+    assert.equal(await evaluate("!!document.querySelector('.userMessage #edit-message-form:not([hidden])')"), true);
     assert.equal(await evaluate("document.getElementById('edited-message').value"), 'Unfinished history edit');
     assert.equal(await evaluate("document.getElementById('prompt').value"), 'Conversation draft');
     assert.ok(!calls.some(method => ['turn/start', 'turn/steer', 'thread/resume', 'thread/revert'].includes(method)));
     console.log('PASS real renderer restart restores the same conversation, composer and open editor independently without sending or rewriting history');
+    await evaluate("$('edited-message').value = 'Unfinished edit before switching'; resetThread();");
+    assert.equal(await evaluate("!!document.querySelector('#edit-message-form')"), false);
+    await evaluate(`openThread(${JSON.stringify(thread)})`);
+    await evaluate("document.querySelector('.edit-message').click()");
+    assert.equal(await evaluate("document.querySelector('.userMessage #edited-message').value"), 'Unfinished edit before switching');
+    console.log('PASS leaving an inline edit keeps its draft on the original message and releases the editor for navigation');
     await evaluate("document.getElementById('cancel-message-edit').click();");
     const task = scheduled.enqueue({ machine: 'access:local', thread, text: 'Original scheduled prompt', input: [{ type: 'text', text: 'Original scheduled prompt' }], images: [], access: { sandbox: 'read-only', approvalPolicy: 'never' }, mode: 'default', turnSettings: { threadId: thread.id } }, 1);
     await evaluate(`(async () => { await refreshSchedules(); await openScheduledEdit(schedules.tasks.find(task => task.id === ${JSON.stringify(task.id)})); })()`);

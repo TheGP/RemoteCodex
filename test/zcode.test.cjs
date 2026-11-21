@@ -88,6 +88,38 @@ test('ZCode usage maps chat quotas and plan dates and fences an account change',
   assert.match((await readZCodeUsage({ family: 'custom', authenticate: () => assert.fail('A custom model tried to use account credentials') }, fetcher)).usageMessage, /individual Coding Plan/);
 });
 
+test('ZCode limits the first history page and keeps older turns reachable', async t => {
+  const f = await fixture(t), thread = await history(f);
+  const newest = await f.connection.call('turn/start', { threadId: thread.id, input: [{ type: 'text', text: 'A newer question' }] });
+  await until(() => f.notifications.some(notification => notification.method === 'turn/completed' && notification.params.turn.id === newest.turn.id));
+  const recent = await f.connection.call('thread/turns/list', { threadId: thread.id, limit: 1 });
+  assert.deepEqual(recent.data.map(turn => turn.id), [newest.turn.id]);
+  assert.ok(recent.nextCursor);
+  const older = await f.connection.call('thread/turns/list', { threadId: thread.id, cursor: recent.nextCursor, limit: 25 });
+  assert.equal(older.data.length, 1);
+  assert.ok(older.data[0].items.some(item => item.text === 'Saved answer'));
+  assert.equal(older.nextCursor, null);
+});
+
+test('ZCode identifies when the raw rows end partway through the oldest turn', async t => {
+  const f = await fixture(t), thread = await history(f);
+  const runtime = f.connection.runtimes.get(fs.realpathSync(f.directory)).runtime;
+  const request = runtime.request.bind(runtime);
+  runtime.request = (method, params) => method !== 'v4/conversation/rowsRange' ? request(method, params) : Promise.resolve(params.beforeRowId
+    ? { rows: [{ rowId: 1, turnId: 'split', kind: 'turnHeader', state: 'completedSuccess' }, { rowId: 2, turnId: 'split', kind: 'userInput', text: 'Question' }], hasMore: false }
+    : { rows: [{ rowId: 3, turnId: 'split', kind: 'assistantText', text: 'Answer' }], hasMore: true });
+  const newer = await f.connection.call('thread/turns/list', { threadId: thread.id, limit: 8 });
+  const older = await f.connection.call('thread/turns/list', { threadId: thread.id, cursor: newer.nextCursor, limit: 25 });
+  assert.equal(newer.nextCursor, '3');
+  assert.equal(newer.data[0].historyStartRowId, 3);
+  assert.equal(newer.data[0].historyEndRowId, 3);
+  assert.equal(newer.data[0].items[0].historyRowId, 3);
+  assert.equal(older.data[0].id, newer.data[0].id);
+  assert.equal(older.data[0].historyStartRowId, undefined);
+  assert.equal(older.data[0].historyEndRowId, 2);
+  assert.equal(older.data[0].items[0].historyRowId, 2);
+});
+
 test('ZCode edits its latest user query once through the native atomic command', async t => {
   const f = await fixture(t), thread = await history(f), target = await editableMessage(f, thread);
   assert.ok(zcodeMethods.includes('thread/edit') && !zcodeMethods.includes('thread/revert'));

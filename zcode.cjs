@@ -49,7 +49,7 @@ function localLaunch(options, cwd) {
 }
 
 function mapItem(id, row) {
-  const base = { id: rowId(id, row), startedAtMs: row.createdAt };
+  const base = { id: rowId(id, row), historyRowId: row.rowId, startedAtMs: row.createdAt };
   if (row.kind === 'userInput') return { ...base, type: 'userMessage', canEdit: row.actions?.canEdit === true, attachmentCount: row.attachments?.length || 0, content: [{ type: 'text', text: row.text }] };
   if (row.kind === 'assistantText') return { ...base, type: 'agentMessage', text: row.text };
   if (row.kind === 'reasoning') return { ...base, type: 'reasoning', summary: [row.text], content: [] };
@@ -345,6 +345,7 @@ class ZCodeConnection extends EventEmitter {
       const key = String(row.turnId ?? row.productTurnId ?? row.rowId);
       if (!turns.has(key)) turns.set(key, { id: turnId(id, key), status: 'completed', items: [] });
       const turn = turns.get(key);
+      turn.historyEndRowId = row.rowId;
       if (row.kind === 'turnHeader') { turn.status = turnStatus(row.state); turn.startedAtMs = row.startedAt; turn.completedAtMs = row.endedAt; }
       else { const item = mapItem(id, row); if (item) turn.items.push(item); }
     }
@@ -438,7 +439,14 @@ class ZCodeConnection extends EventEmitter {
     if (method === 'thread/read' || method === 'thread/resume') return { thread: this.thread(runtime, slot.state), queuedMessageCount: slot.state.queue?.items?.length || 0 };
     if (method === 'thread/turns/list') {
       const result = await runtime.request('v4/conversation/rowsRange', { workspace: runtime.workspace, sessionId: target.sessionId, clientMode: 'desktop-continuous', ...(params.cursor ? { beforeRowId: Number(params.cursor) } : {}), limit: 200 });
-      return { data: this.turns(params.threadId, result.rows).reverse(), nextCursor: result.hasMore && result.rows.length ? String(result.rows[0].rowId) : null, receivedSequence: this.receivedSequence };
+      const turns = this.turns(params.threadId, result.rows).reverse();
+      const data = Number.isSafeInteger(params.limit) && params.limit > 0 ? turns.slice(0, params.limit) : turns;
+      const truncated = data.length < turns.length;
+      const firstRow = truncated
+        ? result.rows.find(row => turnId(params.threadId, row.turnId ?? row.productTurnId ?? row.rowId) === data.at(-1).id)
+        : result.rows[0];
+      if (!truncated && result.hasMore && firstRow && firstRow.kind !== 'turnHeader') data.at(-1).historyStartRowId = firstRow.rowId;
+      return { data, nextCursor: firstRow && (truncated || result.hasMore) ? String(firstRow.rowId) : null, receivedSequence: this.receivedSequence };
     }
     if (method === 'thread/name/set') { await runtime.command(target.sessionId, 'renameSession', { title: params.name }); return {}; }
     if (method === 'queue/delete') { await runtime.command(target.sessionId, 'deleteQueueItem', { queueItemId: params.queueItemId }); return {}; }
