@@ -88,6 +88,8 @@ app.whenReady().then(async () => {
     await evaluate(`(() => { const prompt = $('prompt'); for (const text of ['Fast', 'Fast typing', 'Fast typing saved']) { prompt.value = text; prompt.dispatchEvent(new Event('input', {bubbles: true})); } })()`);
     assert.equal(draftChanges, savesBeforeTyping, 'Keystrokes performed blocking draft writes');
     await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(draftChanges, savesBeforeTyping, 'Prompt autosave ran before typing had been idle');
+    for (let attempt = 0; attempt < 70 && draftChanges === savesBeforeTyping; attempt++) await new Promise(resolve => setTimeout(resolve, 50));
     assert.equal(draftChanges, savesBeforeTyping + 1);
     assert.equal(new DraftStore(store.directory).last('access:local').draft.text, 'Fast typing saved');
     const continuous = draftChanges;
@@ -95,12 +97,12 @@ app.whenReady().then(async () => {
       await evaluate(`$('prompt').value += 'x'; $('prompt').dispatchEvent(new Event('input', {bubbles: true}));`);
       await new Promise(resolve => setTimeout(resolve, 80));
     }
-    assert.ok(draftChanges > continuous, 'Continuous typing never saved a draft');
+    assert.equal(draftChanges, continuous, 'Continuous typing triggered a draft write');
     await evaluate(`$('prompt').value = 'Flush immediately on blur'; $('prompt').dispatchEvent(new Event('input', {bubbles: true})); $('prompt').dispatchEvent(new Event('blur'));`);
     assert.equal(new DraftStore(store.directory).last('access:local').draft.text, 'Flush immediately on blur');
     await new Promise(resolve => setTimeout(resolve, 250));
     assert.equal(new DraftStore(store.directory).last('access:local').draft.text, 'Flush immediately on blur');
-    console.log('PASS prompt typing batches disk writes, saves during continuous input, and flushes its latest text on blur');
+    console.log('PASS prompt typing defers asynchronous saves until idle and flushes its latest text on blur');
     await evaluate("document.getElementById('prompt').value = '  Unsent before restart\\n'; document.getElementById('prompt').dispatchEvent(new Event('input', { bubbles: true })); document.getElementById('send-time').value = '24'; document.getElementById('send-time').dispatchEvent(new Event('change', { bubbles: true }));");
     assert.equal(new DraftStore(store.directory).last('access:local').draft.text, '  Unsent before restart\n');
     await evaluate("document.getElementById('prompt').value += 'last change before close';");

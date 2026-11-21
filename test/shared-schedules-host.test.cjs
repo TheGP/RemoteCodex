@@ -125,6 +125,24 @@ test('expired sends become unconfirmed and never auto-retry or admit another sch
   assert.throws(() => f.a('complete', { id: 'task-a', token: claim.token, turnId: 'unknown-turn' }, due + leaseMs + 2), /receipt/);
 });
 
+test('restarting a device can rotate only its own editing lease and invalidates the old token', t => {
+  const f = fixture(t), task = f.create();
+  const args = { machine, threadId: task.threadId }, old = f.a('edit-lock', args, due);
+  assert.throws(() => f.b('edit-lock', { ...args, recoverOwn: true }, due + 1), /Another computer/);
+  assert.throws(() => f.a('edit-lock', args, due + 1), /Another computer/);
+  assert.throws(() => f.a('edit-lock', { ...args, recoverOwn: 'yes' }, due + 1), /Invalid editing lock recovery/);
+  const current = f.a('edit-lock', { ...args, recoverOwn: true }, due + 1);
+  assert.notEqual(current.token, old.token);
+  assert.deepEqual(f.a('renew', { tokens: [old.token] }, due + 2), []);
+  f.a('unlock', { token: old.token }, due + 2);
+  assert.throws(() => f.a('get', { id: task.id, token: old.token }, due + 2), /lock expired/);
+  assert.equal(f.a('get', { id: task.id, token: current.token }, due + 2).id, task.id);
+  f.a('unlock', { token: current.token }, due + 2);
+  const delivery = f.a('claim', { id: task.id }, due + 3);
+  assert.ok(delivery);
+  assert.throws(() => f.a('edit-lock', { ...args, recoverOwn: true }, due + 4), /Another computer/);
+});
+
 test('shared editor locks require both owner and token and exclude cancellation and delivery', t => {
   const f = fixture(t), task = f.create();
   const a = (method, args) => f.a(method, args, due), b = (method, args) => f.b(method, args, due);

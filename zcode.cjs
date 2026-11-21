@@ -8,7 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { connectionOptions: machineOptions } = require('./transport.cjs');
 
-const zcodeMethods = ['model/list', 'collaborationMode/list', 'thread/list', 'thread/read', 'thread/start', 'thread/resume', 'thread/name/set', 'thread/turns/list', 'turn/start', 'turn/steer', 'turn/interrupt', 'queue/delete', 'queue/resume', 'fs/readDirectory', 'fs/readFile'];
+const zcodeMethods = ['model/list', 'collaborationMode/list', 'thread/list', 'thread/read', 'thread/start', 'thread/resume', 'thread/name/set', 'thread/turns/list', 'thread/edit', 'turn/start', 'turn/steer', 'turn/interrupt', 'queue/delete', 'queue/resume', 'fs/readDirectory', 'fs/readFile', 'account/rateLimits/read'];
 const MAX_FRAME = 32 * 1024 * 1024;
 const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url');
 const namespace = value => createHash('sha256').update(value).digest('hex').slice(0, 24);
@@ -43,12 +43,14 @@ function localLaunch(options, cwd) {
   if (!cli) throw new Error('ZCode CLI not found. Install ZCode and set its CLI path in Settings.');
   const node = directories.map(directory => path.join(directory, process.platform === 'win32' ? 'node.exe' : 'node')).find(file => { try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); } catch { return false; } });
   if (!node) throw new Error('ZCode requires Node.js 24 or later.');
-  return { command: node, args: ['--input-type=module', '-e', fs.readFileSync(path.join(__dirname, 'zcode-host.mjs'), 'utf8'), fs.realpathSync(cli), cwd], env: { ...process.env, PATH: [path.dirname(node), ...directories].join(path.delimiter) } };
+  // The child runs under Node, which cannot load modules from Electron's app archive.
+  const host = ['zcode-usage.mjs', 'zcode-host.mjs'].map(file => fs.readFileSync(path.join(__dirname, file), 'utf8')).join('\n');
+  return { command: node, args: ['--input-type=module', '-e', host, fs.realpathSync(cli), cwd], env: { ...process.env, PATH: [path.dirname(node), ...directories].join(path.delimiter) } };
 }
 
 function mapItem(id, row) {
   const base = { id: rowId(id, row), startedAtMs: row.createdAt };
-  if (row.kind === 'userInput') return { ...base, type: 'userMessage', content: [{ type: 'text', text: row.text }] };
+  if (row.kind === 'userInput') return { ...base, type: 'userMessage', canEdit: row.actions?.canEdit === true, attachmentCount: row.attachments?.length || 0, content: [{ type: 'text', text: row.text }] };
   if (row.kind === 'assistantText') return { ...base, type: 'agentMessage', text: row.text };
   if (row.kind === 'reasoning') return { ...base, type: 'reasoning', summary: [row.text], content: [] };
   if (row.kind === 'timelineMarker' && row.payload?.type === 'compact') return { ...base, type: 'contextCompaction', status: row.payload.status === 'running' ? 'inProgress' : 'completed' };
@@ -231,7 +233,7 @@ class WorkspaceRuntime extends EventEmitter {
   async command(sessionId, type, payload, commandId = randomUUID()) {
     const state = this.topics.get('conversation/' + sessionId)?.state;
     const ack = await this.request('v4/command', { workspace: this.workspace, commandId, clientId: this.owner.clientId, sessionId, type, payload, issuedAt: Date.now(), ...(state ? { baseRevision: state.revision, baseLogEpoch: state.logEpoch } : {}) }, 90000);
-    if (!['accepted', 'duplicate', 'noop'].includes(ack.status)) throw new Error(ack.message || ack.reasonCode || `ZCode rejected ${type}.`);
+    if (!['accepted', 'duplicate', 'noop'].includes(ack.status)) throw Object.assign(new Error(ack.message || ack.reasonCode || `ZCode rejected ${type}.`), { nativeStatus: ack.status, code: ack.reasonCode });
     return { ...ack, commandId };
   }
   async upload(sessionId, part) {
@@ -396,6 +398,11 @@ class ZCodeConnection extends EventEmitter {
   }
   async operation(method, params) {
     if (!this.ready) throw new Error('Connect to ZCode first.');
+    if (method === 'account/rateLimits/read') {
+      const runtime = await this.runtime(this.options.localCwd);
+      const modelSelection = params.model ? this.selection(params.model) : null;
+      return runtime.request('remote-codex/usage', { modelSelection });
+    }
     if (method === 'model/list' || method === 'collaborationMode/list') {
       const runtime = await this.runtime(this.options.localCwd), catalog = await runtime.request('remote-codex/catalog', {});
       if (method === 'collaborationMode/list') return { data: [{ mode: 'default', name: 'Default' }, { mode: 'plan', name: 'Plan' }], nextCursor: null };
@@ -428,7 +435,7 @@ class ZCodeConnection extends EventEmitter {
       return { dataBase64: (await fs.promises.readFile(params.path)).toString('base64') };
     }
     const target = await this.target(params.threadId), runtime = await this.runtime(target.cwd), slot = await runtime.subscribe('conversation/' + target.sessionId);
-    if (method === 'thread/read' || method === 'thread/resume') return { thread: this.thread(runtime, slot.state) };
+    if (method === 'thread/read' || method === 'thread/resume') return { thread: this.thread(runtime, slot.state), queuedMessageCount: slot.state.queue?.items?.length || 0 };
     if (method === 'thread/turns/list') {
       const result = await runtime.request('v4/conversation/rowsRange', { workspace: runtime.workspace, sessionId: target.sessionId, clientMode: 'desktop-continuous', ...(params.cursor ? { beforeRowId: Number(params.cursor) } : {}), limit: 200 });
       return { data: this.turns(params.threadId, result.rows).reverse(), nextCursor: result.hasMore && result.rows.length ? String(result.rows[0].rowId) : null, receivedSequence: this.receivedSequence };
@@ -442,7 +449,27 @@ class ZCodeConnection extends EventEmitter {
       const executionId = slot.state.control.activeWorks?.find(work => work.foregroundExecutionId)?.foregroundExecutionId;
       await runtime.command(target.sessionId, 'stop', executionId ? { expectedForegroundExecutionId: executionId } : {}); return {};
     }
-    if (['turn/start', 'turn/steer'].includes(method)) {
+    if (['turn/start', 'turn/steer', 'thread/edit'].includes(method)) {
+      const editing = method === 'thread/edit';
+      const unconfirmedEdit = error => Object.assign(new Error(`Edit may have been submitted; check conversation history before retrying. ${error.message || error}`), { uncertain: true });
+      const requireIdle = () => {
+        if (activePhase(slot.state.control.phase) || slot.state.control.activeWorks?.length || slot.state.pendingInteractions?.length || slot.state.pendingCommands?.length) throw new Error('Wait for the running task before editing messages.');
+        if (slot.state.queue?.items?.length) throw new Error('Send or remove native queued messages before editing.');
+      };
+      let editRow;
+      if (editing) {
+        requireIdle();
+        const prefix = 'r:' + namespace(params.threadId) + ':';
+        const number = typeof params.itemId === 'string' && params.itemId.startsWith(prefix) ? params.itemId.slice(prefix.length) : '';
+        const targetRowId = /^\d+$/.test(number) ? Number(number) : NaN;
+        if (!Number.isSafeInteger(targetRowId) || targetRowId < 0 || targetRowId >= Number.MAX_SAFE_INTEGER) throw new Error('Reopen the message editor before editing this ZCode message.');
+        editRow = slot.state.rows.window.find(row => row.rowId === targetRowId);
+        if (!editRow) {
+          const page = await runtime.request('v4/conversation/rowsRange', { workspace: runtime.workspace, sessionId: target.sessionId, clientMode: 'desktop-continuous', beforeRowId: targetRowId + 1, limit: 1 });
+          editRow = page.rows.find(row => row.rowId === targetRowId);
+        }
+        if (editRow?.kind !== 'userInput' || editRow.origin !== 'realUser' || editRow.actions?.canEdit !== true || !editRow.entityId || turnId(params.threadId, editRow.turnId ?? editRow.productTurnId ?? editRow.rowId) !== params.beforeTurnId) throw new Error('ZCode can only edit its latest user message. Reload the conversation and reopen the editor.');
+      }
       if (params.sandboxPolicy?.type === 'readOnly') throw new Error('ZCode does not provide a read-only filesystem sandbox. Choose Ask before changes.');
       if (method === 'turn/steer' && params.expectedTurnId) {
         const header = slot.state.rows.window.filter(row => row.kind === 'turnHeader').at(-1);
@@ -455,14 +482,28 @@ class ZCodeConnection extends EventEmitter {
       for (const part of (params.input || []).filter(part => ['image', 'localImage'].includes(part.type))) attachments.push(await runtime.upload(target.sessionId, part));
       const model = params.collaborationMode?.settings?.model || params.model;
       const selection = model ? this.selection(model, params.collaborationMode?.settings?.reasoning_effort || params.effort) : undefined;
-      const ack = await runtime.command(target.sessionId, 'sendText', { text, ...(attachments.length ? { attachments } : {}), ...(selection ? { modelSelection: selection } : {}), planEnabled: params.collaborationMode?.mode === 'plan', mode: params.sandboxPolicy?.type === 'dangerFullAccess' ? 'yolo' : 'build', ...(method === 'turn/steer' ? { requestedDelivery: 'guide' } : {}) });
+      if (editing) requireIdle();
+      let ack;
+      try {
+        ack = await runtime.command(target.sessionId, editing ? 'editUserQuery' : 'sendText', { ...(editing ? { target: { rowId: editRow.rowId, entityId: editRow.entityId }, newText: text, workspaceMode: 'preserve' } : { text }), ...(attachments.length ? { attachments } : {}), ...(selection ? { modelSelection: selection } : {}), planEnabled: params.collaborationMode?.mode === 'plan', mode: params.sandboxPolicy?.type === 'dangerFullAccess' ? 'yolo' : 'build', ...(method === 'turn/steer' ? { requestedDelivery: 'guide' } : {}) });
+      } catch (error) {
+        if (editing && !['rejected', 'stale'].includes(error.nativeStatus)) throw unconfirmedEdit(error);
+        throw error;
+      }
+      if (editing) {
+        if (ack.result?.disposition === 'blocked') throw new Error(ack.result.reasonCode || 'ZCode blocked this edit.');
+        if (ack.result?.type !== 'editUserQuery' || ack.result.disposition !== 'rewind' || ack.result.sessionId !== target.sessionId) throw unconfirmedEdit(new Error('ZCode did not confirm an edit in this conversation.'));
+      }
       if (method === 'turn/steer') return {};
-      if (ack.result?.delivery === 'queue' || ack.result?.delivery === 'guide') return { turn: { id: ack.commandId, status: 'queued' } };
-      await runtime.wait(() => slot.state.rows.window.some(row => row.sourceCommandId === ack.commandId));
+      if (ack.result?.delivery === 'queue' || ack.result?.delivery === 'guide') return { ...(editing ? { thread: this.thread(runtime, slot.state) } : {}), turn: { id: ack.commandId, status: 'queued' } };
+      const queuedEdit = () => editing && slot.state.queue?.items?.some(item => item.sourceCommandId === ack.commandId);
+      try { await runtime.wait(() => slot.state.rows.window.some(row => row.sourceCommandId === ack.commandId) || queuedEdit()); }
+      catch (error) { if (editing) throw unconfirmedEdit(error); throw error; }
+      if (queuedEdit()) return { thread: this.thread(runtime, slot.state), turn: { id: ack.commandId, status: 'queued' } };
       const row = slot.state.rows.window.find(row => row.sourceCommandId === ack.commandId);
       const key = row.turnId ?? row.productTurnId ?? row.rowId;
       const header = slot.state.rows.window.find(row => row.kind === 'turnHeader' && String(row.turnId ?? row.productTurnId ?? row.rowId) === String(key));
-      return { turn: { id: turnId(params.threadId, key), status: header ? turnStatus(header.state) : 'inProgress' } };
+      return { ...(editing ? { thread: this.thread(runtime, slot.state) } : {}), turn: { id: turnId(params.threadId, key), status: header ? turnStatus(header.state) : 'inProgress', ...(editing && header?.state === 'failed' && slot.state.control.lastError ? { error: { message: slot.state.control.lastError.message } } : {}) } };
     }
     throw new Error(`ZCode does not support ${method}.`);
   }

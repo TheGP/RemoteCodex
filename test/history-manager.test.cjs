@@ -531,7 +531,11 @@ test('a changed native file is retried and never publishes a partially captured 
 });
 
 test('missing-parent and corrupt native histories stay thread-specific while healthy conversations keep syncing', async t => {
-  const f = fixture(t), { a, b } = f, linked = f.create(a), corrupt = f.create(a), healthy = f.create(a, 'Healthy conversation after broken histories');
+  const f = fixture(t), { a, b } = f, linked = f.create(a), corrupt = f.create(a);
+  await a.history.tick();
+  const baselines = new Map([linked, corrupt].map(thread => [thread.id, a.state.catalog('history', thread.id).digest]));
+  const healthy = f.create(a, 'Healthy conversation after broken histories');
+  a.history.observe(healthy);
   const linkedRows = fs.readFileSync(linked.path, 'utf8').trim().split('\n').map(JSON.parse);
   linkedRows[0].payload.history_base = { thread_id: randomUUID(), end_ordinal_exclusive: 1, end_byte_offset: 10 };
   fs.writeFileSync(linked.path, encode(linkedRows));
@@ -544,7 +548,7 @@ test('missing-parent and corrupt native histories stay thread-specific while hea
     const error = a.history.errors.get(thread.id);
     assert.ok(error?.message); assert.equal(error.stamp, a.history.stamp(thread.path));
     assert.ok(error.retryAt > Date.now());
-    assert.equal(a.state.catalog('history', thread.id), undefined); assert.equal(a.history.record(thread.id)?.digest, undefined);
+    assert.equal(a.state.catalog('history', thread.id).digest, baselines.get(thread.id)); assert.equal(a.history.record(thread.id)?.digest, baselines.get(thread.id));
     assert.equal(a.state.sync.state.pending.some(op => op.kind === 'history' && op.id === thread.id), false);
     assert.ok(a.logs.some(entry => entry.details?.threadId === thread.id && /history/i.test(entry.event)));
   }
@@ -590,7 +594,9 @@ test('five broken conversations awaiting handoff cannot starve the next healthy 
   const f = fixture(t), { a, b } = f;
   const now = Date.now(); t.mock.method(Date, 'now', () => now);
   const broken = Array.from({ length: 5 }, () => f.create(a));
+  await a.history.tick();
   const healthy = f.create(a, 'Healthy sixth conversation');
+  a.history.observe(healthy);
   for (const thread of broken) {
     fs.appendFileSync(thread.path, '{invalid-json\n');
     await a.history.verify(thread.id); await b.history.request(thread.id);
@@ -604,7 +610,7 @@ test('five broken conversations awaiting handoff cannot starve the next healthy 
   assert.equal(brokenReads(), attempts);
   for (const thread of broken) {
     assert.ok(a.history.errors.get(thread.id)?.message);
-    assert.equal(a.state.catalog('history', thread.id), undefined);
+    assert.ok(a.state.catalog('history', thread.id));
     assert.equal(a.history.status().find(owner => owner.id === thread.id).owned, true);
   }
   assert.equal(a.bridgeCalls.some(call => call.method === 'history-release'), false);
@@ -655,6 +661,7 @@ test('failed codec exports cannot write thread errors or snapshots after namespa
 
 test('a requested handoff waits for both native idle state and a fully uploaded history before releasing ownership', async t => {
   const f = fixture(t), { a, b } = f, thread = f.create(a);
+  await a.history.tick(); fs.appendFileSync(thread.path, encode([question(2, 'New unsynced message before transfer')]));
   await a.history.verify(thread.id); await b.history.request(thread.id);
   thread.status.type = 'active'; await a.history.tick();
   assert.equal(a.history.status().find(owner => owner.id === thread.id).owned, true); assert.equal(a.bridgeCalls.some(call => call.method === 'history-release'), false);
@@ -672,6 +679,7 @@ test('a requested handoff waits for both native idle state and a fully uploaded 
 
 test('a native turn becoming active during upload keeps ownership until a later idle history check', async t => {
   const f = fixture(t), { a, b } = f, thread = f.create(a);
+  await a.history.tick(); fs.appendFileSync(thread.path, encode([question(2, 'New unsynced message before transfer')]));
   await a.history.verify(thread.id); await b.history.request(thread.id);
   a.shared.before = method => { if (method === 'blob-put') thread.status.type = 'active'; };
   await a.history.tick();
@@ -684,10 +692,11 @@ test('a native turn becoming active during upload keeps ownership until a later 
 
 test('native messages appended after export must upload before ownership can transfer', async t => {
   const f = fixture(t), { a, b } = f, thread = f.create(a);
+  await a.history.tick(); fs.appendFileSync(thread.path, encode([question(2, 'New unsynced message before transfer')]));
   await a.history.verify(thread.id); await b.history.request(thread.id);
   let appended = false;
   a.shared.before = method => {
-    if (method === 'blob-put' && !appended) { appended = true; fs.appendFileSync(thread.path, encode([question(2, 'Message added during upload')])); }
+    if (method === 'blob-put' && !appended) { appended = true; fs.appendFileSync(thread.path, encode([question(3, 'Message added during upload')])); }
   };
   await a.history.tick();
   assert.equal(a.bridgeCalls.some(call => call.method === 'history-release'), false, 'handoff must not leave a newer native rollout behind its published snapshot');
@@ -1030,6 +1039,7 @@ test('a durable local authority survives reconnect and upload corruption but fre
   await a.history.verify(thread.id);
   const authority = structuredClone(a.history.record(thread.id).authority);
   assert.deepEqual(authority, { device: a.shared.state.device, epoch: 1, nativeId: thread.id, home: f.home });
+  await a.history.tick();
   fs.appendFileSync(thread.path, encode([question(2, 'Locally owned continuation')]));
   a.state.sync.capture('history', machine, thread.id, { malformed: true });
   const key = stateKey('history', machine, thread.id);
@@ -1233,4 +1243,766 @@ test('live image snapshots use the current native alias and keep original conver
   history.captureAttachment({ ...aliased, method: 'turn/completed' });
   mode = 'ssh'; history.captureAttachment(aliased);
   assert.equal(snapshots.length, 3);
+});
+
+function unwrittenNativeThread(f, client) {
+  const thread = f.create(client), bytes = fs.readFileSync(thread.path);
+  fs.unlinkSync(thread.path); thread.ephemeral = false;
+  client.connection.before = method => {
+    if (method === 'thread/turns/list') throw new Error(`thread ${thread.id} is not materialized yet; thread/turns/list is unavailable before first user message`);
+  };
+  return { thread, bytes };
+}
+
+test('a native chat without its first rollout can send, retry a failed first turn and retain authority across reconnect', async t => {
+  const f = fixture(t), { a } = f, { thread, bytes } = unwrittenNativeThread(f, a);
+  await a.history.verify(thread.id);
+  assert.equal(a.history.canRun(thread.id), true); assert.equal(fs.existsSync(thread.path), false);
+  const first = await a.history.begin(thread.id);
+  assert.ok(first.runToken);
+  await a.history.started(thread.id, first, { turn: { id: 'failed-first-attempt', status: 'failed' } });
+  const retry = await a.history.begin(thread.id);
+  assert.notEqual(retry.runToken, first.runToken); await a.history.end(thread.id, retry);
+  assert.equal(a.history.record(thread.id).digest, undefined);
+  const disk = JSON.parse(fs.readFileSync(a.state.sync.file, 'utf8'));
+  assert.equal(disk.localHistory[thread.id].authority.nativeId, thread.id);
+  a.connection.session = {};
+  const restarted = new HistoryManager(a.state), before = a.calls.length;
+  await restarted.verify(thread.id);
+  assert.equal(restarted.canRun(thread.id), true);
+  assert.equal(a.calls.length, before, 'reconnect must reuse durable native authority without probing nonexistent history again');
+  fs.writeFileSync(thread.path, bytes); a.connection.before = null;
+  restarted.observe(thread); await restarted.tick();
+  assert.ok(a.state.catalog('history', thread.id)?.digest);
+  assert.equal(restarted.record(thread.id).stamp, restarted.stamp(thread.path));
+  assert.equal(restarted.errors.has(thread.id), false);
+});
+
+test('background syncing skips a never-written native rollout without producing history errors', async t => {
+  const f = fixture(t), { a } = f, { thread, bytes } = unwrittenNativeThread(f, a);
+  await a.history.tick(); await a.history.tick();
+  assert.equal(fs.existsSync(thread.path), false);
+  assert.equal(a.history.errors.size, 0); assert.equal(a.state.sync.error, null);
+  assert.equal(a.state.catalog('history', thread.id), undefined);
+  assert.equal(a.state.sync.state.pending.some(op => op.kind === 'history'), false);
+  assert.equal(a.logs.some(log => log.event === 'conversation.history.failed'), false);
+  fs.writeFileSync(thread.path, bytes); a.connection.before = null;
+  await a.history.tick();
+  assert.ok(a.state.catalog('history', thread.id));
+});
+
+test('missing existing or ambiguous native history cannot use the first-message exception', async t => {
+  for (const kind of ['old-history', 'empty-list', 'other-error', 'remote-manifest', 'pending', 'conflict', 'imported', 'ephemeral']) await t.test(kind, async t => {
+    const f = fixture(t), { a } = f;
+    let thread;
+    if (kind === 'old-history' || kind === 'remote-manifest') {
+      thread = f.create(a); thread.ephemeral = false;
+      await a.history.tick(); fs.unlinkSync(thread.path);
+      if (kind === 'remote-manifest') delete a.state.sync.state.localHistory[thread.id];
+      a.connection.before = method => { if (method === 'thread/turns/list') throw new Error(`thread ${thread.id} is not materialized yet; thread/turns/list is unavailable before first user message`); };
+    } else ({ thread } = unwrittenNativeThread(f, a));
+    a.history.context();
+    const key = stateKey('history', machine, thread.id);
+    if (kind === 'empty-list') a.connection.before = null;
+    if (kind === 'other-error') a.connection.before = method => { if (method === 'thread/turns/list') throw new Error('Native probe failed'); };
+    if (kind === 'pending') a.state.sync.capture('history', machine, thread.id, { digest: 'unverified' });
+    if (kind === 'conflict') a.state.sync.state.conflicts[key] = { remote: null };
+    if (kind === 'imported') a.state.sync.state.localHistory[thread.id] = { nativeId: randomUUID(), path: thread.path };
+    if (kind === 'ephemeral') thread.ephemeral = true;
+    await assert.rejects(a.history.verify(thread.id), error => error.code === 'HISTORY_NOT_LOADED' || error.message === 'Native probe failed');
+    assert.equal(a.history.record(thread.id)?.authority, undefined);
+    assert.equal(a.history.canRun(thread.id), false);
+    assert.equal(a.bridgeCalls.some(call => call.method === 'history-begin'), false);
+    if (kind === 'pending') assert.equal(a.state.sync.state.pending.find(op => op.key === key).value.digest, 'unverified');
+    if (kind === 'conflict') assert.deepEqual(a.state.sync.state.conflicts[key], { remote: null });
+  });
+});
+
+test('a never-written native probe cannot grant authority after its connection or local history state changes', async t => {
+  for (const change of ['namespace', 'machine', 'session', 'pending', 'conflict']) await t.test(change, async t => {
+    const f = fixture(t), { a } = f, { thread } = unwrittenNativeThread(f, a), waiting = gate();
+    a.connection.before = async method => {
+      if (method === 'thread/turns/list') { waiting.begin(); await waiting.held; throw new Error(`thread ${thread.id} is not materialized yet; thread/turns/list is unavailable before first user message`); }
+    };
+    const verifying = a.history.verify(thread.id); await waiting.started;
+    const state = a.state.sync.state, key = stateKey('history', machine, thread.id);
+    if (change === 'namespace') a.shared.key = 'history-fixture:/new-empty-native-namespace';
+    else if (change === 'machine') a.switchMachine('access:changed-machine:22');
+    else if (change === 'session') a.connection.session = {};
+    else if (change === 'pending') a.state.sync.capture('history', machine, thread.id, { digest: 'new-pending-version' });
+    else state.conflicts[key] = { remote: null };
+    waiting.release(); await assert.rejects(verifying, /connection changed|Load the latest shared history/);
+    assert.equal(state.localHistory[thread.id]?.authority, undefined);
+  });
+});
+
+test('concurrent first-message verification reuses the authority granted by the other probe', async t => {
+  const f = fixture(t), { a } = f, { thread } = unwrittenNativeThread(f, a), waiting = gate();
+  let probes = 0;
+  a.connection.before = async method => {
+    if (method === 'thread/turns/list') {
+      if (++probes === 2) waiting.begin();
+      await waiting.held;
+      throw new Error(`thread ${thread.id} is not materialized yet; thread/turns/list is unavailable before first user message`);
+    }
+  };
+  const first = a.history.verify(thread.id), second = a.history.verify(thread.id);
+  await waiting.started; waiting.release();
+  await assert.doesNotReject(Promise.all([first, second]));
+  assert.equal(probes, 2); assert.equal(a.history.canRun(thread.id), true);
+  assert.equal(a.history.record(thread.id).authority.nativeId, thread.id);
+  assert.equal(fs.existsSync(thread.path), false);
+});
+
+test('a first-message authority grant during a background probe requeues instead of reporting missing history as corrupt', async t => {
+  const f = fixture(t), { a } = f, { thread } = unwrittenNativeThread(f, a), waiting = gate();
+  const owner = await a.history.ownership(thread.id); let probes = 0;
+  a.connection.before = async method => {
+    if (method === 'thread/turns/list') {
+      if (++probes === 1) { waiting.begin(); await waiting.held; }
+      throw new Error(`thread ${thread.id} is not materialized yet; thread/turns/list is unavailable before first user message`);
+    }
+  };
+  const exporting = a.history.export(thread, owner); await waiting.started;
+  await a.history.verify(thread.id); waiting.release();
+  assert.equal(await exporting, false);
+  assert.equal(probes, 2); assert.equal(a.history.queue.has(thread.id), true);
+  assert.equal(a.history.canRun(thread.id), true); assert.equal(a.history.errors.size, 0);
+  assert.equal(a.logs.some(log => log.event === 'conversation.history.failed'), false);
+  assert.equal(a.state.sync.state.pending.some(op => op.kind === 'history'), false);
+});
+
+test('a cold imported cache resumes its verified path read-only before same-version refresh and authority grant', async t => {
+  for (const state of ['unreadable', 'notLoaded']) await t.test(state, async t => {
+  const f = fixture(t), { a, b } = f, source = f.create(a);
+  await a.history.tick(); await b.history.read(source.id);
+  await b.history.request(source.id); await a.history.tick(); await b.history.refresh();
+  const record = b.history.record(source.id), original = fs.readFileSync(record.path), before = b.calls.length;
+  if (state === 'unreadable') b.native.delete(source.id); else b.native.get(source.id).status.type = 'notLoaded';
+  b.connection.session = {};
+  await b.history.read(source.id, { refresh: true });
+  const calls = b.calls.slice(before), resume = calls.find(call => call.method === 'thread/resume');
+  assert.ok(resume); assert.equal(resume.params.path, record.path); assert.equal(resume.params.threadId, source.id);
+  assert.equal(resume.params.sandbox, 'read-only'); assert.equal(resume.params.approvalPolicy, 'never');
+  assert.deepEqual(resume.params.config, { 'features.goals': false });
+  assert.equal(b.history.record(source.id), record); assert.deepEqual(fs.readFileSync(record.path), original);
+  await b.history.verify(source.id); assert.equal(b.history.hasAuthority(source.id), true);
+  assert.equal(b.calls.slice(before).filter(call => call.method === 'thread/resume').length, 1);
+  assert.equal(b.calls.some(call => ['turn/start', 'review/start'].includes(call.method)), false);
+  });
+});
+
+test('ordinary cached reads share one cold resume and preserve a dirty copy when refresh refuses it', async t => {
+  const f = fixture(t), { a, b } = f, source = f.create(a);
+  await a.history.tick(); await b.history.read(source.id);
+  const record = b.history.record(source.id), waiting = gate(), before = b.calls.length;
+  b.native.delete(source.id);
+  b.connection.before = async method => { if (method === 'thread/resume') { waiting.begin(); await waiting.held; } };
+  const first = b.history.read(source.id), second = b.history.read(source.id); await waiting.started;
+  waiting.release(); await Promise.all([first, second]); b.connection.before = null;
+  assert.equal(b.calls.slice(before).filter(call => call.method === 'thread/resume').length, 1);
+  fs.appendFileSync(record.path, encode([question(2, 'Unpublished local bytes')])); const dirty = fs.readFileSync(record.path);
+  b.native.delete(source.id); const resumes = b.calls.filter(call => call.method === 'thread/resume').length;
+  await assert.rejects(b.history.read(source.id, { refresh: true }), /unsynced conversation messages/);
+  assert.equal(b.calls.filter(call => call.method === 'thread/resume').length, resumes);
+  assert.deepEqual(fs.readFileSync(record.path), dirty); assert.equal(record.authority, null);
+});
+
+test('opening cached history accepts native resume metadata without marking it synced or granting authority', async t => {
+  const f = fixture(t), { a, b } = f, source = f.create(a);
+  await a.history.tick(); await b.history.read(source.id);
+  const record = b.history.record(source.id), savedStamp = record.stamp, before = b.calls.length;
+  b.native.delete(source.id);
+  const metadata = { type: 'session_meta', payload: { id: source.id, cwd: b.root } };
+  b.connection.before = method => { if (method === 'thread/resume') fs.appendFileSync(record.path, encode([metadata])); };
+  await b.history.read(source.id);
+  assert.equal(b.calls.slice(before).filter(call => call.method === 'thread/resume').length, 1);
+  assert.equal(b.native.get(source.id).status.type, 'idle');
+  assert.notEqual(b.history.stamp(record.path), savedStamp);
+  assert.equal(record.stamp, savedStamp); assert.equal(record.authority, null);
+  assert.equal(b.history.hasAuthority(source.id), false);
+  assert.equal(b.calls.slice(before).some(call => ['turn/start', 'review/start'].includes(call.method)), false);
+});
+
+test('cold resume metadata is reconciled before sending while changed messages remain protected', async t => {
+  for (const kind of ['metadata', 'missing-image', 'extra-message', 'edited-message']) await t.test(kind, async t => {
+    const f = fixture(t), { a, b } = f, source = f.create(a);
+    if (kind === 'missing-image') fs.appendFileSync(source.path, encode([{ ...question(2, 'Unavailable image'), payload: { type: 'user_message', message: 'Unavailable image', local_images: [path.join(f.directory, 'removed.png')] } }]));
+    await a.history.tick(); await b.history.read(source.id);
+    await b.history.request(source.id); await a.history.tick(); await b.history.refresh();
+    const record = b.history.record(source.id), savedStamp = record.stamp;
+    b.native.delete(source.id);
+    b.connection.before = method => {
+      if (method !== 'thread/resume') return;
+      fs.appendFileSync(record.path, encode([{ type: 'session_meta', payload: { id: source.id, cwd: b.root } }]));
+      if (kind === 'extra-message') fs.appendFileSync(record.path, encode([question(2, 'Local unsynced request')]));
+      if (kind === 'edited-message') {
+        const rows = fs.readFileSync(record.path, 'utf8').trimEnd().split('\n').map(JSON.parse); rows[1].payload.message = 'Locally edited request';
+        fs.writeFileSync(record.path, encode(rows));
+      }
+    };
+    await b.history.read(source.id);
+    assert.equal(record.stamp, savedStamp); assert.equal(record.authority, null);
+    if (kind === 'metadata' || kind === 'missing-image') {
+      await b.history.verify(source.id);
+      assert.equal(b.history.canRun(source.id), true);
+      if (kind === 'missing-image') {
+        b.history.retry(source.id);
+        await b.history.export(b.native.get(source.id), b.history.owners.get(source.id));
+        const pending = b.state.sync.state.pending.findLast(op => op.kind === 'history' && op.id === source.id);
+        assert.equal(pending.value.missingImages, 1);
+        const compressed = Buffer.concat(pending.value.chunks.map(chunk => fs.readFileSync(b.state.sync.blobFile(chunk.hash))));
+        assert.ok(require('node:zlib').gunzipSync(compressed).includes(Buffer.from('remote-codex-missing-image:' + hash(path.join(f.directory, 'removed.png')))));
+      }
+      assert.equal(b.history.record(source.id).stamp, b.history.stamp(record.path));
+      await b.history.verify(source.id);
+      assert.equal(b.history.canRun(source.id), true);
+    } else {
+      await assert.rejects(b.history.verify(source.id), /Load the latest shared history/);
+      assert.equal(record.stamp, savedStamp); assert.equal(record.authority, null);
+      assert.equal(b.history.canRun(source.id), false);
+    }
+    assert.equal(b.calls.some(call => ['turn/start', 'review/start'].includes(call.method)), false);
+  });
+});
+
+test('cached resume cannot grant authority after its connection or private rollout identity changes', async t => {
+  for (const change of ['session', 'header']) await t.test(change, async t => {
+    const f = fixture(t), { a, b } = f, source = f.create(a);
+    await a.history.tick(); await b.history.read(source.id);
+    await b.history.request(source.id); await a.history.tick(); await b.history.refresh();
+    const record = b.history.record(source.id); b.native.delete(source.id);
+    if (change === 'header') {
+      const rows = fs.readFileSync(record.path, 'utf8').trim().split('\n').map(JSON.parse); rows[0].payload.id = randomUUID();
+      fs.writeFileSync(record.path, encode(rows));
+      await assert.rejects(b.history.verify(source.id), /identity changed/);
+      assert.equal(b.native.has(source.id), false);
+    } else {
+      const waiting = gate(); b.connection.before = async method => { if (method === 'thread/resume') { waiting.begin(); await waiting.held; } };
+      const verifying = b.history.verify(source.id); await waiting.started; b.connection.session = {}; waiting.release();
+      await assert.rejects(verifying, /changed while loading cached/);
+    }
+    assert.equal(record.authority, null);
+  });
+});
+
+test('Stop for an exact admitted local turn works offline without opening shared storage', async t => {
+  const f = fixture(t), { a, b } = f, source = f.create(a);
+  const run = await a.history.begin(source.id); await a.history.started(source.id, run, { turn: { id: 'local-turn', status: 'inProgress' } });
+  let network = 0; a.shared.online = async () => { network++; throw new Error('SSH offline'); };
+  await assert.doesNotReject(a.history.verify(source.id, true, 'local-turn')); assert.equal(network, 0);
+  await assert.rejects(a.history.verify(source.id, true, 'other-turn'), /SSH offline/);
+  a.history.record(source.id).nativeId = randomUUID();
+  await assert.rejects(a.history.verify(source.id, true, 'local-turn'), /SSH offline/);
+  delete a.history.record(source.id).nativeId;
+  a.connection.session = {};
+  await assert.rejects(a.history.verify(source.id, true, 'local-turn'), /SSH offline/);
+  b.shared.online = async () => { throw new Error('Peer SSH offline'); };
+  await assert.rejects(b.history.verify(source.id, true, 'local-turn'), /Peer SSH offline/);
+});
+
+test('offline Stop maps a known detached review back to its admitted source, never to a durable-only marker', async t => {
+  const f = fixture(t), { a } = f, source = f.create(a), child = randomUUID();
+  const run = await a.history.begin(source.id, 'review/start');
+  await a.history.started(source.id, run, { reviewThreadId: child, turn: { id: 'review-turn', status: 'inProgress' } });
+  a.shared.online = async () => { throw new Error('SSH offline'); };
+  await assert.doesNotReject(a.history.verify(child, true, 'review-turn'));
+  await assert.rejects(a.history.verify(randomUUID(), true, 'review-turn'), /SSH offline/);
+  a.connection.session = {};
+  await assert.rejects(a.history.verify(child, true, 'review-turn'), /SSH offline/);
+  assert.ok(a.history.record(source.id).pendingReview);
+});
+
+test('an ambiguous first send before materialization releases only its matching admitted token and can retry', async t => {
+  const f = fixture(t), { a } = f, { thread } = unwrittenNativeThread(f, a);
+  const first = await a.history.begin(thread.id); a.history.uncertain(thread.id, first);
+  assert.equal(await a.history.recover(thread.id, a.history.owners.get(thread.id)), true);
+  assert.equal(a.history.runs.has(thread.id), false); assert.equal(a.history.owners.get(thread.id).busy, 0);
+  const end = a.bridgeCalls.find(call => call.method === 'history-end'); assert.equal(end.args.runToken, first.runToken);
+  const next = await a.history.begin(thread.id); assert.notEqual(next.runToken, first.runToken);
+  assert.equal(fs.existsSync(thread.path), false);
+});
+
+test('empty-thread recovery retains busy when first-message evidence is no longer valid', async t => {
+  const f = fixture(t), { a } = f, { thread } = unwrittenNativeThread(f, a);
+  const run = await a.history.begin(thread.id); a.history.uncertain(thread.id, run);
+  a.history.record(thread.id).digest = 'existing-history';
+  assert.equal(await a.history.recover(thread.id, a.history.owners.get(thread.id)), false);
+  assert.equal(a.history.owners.get(thread.id).busy, 1); assert.equal(a.bridgeCalls.some(call => call.method === 'history-end'), false);
+});
+
+test('an uncertain detached review stays fenced across restart until its own thread and exact turn are known', async t => {
+  const f = fixture(t), { a } = f, source = f.create(a);
+  source.turns = [{ id: 'older-source-turn', status: 'completed' }];
+  const run = await a.history.begin(source.id, 'review/start'); a.history.uncertain(source.id, run);
+  assert.equal(await a.history.recover(source.id, a.history.owners.get(source.id)), false);
+  const stored = JSON.parse(fs.readFileSync(a.state.sync.file, 'utf8')); assert.equal(stored.localHistory[source.id].pendingReview.runToken, run.runToken);
+  a.connection.session = {}; a.history.context(); await a.history.refresh();
+  assert.equal(await a.history.recover(source.id, a.history.owners.get(source.id)), false);
+  await assert.rejects(a.history.begin(source.id), /running task/);
+  assert.equal(a.bridgeCalls.some(call => call.method === 'history-end'), false);
+  const owner = a.history.owners.get(source.id), child = f.create(a, 'Review result');
+  child.status.type = 'active'; child.turns = [{ id: 'actual-review-turn', status: 'inProgress' }];
+  Object.assign(a.history.record(source.id).pendingReview, { threadId: child.id, turnId: 'actual-review-turn' }); a.state.sync.save();
+  assert.equal(await a.history.recover(source.id, owner), false);
+  child.status.type = 'idle'; child.turns[0].status = 'completed';
+  assert.equal(await a.history.recover(source.id, owner), true); assert.equal(a.history.record(source.id).pendingReview, undefined);
+  const next = await a.history.begin(source.id, 'review/start');
+  await a.history.end(source.id, run);
+  assert.equal(a.history.record(source.id).pendingReview.runToken, next.runToken);
+  assert.equal(a.history.owners.get(source.id).busy, 1);
+});
+
+test('a timed-out inline review recovers on its source after completion and reconnect', async t => {
+  for (const reconnect of [false, true]) await t.test(String(reconnect), async t => {
+    const f = fixture(t), { a } = f, source = f.create(a);
+    const run = await a.history.begin(source.id, 'review/start', { delivery: 'inline' });
+    a.history.uncertain(source.id, run);
+    source.status.type = 'active'; source.turns = [{ id: 'inline-review', status: 'inProgress' }];
+    if (reconnect) { a.connection.session = {}; a.history.restore(); await a.history.refresh(); }
+    assert.equal(await a.history.recover(source.id, a.history.owners.get(source.id)), false);
+    source.status.type = 'idle'; source.turns[0].status = 'completed';
+    await a.history.completed({ threadId: source.id, turn: source.turns[0] });
+    assert.equal(await a.history.recover(source.id, a.history.owners.get(source.id)), true);
+    assert.equal(a.history.record(source.id).pendingReview, undefined);
+    assert.equal(a.history.owners.get(source.id).busy, 0);
+    const next = await a.history.begin(source.id);
+    await a.history.end(source.id, next);
+  });
+});
+
+test('Review after restart recovers the previous finished task before admitting a new review', async t => {
+  for (const previous of ['turn', 'inline', 'detached']) await t.test(previous, async t => {
+    const f = fixture(t), { a } = f, source = f.create(a);
+    const target = previous === 'detached' ? f.create(a, 'Detached review') : source;
+    target.turns = [{ id: 'previous-task', status: 'completed' }];
+    const old = await a.history.begin(source.id, previous === 'turn' ? 'turn/start' : 'review/start', { delivery: previous });
+    await a.history.started(source.id, old, { ...(target !== source ? { reviewThreadId: target.id } : {}), turn: { id: 'previous-task', status: 'inProgress' } });
+    a.connection.session = {}; a.history.restore();
+    const next = await a.history.begin(source.id, 'review/start', { delivery: 'inline' });
+    assert.notEqual(next.runToken, old.runToken);
+    assert.equal(a.history.record(source.id).pendingReview.runToken, next.runToken);
+    assert.deepEqual(a.bridgeCalls.filter(call => call.method === 'history-end').map(call => call.args.runToken), [old.runToken]);
+    assert.ok(a.calls.some(call => call.method === 'thread/turns/list' && call.params.threadId === target.id));
+    await a.history.end(source.id, next);
+  });
+});
+
+test('Review after restart keeps an unknown or still-running detached review fenced', async t => {
+  for (const known of [false, true]) await t.test(String(known), async t => {
+    const f = fixture(t), { a } = f, source = f.create(a), child = f.create(a, 'Active detached review');
+    source.turns = [{ id: 'old-source-turn', status: 'completed' }];
+    child.turns = [{ id: 'active-review', status: 'inProgress' }]; child.status.type = 'active';
+    const old = await a.history.begin(source.id, 'review/start', { delivery: 'detached' });
+    if (known) await a.history.started(source.id, old, { reviewThreadId: child.id, turn: child.turns[0] });
+    else a.history.uncertain(source.id, old);
+    a.connection.session = {}; a.history.restore();
+    await assert.rejects(a.history.begin(source.id, 'review/start', { delivery: 'inline' }), /running task/);
+    assert.equal(a.history.record(source.id).pendingReview.runToken, old.runToken);
+    assert.equal(a.bridgeCalls.some(call => call.method === 'history-end'), false);
+    if (known) assert.ok(a.calls.some(call => call.method === 'thread/turns/list' && call.params.threadId === child.id));
+  });
+});
+
+test('successful transfer requests do not wait for bulk sync and can be cancelled with the native provider offline', async t => {
+  const f = fixture(t), { a, b } = f, source = f.create(a); await a.history.tick();
+  t.mock.method(b.state.sync, 'tick', async () => { throw new Error('Unrelated upload failed'); });
+  await assert.doesNotReject(b.history.request(source.id));
+  b.connection.ready = false;
+  assert.equal(b.history.status().find(owner => owner.id === source.id).waiting, true);
+  const result = await b.history.cancelRequest(source.id);
+  assert.equal(result.find(owner => owner.id === source.id).waiting, false);
+  assert.equal(b.calls.length, 0, 'cancellation must not require any native operation');
+  await assert.doesNotReject(a.history.verify(source.id));
+});
+
+test('archive ownership checks do not require native history but still reject busy and foreign conversations', async t => {
+  const { a, b } = fixture(t), id = randomUUID();
+  await a.history.verify(id, false, undefined, { loadHistory: false });
+  assert.equal(a.calls.length, 0, 'archival must not need the missing native history');
+  await assert.rejects(a.history.verify(id), /Load the latest shared history/);
+  await assert.rejects(b.history.verify(id, false, undefined, { loadHistory: false }), /Use this conversation/);
+  const owner = a.history.owners.get(id);
+  await a.shared.bridge.call('history-begin', { machine, id, epoch: owner.epoch });
+  await assert.rejects(a.history.verify(id, false, undefined, { loadHistory: false }), /Stop the running task/);
+});
+
+test('archived conversations leave no missing-history retry loop after their native file disappears', async t => {
+  const f = fixture(t), { a } = f, thread = f.create(a);
+  await a.history.tick();
+  a.state.sync.capture('thread', machine, thread.id, null); await a.state.sync.tick();
+  fs.unlinkSync(thread.path); a.native.delete(thread.id);
+  a.history.queue.set(thread.id, thread);
+  a.history.errors.set(thread.id, { message: 'Old missing history', path: thread.path, stamp: null, retryAt: 0 });
+  a.calls.length = 0;
+  await a.history.tick(); a.history.observe(thread); await a.history.tick();
+  assert.equal(a.history.queue.has(thread.id), false); assert.equal(a.history.errors.has(thread.id), false);
+  assert.equal(a.calls.some(call => call.params?.threadId === thread.id), false);
+  assert.equal(a.state.catalog('thread', thread.id), null);
+});
+
+const encryptedReasoningError = itemId => ({ message: JSON.stringify({ type: 'error', error: { code: 'invalid_encrypted_content', message: `The encrypted content for item ${itemId} could not be verified. Reason: reasoning hydration failed: Encrypted content could not be decrypted or parsed.` }, status: 400 }) });
+function reasoningFixture(t) {
+  const f = fixture(t), { a } = f, thread = f.create(a), itemId = 'rs_damaged123';
+  fs.appendFileSync(thread.path, encode([
+    { type: 'event_msg', ordinal: 2, payload: { type: 'item_completed', thread_id: thread.id, turn_id: 'failed-turn', item: { type: 'Reasoning', id: itemId, summary_text: ['Visible thought'], raw_content: [] } } },
+    { type: 'response_item', ordinal: 3, payload: { type: 'reasoning', id: itemId, summary: [], encrypted_content: 'abc[AI credential removed]xyz' } },
+    { type: 'response_item', ordinal: 4, payload: { type: 'function_call', call_id: 'tool-call', name: 'exec_command', arguments: '{"cmd":"fixture"}' } },
+    { type: 'response_item', ordinal: 5, payload: { type: 'function_call_output', call_id: 'tool-call', output: 'Visible stored output' } },
+    { type: 'response_item', ordinal: 6, payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Visible final answer' }] } },
+  ]));
+  thread.turns = [{ id: 'failed-turn', status: 'failed', error: encryptedReasoningError(itemId) }];
+  let aliases = {};
+  const call = a.connection.call.bind(a.connection);
+  a.connection.setThreadAliases = records => { aliases = structuredClone(records); };
+  a.connection.call = async (method, params) => {
+    const logicalId = params.threadId, nativeId = aliases[logicalId]?.nativeId;
+    const result = await call(method, nativeId ? { ...params, threadId: nativeId } : params);
+    if (nativeId && result.thread) result.thread.id = logicalId;
+    return result;
+  };
+  return { ...f, thread, itemId };
+}
+
+test('Send repairs recognized encrypted reasoning into a private alias without losing visible history or waiting for upload', async t => {
+  const f = reasoningFixture(t), { a, thread, itemId } = f;
+  await a.history.verify(thread.id);
+  const original = fs.readFileSync(thread.path);
+  a.history.observeError(thread.id, encryptedReasoningError(itemId));
+  const run = await a.history.begin(thread.id, 'turn/start', { repairReasoning: true }), record = a.history.record(thread.id);
+  assert.notEqual(record.nativeId, thread.id); assert.notEqual(record.path, thread.path);
+  assert.deepEqual(fs.readFileSync(thread.path), original);
+  const repairedRows = fs.readFileSync(record.path, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(repairedRows.some(row => row.type === 'response_item' && row.payload.type === 'reasoning'), false);
+  assert.equal(repairedRows.find(row => row.payload.item?.type === 'Reasoning').payload.item.id, itemId);
+  assert.match(JSON.stringify(repairedRows), /Visible thought/); assert.match(JSON.stringify(repairedRows), /Visible stored output/); assert.match(JSON.stringify(repairedRows), /Visible final answer/);
+  assert.deepEqual(record.repairedReasoningIds, [itemId]); assert.equal(record.preservedSnapshots.length, 2);
+  assert.equal(record.authority.nativeId, record.nativeId); assert.equal(run.nativeId, record.nativeId);
+  const queued = a.state.sync.state.pending.find(op => op.kind === 'history' && op.id === thread.id);
+  assert.equal(queued.value.digest, record.digest); assert.equal(queued.value.epoch, run.epoch); assert.equal(queued.value.reasoningRepairs, undefined);
+  assert.equal(a.bridgeCalls.some(call => ['state-push', 'blob-put'].includes(call.method)), false);
+  const resumed = a.calls.findLast(call => call.method === 'thread/resume').params;
+  assert.equal(resumed.sandbox, 'read-only'); assert.equal(resumed.approvalPolicy, 'never'); assert.equal(resumed.config['features.goals'], false);
+  assert.deepEqual(a.calls.filter(call => call.method === 'thread/unsubscribe').map(call => call.params.threadId), [thread.id]);
+  a.history.observeError(thread.id, encryptedReasoningError(itemId)); assert.equal(a.history.reasoningErrors.has(thread.id), false);
+  await a.history.end(thread.id, run);
+  const stored = JSON.parse(fs.readFileSync(a.state.sync.file, 'utf8'));
+  assert.equal(stored.localHistory[thread.id].nativeId, record.nativeId); assert.deepEqual(stored.localHistory[thread.id].repairedReasoningIds, [itemId]);
+});
+
+test('reasoning hints require the exact native API error and ignore previously repaired failures', t => {
+  const { a, thread, itemId } = reasoningFixture(t);
+  for (const error of [undefined, { message: 'null' }, { message: '42' }, { message: 'invalid_encrypted_content ' + itemId }, { code: 'other', message: `The encrypted content for item ${itemId} could not be verified.` }, { code: 'invalid_encrypted_content', message: 'Unknown item' }]) {
+    a.history.observeError(thread.id, error); assert.equal(a.history.reasoningErrors.size, 0);
+  }
+  a.history.observeError(thread.id, encryptedReasoningError(itemId)); assert.equal(a.history.reasoningErrors.get(thread.id).itemId, itemId);
+});
+
+test('the first explicit Send after reconnect repairs a persisted reasoning failure', async t => {
+  for (const session of ['session', 'nativeSession']) await t.test(session, async t => {
+    const { a, thread, itemId } = reasoningFixture(t);
+    if (session === 'nativeSession') a.connection.connections = new Map([['codex', { session: {} }]]);
+    await a.history.verify(thread.id);
+    a.history.observeError(thread.id, encryptedReasoningError(itemId));
+    if (session === 'nativeSession') a.connection.connections.get('codex').session = {};
+    else a.connection.session = {};
+    a.history.restore();
+    const run = await a.history.begin(thread.id, 'turn/start', { repairReasoning: true });
+    assert.notEqual(run.nativeId, thread.id);
+    assert.deepEqual(a.history.record(thread.id).repairedReasoningIds, [itemId]);
+    assert.equal(a.calls.filter(call => call.method === 'thread/resume').length, 1);
+    await a.history.end(thread.id, run);
+  });
+});
+
+test('explicit repair after restart recovers a finished task and preserves a running task', async t => {
+  for (const status of ['idle', 'systemError', 'active']) await t.test(status, async t => {
+    const { a, thread, itemId } = reasoningFixture(t), bytes = fs.readFileSync(thread.path);
+    const old = await a.history.begin(thread.id);
+    await a.history.started(thread.id, old, { turn: { id: 'failed-turn', status: 'inProgress' } });
+    a.history.observeError(thread.id, encryptedReasoningError(itemId));
+    thread.status.type = status;
+    if (status === 'active') thread.turns[0].status = 'inProgress';
+    a.connection.session = {}; a.history.restore();
+    if (status === 'active') {
+      await assert.rejects(a.history.begin(thread.id, 'turn/start', { repairReasoning: true }), /running task/);
+      assert.equal(a.history.record(thread.id).nativeId, undefined);
+      assert.equal(a.calls.some(call => call.method === 'thread/resume'), false);
+      assert.equal(a.bridgeCalls.some(call => call.method === 'history-end'), false);
+    } else {
+      const next = await a.history.begin(thread.id, 'turn/start', { repairReasoning: true });
+      assert.notEqual(next.nativeId, thread.id); assert.notEqual(next.runToken, old.runToken);
+      assert.deepEqual(a.history.record(thread.id).repairedReasoningIds, [itemId]);
+      assert.deepEqual(a.bridgeCalls.filter(call => call.method === 'history-end').map(call => call.args.runToken), [old.runToken]);
+      await a.history.end(thread.id, next);
+    }
+    assert.deepEqual(fs.readFileSync(thread.path), bytes);
+  });
+});
+
+test('a persisted failure repairs linked history after restart from native systemError', async t => {
+  const { a, thread, itemId, home } = reasoningFixture(t);
+  const parent = thread.path, parentBytes = fs.readFileSync(parent);
+  const continuation = path.join(home, 'sessions', 'rollout-continuation-' + randomUUID() + '.jsonl');
+  fs.writeFileSync(continuation, encode([
+    { type: 'session_meta', ordinal: 0, payload: { id: thread.id, cwd: a.root, history_base: { thread_id: thread.id, end_ordinal_exclusive: 7, end_byte_offset: parentBytes.length } } },
+    { type: 'event_msg', ordinal: 7, payload: { type: 'task_complete', turn_id: 'failed-turn', error: encryptedReasoningError(itemId) } }
+  ]));
+  thread.path = continuation; thread.status.type = 'systemError';
+  const continuationBytes = fs.readFileSync(continuation);
+  await a.history.verify(thread.id); a.history.observeError(thread.id, thread.turns[0].error);
+  const saved = JSON.parse(fs.readFileSync(a.state.sync.file, 'utf8')).localHistory[thread.id];
+  assert.equal(saved.reasoningFailure.itemId, itemId);
+  a.state.sync.state.localHistory[thread.id] = saved;
+  const restarted = new HistoryManager(a.state); a.state.history = restarted;
+  assert.equal(restarted.reasoningErrors.size, 0);
+  const run = await restarted.begin(thread.id, 'turn/start', { repairReasoning: true }), record = restarted.record(thread.id);
+  assert.notEqual(record.nativeId, thread.id); assert.equal(run.nativeId, record.nativeId);
+  assert.equal(record.reasoningFailure, null);
+  assert.deepEqual(record.repairedReasoningIds, [itemId]);
+  assert.equal(fs.readFileSync(record.path, 'utf8').includes('[AI credential removed]'), false);
+  assert.match(fs.readFileSync(record.path, 'utf8'), /Visible stored output/);
+  assert.deepEqual(fs.readFileSync(parent), parentBytes);
+  assert.deepEqual(fs.readFileSync(continuation), continuationBytes);
+  assert.ok(a.calls.some(call => call.method === 'thread/unsubscribe' && call.params.threadId === thread.id));
+  await restarted.end(thread.id, run);
+});
+
+test('persisted repair hints survive editing away the failed turn and remain scoped to their native profile', async t => {
+  const { a, thread, itemId } = reasoningFixture(t);
+  await a.history.verify(thread.id); a.history.observeError(thread.id, thread.turns[0].error);
+  const saved = a.history.record(thread.id).reasoningFailure;
+  a.history.reasoningErrors.clear();
+  a.history.record(thread.id).reasoningFailure = { ...saved, home: '/another-profile' };
+  assert.equal(a.history.reasoningHint(thread.id), undefined);
+  a.history.record(thread.id).reasoningFailure = { ...saved, nativeId: randomUUID() };
+  assert.equal(a.history.reasoningHint(thread.id), undefined);
+  a.history.record(thread.id).reasoningFailure = saved;
+  thread.turns = [{ id: 'earlier-retained-turn', status: 'completed' }];
+  const run = await a.history.begin(thread.id, 'turn/start', { repairReasoning: true });
+  assert.deepEqual(a.history.record(thread.id).repairedReasoningIds, [itemId]);
+  await a.history.end(thread.id, run);
+});
+
+test('systemError without a terminal failed turn cannot repair or admit a task', async t => {
+  const { a, thread, itemId } = reasoningFixture(t);
+  await a.history.verify(thread.id); a.history.observeError(thread.id, encryptedReasoningError(itemId));
+  thread.status.type = 'systemError'; thread.turns[0].status = 'completed';
+  await assert.rejects(a.history.begin(thread.id, 'turn/start', { repairReasoning: true }), /Stop this conversation/);
+  assert.equal(a.bridgeCalls.some(call => call.method === 'history-begin'), false);
+  assert.equal(a.history.record(thread.id).nativeId, undefined);
+});
+
+test('a missed completion release recovers a failed systemError run before repairing and sending', async t => {
+  const { a, thread, itemId } = reasoningFixture(t);
+  const oldRun = await a.history.begin(thread.id);
+  await a.history.started(thread.id, oldRun, { turn: { id: 'failed-turn', status: 'inProgress' } });
+  thread.status.type = 'systemError'; a.history.observeError(thread.id, encryptedReasoningError(itemId));
+  const run = await a.history.begin(thread.id, 'turn/start', { repairReasoning: true });
+  assert.notEqual(run.runToken, oldRun.runToken);
+  assert.notEqual(run.nativeId, thread.id);
+  assert.deepEqual(a.history.record(thread.id).repairedReasoningIds, [itemId]);
+  assert.ok(a.logs.some(entry => entry.event === 'conversation.history.recovered' && entry.details.phase === 'stale-busy'));
+  await a.history.end(thread.id, run);
+});
+
+test('a pending old export cannot replace the repaired native alias after repair completes', async t => {
+  const { a, thread, itemId } = reasoningFixture(t);
+  await a.history.verify(thread.id); a.history.observeError(thread.id, encryptedReasoningError(itemId));
+  const pause = gate(), source = thread.path, stat = fs.promises.stat; let reads = 0;
+  t.mock.method(fs.promises, 'stat', async file => {
+    const result = await stat(file);
+    if (file === source && ++reads === 3) { pause.begin(); await pause.held; }
+    return result;
+  });
+  const publishing = a.history.export(thread, a.history.owners.get(thread.id));
+  await pause.started;
+  let run;
+  try { run = await a.history.begin(thread.id, 'turn/start', { repairReasoning: true }); }
+  finally { pause.release(); await publishing; }
+  const record = a.history.record(thread.id);
+  assert.equal(record.nativeId, run.nativeId); assert.notEqual(record.nativeId, thread.id);
+  assert.deepEqual(record.repairedReasoningIds, [itemId]);
+  assert.equal(record.reasoningFailure, null);
+  assert.equal(record.previousPath, source);
+  const saved = JSON.parse(fs.readFileSync(a.state.sync.file, 'utf8')).localHistory[thread.id];
+  assert.equal(saved.nativeId, record.nativeId); assert.equal(saved.path, record.path);
+  await a.history.end(thread.id, run);
+});
+
+test('repair cannot release a task still awaiting native acceptance', async t => {
+  const { a, thread, itemId } = reasoningFixture(t), bytes = fs.readFileSync(thread.path);
+  const run = await a.history.begin(thread.id);
+  a.history.observeError(thread.id, encryptedReasoningError(itemId));
+  await assert.rejects(a.history.repairReasoning(thread.id), /Stop the running task before repairing/);
+  assert.equal(a.history.runs.get(thread.id), run); assert.equal(a.history.starting.has(thread.id), true);
+  assert.equal(a.bridgeCalls.some(call => call.method === 'history-end'), false);
+  assert.equal(a.calls.some(call => call.method === 'thread/resume'), false);
+  assert.deepEqual(fs.readFileSync(thread.path), bytes);
+});
+
+test('repair refuses active, busy, unfinished, unrecognized and concurrently changed histories before send admission', async t => {
+  for (const kind of ['active', 'busy', 'unfinished', 'unrecognized', 'session', 'file', 'owner', 'parallel']) await t.test(kind, async t => {
+    const f = reasoningFixture(t), { a, thread, itemId } = f;
+    await a.history.verify(thread.id); a.history.observeError(thread.id, encryptedReasoningError(itemId));
+    const before = fs.readFileSync(thread.path);
+    if (kind === 'active') thread.status.type = 'active';
+    if (kind === 'busy') {
+      await a.shared.bridge.call('history-begin', { machine, id: thread.id, epoch: 1 });
+      thread.turns[0].status = 'inProgress';
+    }
+    if (kind === 'unfinished') thread.turns[0].status = 'inProgress';
+    if (kind === 'unrecognized') fs.writeFileSync(thread.path, before.toString().replace('[AI credential removed]', 'validencrypted'));
+    let changed = false;
+    a.connection.before = async method => {
+      if (method !== 'thread/resume' || changed) return; changed = true;
+      if (kind === 'session') a.connection.session = {};
+      if (kind === 'file') fs.appendFileSync(thread.path, encode([question(7, 'Concurrent new question')]));
+      if (kind === 'owner') await a.shared.bridge.call('history-begin', { machine, id: thread.id, epoch: 1 });
+      if (kind === 'parallel') a.history.runs.set(thread.id, { uncertain: true });
+    };
+    await assert.rejects(a.history.begin(thread.id, 'turn/start', { repairReasoning: true }), /Stop|finished turn|recognized damage|Conversation changed|ownership changed/);
+    assert.equal(a.history.record(thread.id).nativeId, undefined);
+    assert.equal(a.state.sync.state.pending.some(op => op.kind === 'history'), false);
+    assert.equal(a.bridgeCalls.filter(call => call.method === 'history-begin').length, ['busy', 'owner'].includes(kind) ? 1 : 0);
+    if (!['file', 'unrecognized'].includes(kind)) assert.deepEqual(fs.readFileSync(thread.path), before);
+  });
+});
+
+test('two explicit Sends share one reasoning repair and admit only one native run', async t => {
+  const { a, thread, itemId } = reasoningFixture(t), waiting = gate();
+  await a.history.verify(thread.id); a.history.observeError(thread.id, encryptedReasoningError(itemId));
+  a.connection.before = async method => { if (method === 'thread/resume') { waiting.begin(); await waiting.held; } };
+  const first = a.history.begin(thread.id, 'turn/start', { repairReasoning: true }); await waiting.started;
+  const second = a.history.begin(thread.id, 'turn/start', { repairReasoning: true });
+  waiting.release();
+  const results = await Promise.allSettled([first, second]);
+  assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+  assert.match(results.find(result => result.status === 'rejected').reason.message, /running task/);
+  assert.equal(a.calls.filter(call => call.method === 'thread/resume').length, 1);
+  assert.equal(a.bridgeCalls.filter(call => call.method === 'history-begin').length, 1);
+});
+
+test('failed repair persistence keeps the original native alias and prevents send admission', async t => {
+  for (const failure of ['capture', 'save']) await t.test(failure, async t => {
+    const { a, thread, itemId } = reasoningFixture(t);
+    await a.history.verify(thread.id); a.history.observeError(thread.id, encryptedReasoningError(itemId));
+    const original = fs.readFileSync(thread.path), previous = a.history.record(thread.id);
+    t.mock.method(a.state.sync, failure, () => { throw new Error('Disk full'); });
+    await assert.rejects(a.history.begin(thread.id, 'turn/start', { repairReasoning: true }), /Disk full/);
+    assert.equal(a.history.record(thread.id), previous); assert.equal(a.history.record(thread.id).nativeId, undefined);
+    assert.deepEqual(fs.readFileSync(thread.path), original);
+    assert.equal(a.state.sync.state.pending.some(op => op.kind === 'history'), false);
+    if (fs.existsSync(a.state.sync.file + '.outbox')) assert.equal(JSON.parse(fs.readFileSync(a.state.sync.file + '.outbox', 'utf8')).pending.some(op => op.kind === 'history'), false);
+    assert.equal(a.bridgeCalls.some(call => call.method === 'history-begin'), false);
+  });
+});
+
+test('a reopened notLoaded source can repair without acquiring or changing its original rollout', async t => {
+  const { a, thread, itemId } = reasoningFixture(t);
+  thread.status.type = 'notLoaded';
+  const original = fs.readFileSync(thread.path);
+  await a.history.verify(thread.id); a.history.observeError(thread.id, encryptedReasoningError(itemId));
+  const run = await a.history.begin(thread.id, 'turn/start', { repairReasoning: true }), record = a.history.record(thread.id);
+  assert.notEqual(record.nativeId, thread.id);
+  assert.deepEqual(fs.readFileSync(thread.path), original);
+  assert.equal(a.calls.filter(call => call.method === 'thread/resume').length, 1);
+  assert.equal(a.calls.find(call => call.method === 'thread/resume').params.threadId, record.nativeId);
+  assert.equal(a.calls.some(call => call.method === 'thread/unsubscribe'), false);
+  assert.equal(thread.status.type, 'notLoaded');
+  await a.history.end(thread.id, run);
+});
+
+test('failed repair save restores its existing pending history and preserves unrelated outbox edits', async t => {
+  const { a, thread, itemId } = reasoningFixture(t);
+  await a.history.verify(thread.id);
+  await a.history.export(thread, a.history.owners.get(thread.id));
+  const key = stateKey('history', machine, thread.id), pending = a.state.sync.state.pending.filter(op => op.key === key), previous = a.history.record(thread.id);
+  a.state.sync.save();
+  a.history.observeError(thread.id, encryptedReasoningError(itemId));
+  t.mock.method(a.state.sync, 'save', () => {
+    a.state.sync.capture('note', machine, 'unrelated-chat', { text: 'Unrelated edit during persistence failure' });
+    throw new Error('Disk full');
+  });
+  await assert.rejects(a.history.begin(thread.id, 'turn/start', { repairReasoning: true }), /Disk full/);
+  assert.equal(a.history.record(thread.id), previous);
+  assert.deepEqual(a.state.sync.state.pending.filter(op => op.key === key), pending);
+  assert.ok(a.state.sync.state.pending.some(op => op.kind === 'note' && op.id === 'unrelated-chat'));
+  const outbox = JSON.parse(fs.readFileSync(a.state.sync.file + '.outbox', 'utf8'));
+  assert.deepEqual(outbox.pending.filter(op => op.key === key), pending);
+  assert.ok(outbox.pending.some(op => op.kind === 'note' && op.id === 'unrelated-chat'));
+  assert.equal(a.bridgeCalls.some(call => call.method === 'history-begin'), false);
+});
+
+test('scheduled admission leaves a pending reasoning repair for an explicit Send', async t => {
+  const { a, thread, itemId } = reasoningFixture(t);
+  await a.history.verify(thread.id); a.history.observeError(thread.id, encryptedReasoningError(itemId));
+  const before = a.calls.length;
+  await assert.rejects(a.history.begin(thread.id), /Send a message explicitly/);
+  assert.equal(a.calls.length, before);
+  assert.equal(a.bridgeCalls.some(call => call.method === 'history-begin'), false);
+  assert.equal(a.history.record(thread.id).nativeId, undefined);
+  assert.ok(a.history.reasoningErrors.has(thread.id));
+});
+
+test('repair refuses an unloaded alias without authority and never resumes its source', async t => {
+  const { a, thread, itemId } = reasoningFixture(t);
+  await a.history.verify(thread.id);
+  a.history.record(thread.id).nativeId = thread.id;
+  a.history.record(thread.id).authority = null;
+  thread.status.type = 'notLoaded';
+  a.history.observeError(thread.id, encryptedReasoningError(itemId));
+  await assert.rejects(a.history.begin(thread.id, 'turn/start', { repairReasoning: true }), /Load the latest shared history/);
+  assert.equal(a.calls.some(call => call.method === 'thread/resume'), false);
+  assert.equal(a.bridgeCalls.some(call => call.method === 'history-begin'), false);
+});
+
+test('an imported repaired snapshot with its retained failed-turn error sends without another repair', async t => {
+  const { a, thread, itemId } = reasoningFixture(t);
+  const rows = fs.readFileSync(thread.path, 'utf8').trim().split('\n').map(JSON.parse).filter(row => !(row.type === 'response_item' && row.payload.type === 'reasoning'));
+  fs.writeFileSync(thread.path, encode(rows));
+  await a.history.verify(thread.id);
+  const record = a.history.record(thread.id), original = fs.readFileSync(thread.path);
+  record.nativeId = thread.id; a.connection.setThreadAliases({ [thread.id]: record });
+  a.history.observeError(thread.id, thread.turns[0].error);
+  const run = await a.history.begin(thread.id, 'turn/start', { repairReasoning: true });
+  assert.equal(a.history.record(thread.id).nativeId, thread.id);
+  assert.deepEqual(a.history.record(thread.id).repairedReasoningIds, [itemId]);
+  assert.equal(a.calls.some(call => ['thread/resume', 'thread/unsubscribe'].includes(call.method)), false);
+  assert.deepEqual(fs.readFileSync(thread.path), original);
+  assert.equal(a.history.reasoningErrors.has(thread.id), false);
+  a.history.observeError(thread.id, thread.turns[0].error); assert.equal(a.history.reasoningErrors.has(thread.id), false);
+  await a.history.end(thread.id, run);
+});
+
+test('an older failed history page cannot rewrite or block a healthy newer finished history', async t => {
+  for (const status of ['completed', 'failed']) await t.test(status, async t => {
+    const { a, thread, itemId } = reasoningFixture(t);
+    await a.history.verify(thread.id); a.history.observeError(thread.id, encryptedReasoningError(itemId));
+    thread.turns = [{ id: 'newer-turn', status, error: status === 'failed' ? { message: 'An unrelated newer failure' } : null }];
+    const rows = fs.readFileSync(thread.path, 'utf8').trim().split('\n').map(JSON.parse).filter(row => !(row.type === 'response_item' && row.payload.type === 'reasoning'));
+    fs.writeFileSync(thread.path, encode(rows));
+    const original = fs.readFileSync(thread.path);
+    const run = await a.history.begin(thread.id, 'turn/start', { repairReasoning: true });
+    assert.equal(a.history.reasoningErrors.has(thread.id), false);
+    assert.equal(a.calls.some(call => ['thread/resume', 'thread/unsubscribe'].includes(call.method)), false);
+    assert.equal(a.history.record(thread.id).nativeId, undefined);
+    assert.deepEqual(fs.readFileSync(thread.path), original);
+    await a.history.end(thread.id, run);
+  });
+});
+
+test('Retry repairs remaining damaged context after an edit removed the failed turn', async t => {
+  const { a, thread, itemId } = reasoningFixture(t);
+  await a.history.verify(thread.id); a.history.observeError(thread.id, encryptedReasoningError(itemId));
+  thread.turns = [{ id: 'remaining-earlier-turn', status: 'completed', error: null }];
+  const original = fs.readFileSync(thread.path);
+  const run = await a.history.begin(thread.id, 'turn/start', { repairReasoning: true });
+  const record = a.history.record(thread.id);
+  assert.notEqual(record.nativeId, thread.id);
+  assert.deepEqual(record.repairedReasoningIds, [itemId]);
+  assert.equal(run.nativeId, record.nativeId);
+  assert.deepEqual(fs.readFileSync(thread.path), original);
+  assert.equal(fs.readFileSync(record.path, 'utf8').includes('[AI credential removed]'), false);
+  await a.history.end(thread.id, run);
 });

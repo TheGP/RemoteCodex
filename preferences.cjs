@@ -31,6 +31,7 @@ class PreferencesStore {
     if (data.activeRuns !== undefined && !validActiveRuns(data.activeRuns)) throw new Error('Invalid saved active runs.');
     if (data.conversationNotes !== undefined && (!data.conversationNotes || typeof data.conversationNotes !== 'object' || Array.isArray(data.conversationNotes) || Object.entries(data.conversationNotes).some(([machine, notes]) => !machine.startsWith('access:') || !validNotes(notes)))) throw new Error('Invalid saved conversation notes.');
     if (data.finishedThreads !== undefined && (!data.finishedThreads || typeof data.finishedThreads !== 'object' || Array.isArray(data.finishedThreads) || Object.entries(data.finishedThreads).some(([machine, ids]) => !machine.startsWith('access:') || !Array.isArray(ids) || !ids.every(validId)))) throw new Error('Invalid saved finished conversations.');
+    if (data.archivedThreads !== undefined && (!data.archivedThreads || typeof data.archivedThreads !== 'object' || Array.isArray(data.archivedThreads) || Object.entries(data.archivedThreads).some(([machine, ids]) => !machine.startsWith('access:') || !Array.isArray(ids) || !ids.every(validPinId)))) throw new Error('Invalid saved archived conversations.');
     if (data.threadOrders !== undefined && (!data.threadOrders || typeof data.threadOrders !== 'object' || Array.isArray(data.threadOrders) || Object.entries(data.threadOrders).some(([machine, value]) => !machine.startsWith('access:') || !validOrders(value)))) throw new Error('Invalid saved conversation order.');
     if (data.threadOrderCutoffs !== undefined && (!data.threadOrderCutoffs || typeof data.threadOrderCutoffs !== 'object' || Array.isArray(data.threadOrderCutoffs) || Object.entries(data.threadOrderCutoffs).some(([machine, value]) => !machine.startsWith('access:') || !validCutoffs(value)))) throw new Error('Invalid saved conversation cutoff.');
     if (data.fileOpener !== undefined && !fileOpeners.has(data.fileOpener)) throw new Error('Invalid saved file opener.');
@@ -51,6 +52,14 @@ class PreferencesStore {
     next.activeRuns = { ...next.activeRuns, [machine]: { ...next.activeRuns?.[machine], [threadId]: { turnId, provider } } };
     if (next.conversationStates?.[machine]) delete next.conversationStates[machine].completions[threadId];
     this.write(next); return true;
+  }
+
+  archiveThread(machine, threadId) {
+    if (typeof machine !== 'string' || !machine.startsWith('access:') || machine.length > 300 || !validPinId(threadId)) throw new Error('Invalid archived conversation.');
+    const next = this.read();
+    if (next.archivedThreads?.[machine]?.includes(threadId)) return next;
+    next.archivedThreads = { ...next.archivedThreads, [machine]: [...new Set([...next.archivedThreads?.[machine] || [], threadId])] };
+    return this.write(next);
   }
 
   finishRun(machine, threadId, turnId, provider = 'codex') {
@@ -78,11 +87,34 @@ class PreferencesStore {
     return recovered;
   }
 
-  write(next) {
+  write(next, beforeCommit) {
+    const temporary = this.file + '.tmp';
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
-    fs.writeFileSync(this.file + '.tmp', JSON.stringify(next, null, 2), { mode: 0o600 });
-    fs.renameSync(this.file + '.tmp', this.file);
+    try {
+      fs.writeFileSync(temporary, JSON.stringify(next, null, 2), { mode: 0o600 });
+      beforeCommit?.(next);
+      fs.renameSync(temporary, this.file);
+    } catch (error) {
+      try { fs.unlinkSync(temporary); } catch {}
+      throw error;
+    }
     return next;
+  }
+
+  moveShortcut(move, beforeCommit, result = this.read()) {
+    if (!move || !validId(move.id) || !validId(move.targetId) || move.id === move.targetId || typeof move.after !== 'boolean') throw new Error('Invalid shortcut move.');
+    const shortcuts = result.shortcuts?.slice() ?? [];
+    const from = shortcuts.findIndex(shortcut => shortcut.id === move.id);
+    if (from < 0) return result;
+    const [shortcut] = shortcuts.splice(from, 1);
+    const target = shortcuts.findIndex(shortcut => shortcut.id === move.targetId);
+    const to = target + Number(move.after);
+    if (target < 0 || from === to) return result;
+    shortcuts.splice(to, 0, shortcut);
+    const next = { ...result, shortcuts };
+    let queued = false;
+    try { return this.write(next, value => { queued = beforeCommit?.(value) === true; }); }
+    catch (error) { if (!queued) throw error; return next; }
   }
 
   update(patch) {

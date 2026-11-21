@@ -343,6 +343,28 @@ test('a lost finish acknowledgment replays its durable receipt after restart wit
   assert.ok(reopened.bridge.calls.filter(call => call.method === 'finish').length >= 2);
 });
 
+test('a restarted coordinator recovers its orphaned edit lock without allowing duplicate local editors', async t => {
+  const f = fixture(t), a = f.client('computer-a');
+  await a.shared.configure(options);
+  const old = await a.shared.lock('same-local-chat');
+  await assert.rejects(a.shared.lock('same-local-chat'), /already being edited on this computer/);
+  a.shared.close();
+  const restarted = f.client('computer-a');
+  let release, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  restarted.bridge.before = async method => { if (method === 'edit-lock') { entered(); await new Promise(resolve => { release = resolve; }); } };
+  const acquiring = restarted.shared.lock('same-local-chat');
+  await started;
+  await assert.rejects(restarted.shared.lock('same-local-chat'), /already being edited on this computer/);
+  release();
+  const current = await acquiring;
+  assert.notEqual(current, old);
+  assert.deepEqual(f.request('renew', { tokens: [old] }, 'computer-a'), []);
+  f.request('unlock', { token: old }, 'computer-a');
+  await restarted.shared.verify(current);
+  await restarted.shared.unlock(current);
+});
+
 test('coordinator editing leases expire locally and old tokens cannot renew or unlock another editor', async t => {
   const f = fixture(t), a = f.client('computer-a'), b = f.client('computer-b');
   await Promise.all([a.shared.configure(options), b.shared.configure(options)]);
@@ -388,4 +410,26 @@ test('a confirmed native send stays sent when recording its completed history re
   f.clock.value += 3600000; await a.shared.tick(); await a.shared.tick();
   assert.equal(recorded, 1); assert.equal(sends(a).length, 1);
   assert.equal(f.request('list')[0].status, 'sent');
+});
+
+test('server-only receipt cleanup works without a native provider and releases settings only after delivery is cleared', async t => {
+  for (const outcome of ['dismissed', 'completed', 'active']) await t.test(outcome, async t => {
+    const f = fixture(t), a = f.client('computer-a'), task = f.seed('provider-off-' + outcome);
+    await a.shared.configure(options); f.clock.value += 3600000;
+    const claim = f.request('claim', { id: task.id }, 'computer-a');
+    f.request('begin', { id: task.id, token: claim.token }, 'computer-a');
+    f.request('finish', { id: task.id, token: claim.token, status: 'sent', turnId: 'synthetic-finished-turn' }, 'computer-a');
+    a.shared.state.receipts.push({ id: task.id, token: claim.token, status: 'sent', turnId: 'synthetic-finished-turn', completed: outcome === 'completed', threadId: task.threadId, machine, cwd: task.cwd, server: a.shared.key });
+    a.shared.save(); a.connection.ready = false; a.shared.available = () => false;
+    if (outcome === 'dismissed') { f.clock.value += leaseMs + 1; f.request('list'); f.request('dismiss', { id: task.id }, 'peer'); }
+    await a.shared.tick();
+    assert.equal(a.connection.calls.length, 0);
+    if (outcome === 'active') {
+      assert.equal(a.shared.state.receipts.length, 1); assert.equal(f.request('list')[0].active, true);
+      await assert.rejects(a.shared.configure({ ...options, enabled: false }), /Wait for schedule sync/);
+    } else {
+      assert.equal(a.shared.state.receipts.length, 0); assert.equal(f.request('list')[0].active, false);
+      await a.shared.configure({ ...options, enabled: false }); assert.equal(a.shared.enabled, false);
+    }
+  });
 });

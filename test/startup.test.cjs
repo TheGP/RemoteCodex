@@ -10,6 +10,8 @@ const { pathToFileURL } = require('node:url');
 const providers = require('../providers.cjs');
 const pool = require('../agent-pool.cjs');
 const links = require('../links.cjs');
+const conversationModule = require('../conversation-state.cjs');
+const { stateKey } = require('../sync-state.cjs');
 
 async function fixture(t, saved, ids = ['codex'], savedPreferences) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-startup-'));
@@ -18,7 +20,11 @@ async function fixture(t, saved, ids = ['codex'], savedPreferences) {
   if (savedPreferences !== undefined) fs.writeFileSync(path.join(directory, 'preferences.json'), JSON.stringify(savedPreferences));
   const app = new EventEmitter(), ipcMain = new EventEmitter();
   const windows = [], exits = [], attempts = [], errors = [], notifications = [], intervals = [], openedURLs = [], adapters = new Map(), handlers = new Map(), connectErrors = new Map();
-  let connection;
+  const menus = [], copied = [], revealed = [], menuErrors = [];
+  let connection, conversations;
+  class ConversationState extends conversationModule.ConversationState {
+    constructor(options) { super(options); conversations = this; }
+  }
   Object.assign(app, { requestSingleInstanceLock: () => true, whenReady: () => Promise.resolve(), getPath: () => directory, getVersion: () => 'test', getApplicationNameForProtocol: () => 'Test editor', exit: code => exits.push(code), dock: { setIcon() {} } });
   ipcMain.handle = (name, handler) => handlers.set(name, handler);
   class BrowserWindow extends EventEmitter {
@@ -50,19 +56,126 @@ async function fixture(t, saved, ids = ['codex'], savedPreferences) {
       }]))); connection = this;
     }
   }
-  const electron = { app, ipcMain, BrowserWindow, Menu: { buildFromTemplate: value => value, setApplicationMenu() {} }, shell: { openExternal: async url => { openedURLs.push(url); } }, powerMonitor: new EventEmitter(), powerSaveBlocker: { start: () => 1, stop() {} } };
+  const electron = {
+    app, ipcMain, BrowserWindow, powerMonitor: new EventEmitter(), powerSaveBlocker: { start: () => 1, stop() {} },
+    Menu: { buildFromTemplate: template => ({ popup: () => menus.push(Array.from(template)) }), setApplicationMenu() {} },
+    shell: { openExternal: async url => { openedURLs.push(url); }, showItemInFolder: file => revealed.push(file) },
+    clipboard: { writeText: text => copied.push(text) },
+    dialog: { showErrorBox: (title, message) => menuErrors.push({ title, message }) }
+  };
   const main = path.resolve(__dirname, '../main.cjs'), realRequire = createRequire(main);
   t.after(() => { app.emit('before-quit'); fs.rmSync(directory, { recursive: true, force: true }); });
   vm.runInNewContext(fs.readFileSync(main, 'utf8'), {
-    require: name => name === 'electron' ? electron : name === './agent-pool.cjs' ? { ...pool, AgentPool: Connection } : name === './links.cjs' ? { ...links, openFileLink: (value, options) => links.openFileLink(value, { ...options, sshHost: async settings => settings.host }) } : realRequire(name),
+    require: name => name === 'electron' ? electron : name === './agent-pool.cjs' ? { ...pool, AgentPool: Connection } : name === './conversation-state.cjs' ? { ...conversationModule, ConversationState } : name === './links.cjs' ? { ...links, openFileLink: (value, options) => links.openFileLink(value, { ...options, sshHost: async settings => settings.host }) } : realRequire(name),
     __dirname: path.dirname(main), process: { platform: process.platform, argv: [] },
     console: { error: error => errors.push(String(error)) }, Buffer, setInterval: (...args) => { intervals.push(args[0]); return setInterval(...args); }, clearInterval, setImmediate
   }, { filename: main });
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(errors, []); assert.deepEqual(exits, []); assert.equal(windows.length, 1);
   const event = { sender: windows[0].webContents, senderFrame: { url: pathToFileURL(windows[0].file).href } };
-  return { file, directory, attempts, adapters, connection, notifications, intervals, openedURLs, connectErrors, quit: () => app.emit('before-quit'), send: (name, ...args) => { const request = { ...event }; ipcMain.emit(name, request, ...args); return request.returnValue; }, request: (name, ...args) => handlers.get(name)(event, ...args) };
+  return { file, directory, attempts, adapters, connection, conversations, notifications, intervals, openedURLs, connectErrors, menus, copied, revealed, menuErrors, quit: () => app.emit('before-quit'), send: (name, ...args) => { const request = { ...event }; ipcMain.emit(name, request, ...args); return request.returnValue; }, request: (name, ...args) => handlers.get(name)(event, ...args) };
 }
+
+test('file-link menu reveals existing local files and retains copy-only behavior for other links', async t => {
+  const f = await fixture(t);
+  const file = path.join(f.directory, 'local file.txt');
+  fs.writeFileSync(file, 'hello');
+  const context = { machine: 'access:local', cwd: '/old/project', threadId: 'mapped-chat' };
+  f.conversations.fileMapping = threadId => threadId === context.threadId ? { root: f.directory, roots: ['/old/project'] } : null;
+  await f.request('link-menu', 'local%20file.txt#L11C3', context);
+  const menu = f.menus.at(-1);
+  assert.deepEqual(menu.map(item => item.label), ['Copy link', 'Open containing folder']);
+  menu[0].click(); await menu[1].click();
+  assert.deepEqual(f.copied, [file + ':11:3']);
+  assert.deepEqual(f.revealed, [file]);
+
+  for (const link of ['https://example.com/a', 'missing.txt', '.']) {
+    await f.request('link-menu', link, context);
+    assert.deepEqual(f.menus.at(-1).map(item => item.label), ['Copy link']);
+  }
+  await f.request('connect', { mode: 'ssh', host: 'user@fixture-host', port: 22, cwd: '/remote/project' });
+  await menu[1].click();
+  assert.deepEqual(f.revealed, [file]);
+  assert.match(f.menuErrors.at(-1).message, /machine changed/);
+  await f.request('link-menu', pathToFileURL(file).href, { machine: 'access:user@fixture-host:22', cwd: '/remote/project' });
+  assert.deepEqual(f.menus.at(-1).map(item => item.label), ['Copy link']);
+});
+
+test('a shortcut move keeps the old order until the outbox saves, including on a full disk', async t => {
+  const initial = [{ id: 'a', label: 'A', prompt: 'Prompt A' }, { id: 'b', label: 'B', prompt: 'Prompt B' }, { id: 'c', label: 'C', prompt: 'Prompt C' }];
+  const saved = { theme: 'system', startupProjects: {}, shortcuts: initial };
+  const f = await fixture(t, undefined, ['codex'], saved);
+  const { sync, shared } = f.conversations;
+  Object.defineProperty(shared, 'enabled', { value: true, configurable: true });
+  sync.soon = () => {};
+  sync.load();
+  const key = stateKey('shortcuts', 'access:local', 'shortcuts');
+  await sync.applyEntry({ key, kind: 'shortcuts', machine: 'access:local', id: 'shortcuts', value: initial, revision: 1 });
+  sync.save();
+  sync.capture('pin', 'access:local', 'another-chat', true);
+  const previousPending = structuredClone(sync.state.pending);
+  const preferencesFile = path.join(f.directory, 'preferences.json');
+  const outbox = sync.file + '.outbox', open = fs.openSync, write = fs.writeFileSync;
+  let diskFull = false;
+  const outboxOpen = t.mock.method(fs, 'openSync', (...args) => {
+    if (args[0] === outbox + '.tmp') diskFull = true;
+    return open(...args);
+  });
+  const failedWrite = t.mock.method(fs, 'writeFileSync', (...args) => {
+    if (diskFull) throw Object.assign(new Error('Disk full writing shortcut outbox'), { code: 'ENOSPC' });
+    return write(...args);
+  });
+  const move = { shortcutMove: { id: 'a', targetId: 'b', after: true } };
+  assert.throws(() => f.request('save-preferences', move), { code: 'ENOSPC' });
+  assert.equal(failedWrite.mock.callCount(), 2, 'A failed outbox save attempted another disk write to restore preferences');
+  outboxOpen.mock.restore(); failedWrite.mock.restore();
+  assert.deepEqual(f.request('preferences').shortcuts, initial);
+  assert.equal(fs.existsSync(preferencesFile + '.tmp'), false);
+  assert.deepEqual(sync.state.pending, previousPending);
+  const reloaded = new sync.constructor({ directory: sync.directory, shared, apply: sync.apply });
+  reloaded.load();
+  assert.deepEqual(reloaded.state.pending, previousPending);
+  const rename = fs.renameSync;
+  const failedPublish = t.mock.method(fs, 'renameSync', (from, to) => {
+    if (to === preferencesFile) throw new Error('Could not replace preferences');
+    return rename(from, to);
+  });
+  const firstMove = [initial[1], initial[0], initial[2]];
+  const queued = f.request('save-preferences', move);
+  assert.equal(queued.shortcutMoveQueued, true);
+  assert.deepEqual(queued.shortcuts, firstMove);
+  assert.deepEqual(JSON.parse(fs.readFileSync(preferencesFile, 'utf8')).shortcuts, initial);
+  assert.deepEqual(f.request('preferences').shortcuts, firstMove);
+  const latest = [initial[1], initial[2], initial[0]];
+  assert.deepEqual(f.request('save-preferences', { shortcutMove: { id: 'c', targetId: 'a', after: false } }).shortcuts, latest);
+  const restarted = new sync.constructor({ directory: sync.directory, shared, apply: sync.apply, applyShortcutMove: sync.applyShortcutMove });
+  restarted.load();
+  assert.deepEqual(restarted.pendingShortcutMove()?.value, latest);
+
+  const pushed = [];
+  shared.online = async () => {};
+  t.mock.method(shared.bridge, 'call', async (method, params) => {
+    if (method === 'state-pull') return { entries: [], cursor: 0, more: false };
+    assert.equal(method, 'state-push');
+    pushed.push(...params.operations);
+    return params.operations.map(op => ({ opId: op.opId, revision: 2 }));
+  });
+  await sync.tick();
+  assert.deepEqual(pushed.map(op => op.kind), ['pin'], 'An unwritable shortcut order blocked other sync or reached the server before saving locally');
+  assert.deepEqual(f.request('preferences').shortcuts, latest);
+  assert.equal(f.request('preferences').shortcutMoveQueued, true);
+  failedPublish.mock.restore();
+
+  Object.defineProperty(shared, 'enabled', { value: false });
+  await f.conversations.tick();
+  assert.deepEqual(JSON.parse(fs.readFileSync(preferencesFile, 'utf8')).shortcuts, latest);
+  assert.equal(f.request('preferences').shortcutMoveQueued, undefined);
+  assert.deepEqual(sync.pendingShortcutMove()?.value, latest);
+  Object.defineProperty(shared, 'enabled', { value: true });
+  await sync.tick();
+  assert.deepEqual(pushed.filter(op => op.kind === 'shortcuts').map(op => op.value), [latest]);
+  assert.equal(sync.pendingShortcutMove(), null);
+});
 
 test('changed-file link IPC clamps remote lines through the owning provider and blocks malformed or stale reads', async t => {
   const f = await fixture(t, undefined, ['codex', 'sample']);
@@ -290,6 +403,33 @@ test('failed agent settings writes leave runtime flags and unrelated running wor
 });
 
 
+test('reading later history clears its older visible completion without clearing unseen new turns', async t => {
+  const f = await fixture(t);
+  const { SharedScheduleDatabase } = require('../shared-schedules-host.cjs');
+  const database = new SharedScheduleDatabase(path.join(f.directory, 'markers.sqlite'));
+  t.after(() => database.close());
+  const machine = 'access:local', id = 'read-chat'; let sequence = 0, receipt;
+  const current = () => database.request('state-get', { kind: 'completion', machine, id }, 'test-device').result;
+  const publish = (value, observedTurn) => database.request('state-push', { operations: [{ kind: 'completion', machine, id, value, observedTurn, opId: 'marker-' + ++sequence, base: current()?.revision || 0 }] }, 'test-device').result[0];
+  f.conversations.catalog = () => current()?.value;
+  f.conversations.sync.capture = (_kind, _machine, _id, value, _seed, observedTurn) => { receipt = publish(value, observedTurn); };
+  publish({ status: 'completed', turnId: 'older-visible-turn' });
+  const seen = ['older-visible-turn', 'newest-visible-turn'];
+  const ack = f.send('save-conversation-state', { machine }, { field: 'completion', threadId: id, value: null, turnId: 'newest-visible-turn', seenTurnIds: seen });
+  assert.equal(ack.ok, true); assert.equal(receipt.conflict, undefined);
+  assert.equal(current().value, null);
+  publish({ status: 'completed', turnId: 'new-unseen-turn' });
+  const stale = f.send('save-conversation-state', { machine }, { field: 'completion', threadId: id, value: null, turnId: 'newest-visible-turn', seenTurnIds: seen });
+  assert.equal(stale.ok, true); assert.equal(receipt.conflict, true);
+  assert.equal(current().value.turnId, 'new-unseen-turn');
+  const before = sequence;
+  for (const seenTurnIds of ['bad', [null], [''], ['x'.repeat(201)], Array(1001).fill('a-turn')]) {
+    const invalid = f.send('save-conversation-state', { machine }, { field: 'completion', threadId: id, value: null, seenTurnIds });
+    assert.match(invalid.error, /Invalid observed conversation turns/);
+  }
+  assert.equal(sequence, before);
+});
+
 test('app restart recovers interrupted run markers per machine and provider without resuming conversations', async t => {
   const f = await fixture(t, undefined, ['codex', 'sample']);
   await f.request('connect', { mode: 'local', localCwd: f.directory });
@@ -333,4 +473,201 @@ test('accepted RPC run results are durable while early completions and shared se
   await shared.request('connect', { mode: 'ssh', host: 'fixture-shared-host', sharedServer: true });
   shared.adapters.get('codex').emit('notification', { method: 'turn/started', params: { threadId: 'surviving-chat', turn: { id: 'surviving-turn' } } });
   assert.equal(shared.request('preferences').activeRuns, undefined);
+});
+
+test('explicit edits repair context before reverting and leave history intact if repair fails', async t => {
+  const f = await fixture(t);
+  f.conversations.tick = async () => {};
+  await f.request('connect', { mode: 'local', localCwd: f.directory });
+  const shared = f.conversations.shared, history = f.conversations.history, calls = [];
+  Object.defineProperty(shared, 'enabled', { value: true });
+  shared.lock = async () => 'edit-token';
+  shared.verify = async token => { assert.equal(token, 'edit-token'); calls.push('lock'); };
+  history.verify = async () => {};
+  history.repairReasoning = async id => { assert.equal(id, 'edited-chat'); calls.push('repair'); };
+  f.conversations.catalog = () => null;
+  f.conversations.threadBinding = () => null;
+  f.adapters.get('codex').call = async method => { calls.push(method); return {}; };
+  await f.request('edit-lock', 'edited-chat');
+  await f.request('rpc', 'thread/revert', { threadId: 'edited-chat', beforeTurnId: 'old-turn' }, { repairReasoning: true });
+  assert.deepEqual(calls, ['lock', 'repair', 'lock', 'thread/revert']);
+  calls.length = 0;
+  history.repairReasoning = async () => { throw new Error('Repair could not be saved'); };
+  await assert.rejects(f.request('rpc', 'thread/revert', { threadId: 'edited-chat', beforeTurnId: 'old-turn' }, { repairReasoning: true }), /Repair could not be saved/);
+  assert.deepEqual(calls, ['lock']);
+});
+
+test('recovery IPC forwards exact Stop identity and operation type, cancels only through the history server and retries metadata without inference', async t => {
+  const f = await fixture(t);
+  f.conversations.tick = async () => {};
+  await f.request('connect', { mode: 'local', localCwd: f.directory });
+  const calls = [], history = f.conversations.history;
+  Object.defineProperty(f.conversations.shared, 'enabled', { value: true });
+  Object.defineProperty(history, 'enabled', { value: true });
+  history.verify = async (...args) => { calls.push({ method: 'verify', args }); };
+  history.begin = async (...args) => { calls.push({ method: 'begin', args }); return { id: args[0] }; };
+  history.started = async () => {};
+  history.cancelRequest = async id => { calls.push({ method: 'cancel', id }); };
+  f.conversations.threadBinding = () => null; f.conversations.catalog = () => null;
+  f.conversations.status = () => ({ ownership: [] });
+  f.adapters.get('codex').call = async (method, params) => { calls.push({ method, params }); return method === 'turn/interrupt' ? {} : { turn: { id: 'accepted-turn', status: 'completed' } }; };
+  for (const method of ['turn/start', 'review/start', 'thread/compact/start']) await f.request('rpc', method, { threadId: 'owned-chat', ...(method === 'review/start' ? { delivery: 'inline' } : {}) }, { repairReasoning: true });
+  assert.deepEqual(calls.filter(call => call.method === 'begin').map(call => structuredClone(call.args)), [['owned-chat', 'turn/start', { repairReasoning: true }], ['owned-chat', 'review/start', { repairReasoning: false, delivery: 'inline' }], ['owned-chat', 'thread/compact/start', { repairReasoning: false }]]);
+  await f.request('rpc', 'review/start', { threadId: 'owned-chat', delivery: 'detached' });
+  assert.deepEqual(structuredClone(calls.filter(call => call.method === 'begin').at(-1).args), ['owned-chat', 'review/start', { repairReasoning: false, delivery: 'detached' }]);
+  await f.request('rpc', 'turn/start', { threadId: 'owned-chat' });
+  await f.request('rpc', 'turn/start', { threadId: 'owned-chat' }, { repairReasoning: false });
+  assert.deepEqual(calls.filter(call => call.method === 'begin').slice(-2).map(call => structuredClone(call.args)), [['owned-chat', 'turn/start', { repairReasoning: false }], ['owned-chat', 'turn/start', { repairReasoning: false }]]);
+  await f.request('rpc', 'turn/interrupt', { threadId: 'owned-chat', turnId: 'exact-current-turn' });
+  assert.deepEqual(calls.find(call => call.method === 'verify').args, ['owned-chat', true, 'exact-current-turn']);
+  const beforeCancel = calls.length;
+  await f.request('cancel-conversation-request', 'owned-chat');
+  assert.deepEqual(calls.slice(beforeCancel), [{ method: 'cancel', id: 'owned-chat' }]);
+  f.connection.disconnect();
+  await f.request('cancel-conversation-request', 'owned-chat');
+  assert.deepEqual(calls.at(-1), { method: 'cancel', id: 'owned-chat' }, 'server-only cancellation must remain available without a native agent');
+  history.cancelRequest = async () => { throw new Error('Only the requester can cancel'); };
+  await assert.rejects(f.request('cancel-conversation-request', 'owned-chat'), /Only the requester/);
+  await assert.rejects(f.request('cancel-conversation-request', ''), /Select a local Codex/);
+  let retried;
+  f.conversations.sync.retry = key => { retried = key; return []; };
+  const key = JSON.stringify(['note', 'access:local', 'owned-chat']);
+  assert.deepEqual(f.request('retry-conversation-sync', key), []); assert.equal(retried, key);
+  assert.throws(() => f.request('retry-conversation-sync', '["note"]'), /Invalid sync item/);
+});
+
+test('saved edit draft recovery is scoped to the selected machine and conversation', async t => {
+  const f = await fixture(t);
+  f.conversations.tick = async () => {};
+  await f.request('connect', { mode: 'local', localCwd: f.directory });
+  const target = { machine: 'access:local', kind: 'edit-message', cwd: f.directory, threadId: 'recover-chat', itemId: 'removed-message' };
+  for (const [draft, text] of [
+    [target, 'Retained edit text'],
+    [{ ...target, threadId: 'other-chat' }, 'Different conversation'],
+    [{ ...target, machine: 'access:other-host:22' }, 'Different computer'],
+    [{ ...target, kind: 'composer', itemId: null }, 'Existing composer draft']
+  ]) assert.equal(f.send('save-draft', draft, { text }).error, undefined);
+  const edits = await f.request('edit-drafts', target.threadId);
+  assert.equal(edits.length, 1);
+  assert.equal(edits[0].text, 'Retained edit text');
+  assert.equal(typeof edits[0].updatedAt, 'number');
+  assert.equal(f.send('last-draft', target.machine).value.draft.text, 'Existing composer draft');
+  await assert.rejects(async () => f.request('edit-drafts', ''), /Invalid conversation/);
+});
+
+test('atomic provider edits require the editor lock and route only to the owning provider', async t => {
+  const f = await fixture(t, undefined, ['codex', 'sample']);
+  f.conversations.tick = async () => {};
+  await f.request('connect', { mode: 'local', localCwd: f.directory });
+  const threadId = pool.agentId('sample', 'thread', 'native-edit-chat');
+  const params = {
+    threadId,
+    beforeTurnId: pool.agentId('sample', 'turn', 'before-edit'),
+    itemId: pool.agentId('sample', 'item', 'editable-query'),
+    input: [{ type: 'text', text: 'Revised query' }]
+  };
+  const calls = [];
+  f.adapters.get('sample').call = async (method, native) => {
+    calls.push(method);
+    assert.equal(native.threadId, 'native-edit-chat');
+    assert.equal(native.beforeTurnId, 'before-edit');
+    assert.equal(native.itemId, 'editable-query');
+    return { thread: { id: native.threadId }, turn: { id: 'replacement-turn', status: 'inProgress' } };
+  };
+  await assert.rejects(f.request('rpc', 'thread/edit', params), /Reopen the message editor/);
+  const lock = await f.request('edit-lock', threadId);
+  const result = await f.request('rpc', 'thread/edit', params);
+  await f.request('edit-lock', threadId, lock);
+  await assert.rejects(f.request('rpc', 'thread/edit', params), /Reopen the message editor/);
+  assert.deepEqual(calls, ['thread/edit']);
+  assert.equal(result.thread.id, threadId);
+  assert.equal(result.turn.id, pool.agentId('sample', 'turn', 'replacement-turn'));
+});
+
+test('providers without native archive support use a durable app archive and keep native history', async t => {
+  const f = await fixture(t, undefined, ['codex', 'sample']);
+  f.conversations.tick = async () => {};
+  await f.request('connect', { mode: 'local', localCwd: f.directory });
+  const native = { id: 'app-archive', name: 'Archive this provider chat', status: { type: 'idle' } };
+  const id = pool.agentId('sample', 'thread', native.id), calls = [];
+  let queuedMessageCount = 0;
+  f.connection.registry.sample.methods = f.connection.registry.sample.methods.filter(method => method !== 'thread/archive');
+  f.adapters.get('sample').call = async method => {
+    calls.push(method);
+    if (method === 'thread/read') return { thread: native, queuedMessageCount };
+    if (method === 'thread/list') return { data: [native], nextCursor: null };
+    throw new Error('App archiving must not call the native ' + method);
+  };
+  await f.request('rpc', 'thread/archive', { threadId: id });
+  assert.deepEqual(calls, ['thread/read']);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.directory, 'preferences.json'))).archivedThreads['access:local'], [id]);
+  assert.deepEqual((await f.request('rpc', 'thread/list', { provider: 'sample' })).data, []);
+  native.id = 'running-chat'; native.status.type = 'active';
+  await assert.rejects(f.request('rpc', 'thread/archive', { threadId: pool.agentId('sample', 'thread', native.id) }), /Stop the running/);
+  native.id = 'queued-chat'; native.status.type = 'idle'; queuedMessageCount = 1;
+  const queuedId = pool.agentId('sample', 'thread', native.id);
+  f.request('set-pin', queuedId, true);
+  await assert.rejects(f.request('rpc', 'thread/archive', { threadId: queuedId }), /Send or remove queued messages/);
+  assert.ok(f.request('pins').includes(queuedId));
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.directory, 'preferences.json'))).archivedThreads['access:local'], [id]);
+
+  queuedMessageCount = 0;
+  const { shared } = f.conversations;
+  Object.defineProperty(shared, 'enabled', { value: true });
+  shared.summaries = () => [];
+  let releaseRefresh;
+  shared.refresh = () => new Promise(resolve => { releaseRefresh = resolve; });
+  const pending = f.request('rpc', 'thread/archive', { threadId: queuedId });
+  await new Promise(resolve => setImmediate(resolve));
+  native.status.type = 'active'; releaseRefresh();
+  await assert.rejects(pending, /Stop the running/);
+  assert.ok(f.request('pins').includes(queuedId));
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.directory, 'preferences.json'))).archivedThreads['access:local'], [id]);
+  const stale = f.request('rpc', 'thread/archive', { threadId: queuedId });
+  await new Promise(resolve => setImmediate(resolve));
+  const beforeStale = calls.length;
+  f.connection.session = {}; releaseRefresh();
+  await assert.rejects(stale, /Conversation connection changed/);
+  assert.equal(calls.length, beforeStale);
+});
+
+test('archiving a missing local chat saves its shared tombstone without loading history or hiding native permission failures', async t => {
+  const f = await fixture(t);
+  f.conversations.tick = async () => {};
+  await f.request('connect', { mode: 'local', localCwd: f.directory });
+  const { history, shared, sync } = f.conversations, calls = [], captured = [];
+  Object.defineProperty(shared, 'enabled', { value: true });
+  Object.defineProperty(history, 'enabled', { value: true });
+  shared.refresh = async () => {}; shared.summaries = () => [];
+  history.verify = async (id, stop, turn, options) => { assert.equal(options?.loadHistory, false); calls.push(id); };
+  sync.capture = (...args) => captured.push(args);
+  f.adapters.get('codex').call = async method => { assert.equal(method, 'thread/archive'); throw new Error('thread not loaded: empty-chat'); };
+  await f.request('rpc', 'thread/archive', { threadId: 'empty-chat' });
+  assert.deepEqual(calls, ['empty-chat']);
+  assert.deepEqual(captured, [['thread', 'access:local', 'empty-chat', null]]);
+  captured.length = 0;
+  f.adapters.get('codex').call = async () => { throw new Error('Permission denied'); };
+  await assert.rejects(f.request('rpc', 'thread/archive', { threadId: 'protected-chat' }), /Permission denied/);
+  assert.equal(captured.length, 0);
+  f.adapters.get('codex').call = async () => { throw new Error('thread not loaded: empty-chat'); };
+  sync.capture = () => { throw new Error('Disk full'); };
+  await assert.rejects(f.request('rpc', 'thread/archive', { threadId: 'empty-chat' }), /Disk full/);
+});
+
+test('native errors and restored failed turns record repair hints without starting or resending tasks', async t => {
+  const f = await fixture(t, undefined, ['codex', 'sample']);
+  f.conversations.tick = async () => {};
+  await f.request('connect', { mode: 'local', localCwd: f.directory });
+  const hints = [], calls = [], history = f.conversations.history;
+  history.observeError = (id, error) => hints.push({ id, error });
+  const error = { message: 'native encrypted reasoning error' };
+  f.adapters.get('codex').emit('notification', { method: 'error', params: { threadId: 'native-chat', error } });
+  f.adapters.get('codex').emit('notification', { method: 'turn/completed', params: { threadId: 'failed-chat', turn: { id: 'failed', status: 'failed', error } } });
+  f.adapters.get('codex').emit('notification', { method: 'turn/completed', params: { threadId: 'healthy-chat', turn: { id: 'healthy', status: 'completed', error } } });
+  f.adapters.get('sample').emit('notification', { method: 'error', params: { threadId: 'sample-chat', error } });
+  f.adapters.get('codex').call = async (method, params) => { calls.push({ method, params }); return { data: [{ id: 'failed', status: 'failed', error }, { id: 'completed', status: 'completed', error }], nextCursor: null }; };
+  await f.request('rpc', 'thread/turns/list', { threadId: 'restored-chat', limit: 25 });
+  assert.deepEqual(hints.map(hint => hint.id), ['native-chat', 'failed-chat', 'restored-chat']);
+  assert.ok(hints.every(hint => hint.error === error));
+  assert.deepEqual(calls.map(call => call.method), ['thread/turns/list']);
 });

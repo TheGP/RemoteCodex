@@ -4,7 +4,7 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { ZCodeConnection, modelId, threadId } = require('../zcode.cjs');
+const { ZCodeConnection, modelId, threadId, zcodeMethods } = require('../zcode.cjs');
 const { agentId } = require('../agent-pool.cjs');
 
 async function until(predicate, message = 'Timed out waiting for fixture', timeout = 4000) {
@@ -38,6 +38,139 @@ async function history(f) {
   return thread;
 }
 const commands = f => f.requests.filter(request => request.method === 'v4/command');
+async function editableMessage(f, thread) {
+  const history = await f.connection.call('thread/turns/list', { threadId: thread.id });
+  const turn = history.data.find(turn => turn.items.some(item => item.type === 'userMessage' && item.canEdit));
+  assert.ok(turn, 'Native history did not expose an editable user message');
+  return { threadId: thread.id, beforeTurnId: turn.id, itemId: turn.items.find(item => item.canEdit).id };
+}
+
+test('ZCode usage reads the selected provider without issuing a chat command', async t => {
+  const f = await fixture(t);
+  assert.ok(zcodeMethods.includes('account/rateLimits/read'));
+  const defaultUsage = await f.connection.call('account/rateLimits/read');
+  const selected = await f.connection.call('account/rateLimits/read', { model: modelId('fixture', 'model-a') });
+  assert.deepEqual(defaultUsage, selected);
+  assert.equal(selected.rateLimits.primary.usedPercent, 35);
+  assert.equal(selected.plan.expiresAt, 1800010000);
+  const usage = f.requests.filter(request => request.method === 'remote-codex/usage');
+  assert.equal(usage[0].params.modelSelection, null);
+  assert.deepEqual(usage[1].params.modelSelection, { providerId: 'fixture', modelId: 'model-a', options: { reasoningLevel: 'high' } });
+  assert.deepEqual(commands(f), []);
+});
+
+test('ZCode usage maps chat quotas and plan dates and fences an account change', async () => {
+  const { readZCodeUsage } = await import('../zcode-usage.mjs');
+  const calls = [], scopes = [];
+  const quota = { limits: [
+    { type: 'TIME_LIMIT', unit: 5, number: 1, percentage: 99 },
+    { type: 'CREDIT_LIMIT', unit: 3, number: 5, percentage: 42, nextResetTime: 1800000000000 },
+    { type: 'TOKENS_LIMIT', unit: 6, number: 1, percentage: 10, nextResetTime: 1800000100 }
+  ] };
+  const plans = [{ status: 'VALID', inCurrentPeriod: true, productId: 'coding-pro', productName: 'GLM Coding Plan Pro', nextRenewTime: '2027-01-15T12:00:00Z', autoRenew: false }];
+  const fetcher = async (url, options) => {
+    calls.push({ url, authorization: options.headers.Authorization, redirect: options.redirect });
+    return { ok: true, json: async () => ({ code: 0, data: url.includes('/quota/') ? quota : plans }) };
+  };
+  const authenticate = async (_signal, scope) => { scopes.push(scope); return { apiKey: 'fixture-credential', accountScope: 'fixture-account' }; };
+  const account = await readZCodeUsage({ family: 'zai', authenticate }, fetcher);
+  assert.deepEqual(account, {
+    rateLimits: { limitId: 'zcode', primary: { usedPercent: 42, windowDurationMins: 300, resetsAt: 1800000000 }, secondary: { usedPercent: 10, windowDurationMins: 10080, resetsAt: 1800000100 } },
+    plan: { name: plans[0].productName, expiresAt: Date.parse(plans[0].nextRenewTime) / 1000, renewsAt: null }
+  });
+  assert.deepEqual(scopes, [undefined, 'fixture-account']);
+  assert.ok(calls.every(call => call.url.startsWith('https://api.z.ai/') && call.authorization === 'fixture-credential' && call.redirect === 'error'));
+  await assert.rejects(readZCodeUsage({ family: 'zai', authenticate: async (_signal, scope) => ({ apiKey: 'fixture-credential', accountScope: scope ? 'other-account' : 'first-account' }) }, fetcher), /account changed/);
+  const partial = await readZCodeUsage({ family: 'zai', authenticate }, async (...args) => args[0].includes('/subscription/') ? { ok: false, status: 503 } : fetcher(...args));
+  assert.equal(partial.rateLimits.primary.usedPercent, 42);
+  assert.match(partial.usageMessage, /plan details.*unavailable/);
+  await assert.rejects(readZCodeUsage({ family: 'zai', authenticate: async () => { throw new Error('project_token_login_failed'); } }, fetcher), /Reopen Usage to retry/);
+  assert.match((await readZCodeUsage({ family: 'custom', authenticate: () => assert.fail('A custom model tried to use account credentials') }, fetcher)).usageMessage, /individual Coding Plan/);
+});
+
+test('ZCode edits its latest user query once through the native atomic command', async t => {
+  const f = await fixture(t), thread = await history(f), target = await editableMessage(f, thread);
+  assert.ok(zcodeMethods.includes('thread/edit') && !zcodeMethods.includes('thread/revert'));
+  const slot = f.connection.runtimes.get(fs.realpathSync(f.directory)).runtime.topics.get('conversation/history-session');
+  slot.state.rows.window = slot.state.rows.window.filter(row => row.kind !== 'userInput');
+  const result = await f.connection.call('thread/edit', { ...target, input: [{ type: 'text', text: 'Edited question' }], model: modelId('fixture', 'model-a'), effort: 'low', sandboxPolicy: { type: 'dangerFullAccess' }, collaborationMode: { mode: 'plan', settings: { model: modelId('fixture', 'model-a'), reasoning_effort: 'low' } } });
+  assert.equal(result.thread.id, thread.id);
+  assert.ok(['inProgress', 'completed'].includes(result.turn.status));
+  await until(() => f.notifications.some(notification => notification.method === 'turn/completed'));
+  const edits = commands(f).filter(request => request.params.type === 'editUserQuery');
+  assert.equal(edits.length, 1);
+  assert.deepEqual(edits[0].params.payload, { target: { rowId: 2, entityId: 'entity-2' }, newText: 'Edited question', workspaceMode: 'preserve', modelSelection: { providerId: 'fixture', modelId: 'model-a', options: { reasoningLevel: 'low' } }, planEnabled: true, mode: 'yolo' });
+  assert.equal(commands(f).filter(request => request.params.type === 'sendText').length, 0);
+  assert.ok(f.requests.some(request => request.method === 'v4/conversation/rowsRange' && request.params.beforeRowId === 3 && request.params.limit === 1));
+  const items = (await f.connection.call('thread/turns/list', { threadId: thread.id })).data.flatMap(turn => turn.items);
+  assert.ok(items.some(item => item.content?.some(part => part.text === 'Edited question')));
+  assert.ok(!items.some(item => item.content?.some(part => part.text === 'Saved question')));
+});
+
+test('ZCode exposes preserved attachments and permits an edit with only those attachments', async t => {
+  const f = await fixture(t), thread = await history(f), target = await editableMessage(f, thread);
+  const read = async () => (await f.connection.call('thread/turns/list', { threadId: thread.id })).data
+    .flatMap(turn => turn.items).find(item => item.type === 'userMessage');
+  assert.equal((await read()).attachmentCount, 1);
+  await f.connection.call('thread/edit', { ...target, input: [] });
+  const edits = commands(f).filter(request => request.params.type === 'editUserQuery');
+  assert.equal(edits.length, 1);
+  assert.equal(edits[0].params.payload.newText, '');
+  assert.equal(Object.hasOwn(edits[0].params.payload, 'attachments'), false);
+  const updated = await read();
+  assert.equal(updated.attachmentCount, 1);
+  assert.equal(updated.content[0].text, '');
+});
+
+test('ZCode edit waits for authoritative projection and retains explicit native rejection', async t => {
+  const f = await fixture(t), thread = await history(f), target = await editableMessage(f, thread);
+  await assert.rejects(f.connection.call('thread/edit', { ...target, input: [{ type: 'text', text: 'reject edit' }] }), error => {
+    assert.match(error.message, /Sign in through ZCode/);
+    assert.equal(error.uncertain, undefined);
+    return true;
+  });
+  assert.ok((await f.connection.call('thread/turns/list', { threadId: thread.id })).data.flatMap(turn => turn.items).some(item => item.content?.some(part => part.text === 'Saved question')));
+  let settled = false;
+  const editing = f.connection.call('thread/edit', { ...target, input: [{ type: 'text', text: 'wait for edit projection' }] }).then(result => { settled = true; return result; });
+  await until(() => commands(f).some(request => request.params.type === 'editUserQuery' && request.params.payload.newText === 'wait for edit projection'));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(settled, false, 'Native command ACK was mistaken for a projected edited turn');
+  f.send({ action: 'publish-edit' });
+  assert.ok((await editing).turn.id);
+  assert.equal(commands(f).filter(request => request.params.type === 'sendText').length, 0);
+});
+
+test('ZCode edit rejects active, queued and unsupported inputs before changing history', async t => {
+  const f = await fixture(t), thread = await history(f), original = await editableMessage(f, thread);
+  await assert.rejects(f.connection.call('thread/edit', { ...original, itemId: original.itemId + 'invalid', input: [{ type: 'text', text: 'Bad target' }] }), /Reopen the message editor/);
+  await assert.rejects(f.connection.call('thread/edit', { ...original, beforeTurnId: 'another-turn', input: [{ type: 'text', text: 'Bad turn' }] }), /latest user message/);
+  await assert.rejects(f.connection.call('thread/edit', { ...original, input: [{ type: 'skill', name: 'unsupported' }] }), /cannot execute Codex skill/);
+  assert.equal(commands(f).length, 0);
+  const running = await f.connection.call('turn/start', { threadId: thread.id, input: [{ type: 'text', text: 'hold this input' }] });
+  await assert.rejects(f.connection.call('thread/edit', { ...original, input: [{ type: 'text', text: 'While running' }] }), /Wait for the running task/);
+  await f.connection.call('turn/interrupt', { threadId: thread.id, turnId: running.turn.id });
+  await until(() => f.notifications.some(notification => notification.method === 'turn/completed' && notification.params.turn.status === 'interrupted'));
+  await assert.rejects(f.connection.call('thread/edit', { ...original, input: [{ type: 'text', text: 'Older query' }] }), /latest user message/);
+  const target = await editableMessage(f, thread), state = f.connection.runtimes.get(fs.realpathSync(f.directory)).runtime.topics.get('conversation/history-session').state;
+  state.queue.items = [{ sourceCommandId: 'accepted', text: 'Preserve queued message' }];
+  await assert.rejects(f.connection.call('thread/edit', { ...target, input: [{ type: 'text', text: 'While queued' }] }), /native queued messages/);
+  assert.equal(commands(f).filter(request => request.params.type === 'editUserQuery').length, 0);
+});
+
+test('ZCode accepted edit queue and post-cut failure cannot trigger a second submission', async t => {
+  for (const text of ['queue edited input', 'fail edit after cut']) await t.test(text, async t => {
+    const f = await fixture(t), thread = await history(f), target = await editableMessage(f, thread);
+    const editing = f.connection.call('thread/edit', { ...target, input: [{ type: 'text', text }] });
+    if (text === 'queue edited input') assert.equal((await editing).turn.status, 'queued');
+    else await assert.rejects(editing, error => {
+      assert.equal(error.uncertain, true);
+      assert.match(error.message, /^Edit may have been submitted; check conversation history before retrying\./);
+      return true;
+    });
+    assert.equal(commands(f).filter(request => request.params.type === 'editUserQuery').length, 1);
+    assert.equal(commands(f).filter(request => request.params.type === 'sendText').length, 0);
+  });
+});
 
 test('ZCode uses native catalogs and stored V4 history without running inference', async t => {
   const f = await fixture(t);
@@ -82,6 +215,14 @@ test('ZCode rejected inputs fail explicitly and accepted native queued inputs ar
   await new Promise(resolve => setTimeout(resolve, 40));
   assert.equal(commands(f).filter(request => request.params.type === 'sendText' && request.params.payload.text === 'queue this input').length, 1);
   assert.equal(f.notifications.slice(before).filter(notification => notification.method === 'turn/completed').length, 0);
+  const state = f.connection.runtimes.get(fs.realpathSync(f.directory)).runtime.topics.get('conversation/history-session').state;
+  state.queue = { autoDrain: false, items: [{ queueItemId: 'accepted-message', text: 'queue this input' }] };
+  const paused = await f.connection.call('thread/read', { threadId: thread.id });
+  assert.equal(paused.thread.status.type, 'idle');
+  assert.equal(paused.queuedMessageCount, 1);
+  state.queue.items = [];
+  assert.equal((await f.connection.call('thread/resume', { threadId: thread.id })).queuedMessageCount, 0);
+  assert.equal(commands(f).filter(request => request.params.type === 'sendText' && request.params.payload.text === 'queue this input').length, 1);
 });
 
 test('ZCode questions preserve answers and permission acceptance grants only the advertised one-time option', async t => {

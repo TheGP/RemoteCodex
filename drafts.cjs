@@ -35,12 +35,31 @@ class DraftStore {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     fs.writeFileSync(file + '.tmp', JSON.stringify(value), { mode: 0o600 }); fs.renameSync(file + '.tmp', file);
   }
+  parseMetadata(target, text) {
+    const value = JSON.parse(text);
+    if (value.version !== 1 || draftKey(value.target) !== draftKey(target) || typeof value.text !== 'string' || !Array.isArray(value.images)) throw new Error('Invalid saved draft.');
+    return value;
+  }
   metadata(target) {
-    try {
-      const value = JSON.parse(fs.readFileSync(path.join(this.folder(target), 'draft.json'), 'utf8'));
-      if (value.version !== 1 || draftKey(value.target) !== draftKey(target) || typeof value.text !== 'string' || !Array.isArray(value.images)) throw new Error('Invalid saved draft.');
-      return value;
-    } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    try { return this.parseMetadata(target, fs.readFileSync(path.join(this.folder(target), 'draft.json'), 'utf8')); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  }
+  async indicators(machine, threadIds, onError = () => {}) {
+    const pending = [];
+    for (let offset = 0; offset < threadIds.length; offset += 100) {
+      const present = await Promise.all(threadIds.slice(offset, offset + 100).map(async threadId => {
+        const target = { machine, kind: 'composer', threadId, cwd: '' };
+        try {
+          const value = this.parseMetadata(target, await fs.promises.readFile(path.join(this.folder(target), 'draft.json'), 'utf8'));
+          return value.text.trim() || value.images.length ? threadId : null;
+        } catch (error) {
+          if (error.code !== 'ENOENT') onError(error);
+          return null;
+        }
+      }));
+      pending.push(...present.filter(Boolean));
+    }
+    return pending;
   }
   remember(target) {
     target = normalizeTarget(target); const signature = JSON.stringify(target);
@@ -55,10 +74,6 @@ class DraftStore {
       const data = fs.readFileSync(path.join(this.folder(target), image.file));
       return { name: image.name, size: data.length, url: `data:${image.mime};base64,${data.toString('base64')}` };
     }) };
-  }
-  hasContent(target) {
-    const value = this.metadata(target);
-    return Boolean(value && (value.text.trim() || value.images.length));
   }
   last(machine) {
     try {
@@ -90,7 +105,8 @@ class DraftStore {
         return { name: image.name, size: data.length, mime: match[1], file };
       });
     }
-    if (target.kind === 'composer' && !value.text && !value.images.length) this.clear(target);
+    const empty = target.kind === 'composer' && !value.text && !value.images.length;
+    if (empty) this.clear(target);
     else {
       this.write(path.join(folder, 'draft.json'), value);
       const used = new Set(value.images.map(image => image.file));
@@ -99,6 +115,7 @@ class DraftStore {
       }
     }
     this.remember(target);
+    return empty ? null : value;
   }
   clear(target) { fs.rmSync(this.folder(target), { recursive: true, force: true }); }
   move(source, target) {
@@ -113,18 +130,38 @@ class DraftStore {
 }
 
 function registerDraftIpc(ipcMain, drafts, checkSender, onError = () => {}, changed = () => {}) {
-  for (const operation of ['read-draft', 'has-draft', 'save-draft', 'clear-draft', 'last-draft', 'move-draft']) ipcMain.on(operation, (event, target, patch, expected) => {
+  const autosaves = new WeakMap();
+  const request = (operation, event, target, patch, expected, writeId, deferred = false) => {
     try {
       checkSender(event);
-      let value, stale = false;
+      let value, stale = false, write;
+      if (deferred || writeId !== undefined) {
+        if (operation !== 'save-draft' || target?.kind !== 'composer' || typeof writeId !== 'string' || !/^[a-f0-9-]{36}$/.test(writeId)) throw new Error('Invalid draft write.');
+        const key = draftKey(target);
+        if (!autosaves.has(event.sender)) autosaves.set(event.sender, { cancelled: new Set(), last: null });
+        const writes = autosaves.get(event.sender);
+        if (deferred) {
+          if (writes.cancelled.delete(writeId)) return { value: false };
+          write = writes.last = { id: writeId, key };
+        } else if (writes.last?.id === writeId && writes.last.key === key) {
+          expected = writes.last.expected ?? expected;
+          writes.last = null;
+        } else {
+          // A forced save can arrive before the pending asynchronous write.
+          writes.cancelled.add(writeId);
+        }
+      }
       if (['save-draft', 'clear-draft'].includes(operation) && expected !== undefined) {
         if (!expected || typeof expected !== 'object' || Array.isArray(expected) || Object.keys(expected).some(key => !['text', 'runAt', 'hours', 'model', 'effort', 'mode', 'access'].includes(key)) || !Object.hasOwn(expected, 'text') || Object.entries(expected).some(([key, value]) => value !== null && (key === 'hours' ? !hours.has(value) : typeof value !== 'string'))) throw new Error('Invalid editor draft baseline.');
         const previous = drafts.metadata(target);
         stale = Object.entries(expected).some(([key, value]) => (previous?.[key] ?? null) !== value);
       }
       if (operation === 'read-draft') { value = drafts.read(target); if (target.kind === 'composer') drafts.remember(target); }
-      else if (operation === 'has-draft') value = drafts.hasContent(target);
-      else if (operation === 'save-draft') drafts.save(target, patch);
+      else if (operation === 'save-draft') {
+        const saved = drafts.save(target, patch);
+        if (deferred && write && expected) write.expected = Object.fromEntries(Object.keys(expected).map(key => [key, saved?.[key] ?? null]));
+        value = true;
+      }
       else if (operation === 'clear-draft') { drafts.clear(target); if (target.kind !== 'composer') drafts.remember({ ...target, kind: 'composer', itemId: null }); }
       else if (operation === 'move-draft') drafts.move(target, patch);
       else value = drafts.last(target);
@@ -132,8 +169,18 @@ function registerDraftIpc(ipcMain, drafts, checkSender, onError = () => {}, chan
         if (operation === 'move-draft') changed(patch);
         changed(target, stale);
       }
-      event.returnValue = { value };
-    } catch (error) { onError(error); event.returnValue = { error: error.message }; }
+      return { value };
+    } catch (error) { onError(error); return { error: error.message }; }
+  };
+  for (const operation of ['read-draft', 'save-draft', 'clear-draft', 'last-draft', 'move-draft']) ipcMain.on(operation, (event, ...args) => {
+    event.returnValue = request(operation, event, ...args);
+  });
+  ipcMain.handle('autosave-draft', (event, target, patch, expected, writeId) => request('save-draft', event, target, patch, expected, writeId, true));
+  ipcMain.handle('draft-indicators', (event, machine, ids) => {
+    checkSender(event);
+    if (typeof machine !== 'string' || !machine.startsWith('access:') || machine.length > 500 || !Array.isArray(ids)
+        || ids.some(id => typeof id !== 'string' || !id || id.length > 200)) throw new Error('Invalid draft indicators.');
+    return drafts.indicators(machine, ids, onError);
   });
 }
 

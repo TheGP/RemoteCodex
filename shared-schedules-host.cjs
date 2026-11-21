@@ -117,7 +117,10 @@ class SharedScheduleDatabase {
     }
     if (method === 'edit-lock') {
       const resource = scope(args.machine, args.threadId);
-      if (this.db.prepare('SELECT 1 FROM leases WHERE resource=?').get(resource)) throw new Error('Another computer is editing or sending to this conversation.');
+      if (args.recoverOwn !== undefined && typeof args.recoverOwn !== 'boolean') throw new Error('Invalid editing lock recovery.');
+      const previous = this.db.prepare('SELECT * FROM leases WHERE resource=?').get(resource);
+      if (previous && !(args.recoverOwn === true && previous.owner === owner && previous.kind === 'edit')) throw new Error('Another computer is editing or sending to this conversation.');
+      if (previous) this.db.prepare('DELETE FROM leases WHERE resource=? AND token=?').run(resource, previous.token);
       const token = randomUUID();
       this.db.prepare('INSERT INTO leases VALUES(?,?,?,?,?,?)').run(resource, token, owner, 'edit', null, now + leaseMs);
       return { token, expiresAt: now + leaseMs };

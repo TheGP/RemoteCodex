@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 const { ConversationSync } = require('./conversation-sync.cjs');
 const { stateKey, hash } = require('./sync-state.cjs');
 const { agentTarget, agentId } = require('./agent-pool.cjs');
@@ -14,8 +15,12 @@ function completionValue(status, turnId) {
 class ConversationState {
   constructor({ directory, shared, pins, drafts, preferences, machine, options, connection, changed, log }) {
     Object.assign(this, { shared, pins, drafts, preferences, machine, options, connection, changed });
-    this.sync = new ConversationSync({ directory, shared, apply: entry => this.apply(entry), changed, log });
+    this.sync = new ConversationSync({
+      directory, shared, apply: entry => this.apply(entry), changed, log,
+      applyShortcutMove: shortcuts => this.saveShortcutOrder(shortcuts)
+    });
     this.nativeProjects = new Map();
+    this.draftRevision = 0;
     this.history = new HistoryManager(this);
   }
   binding(id, machine = this.machine()) {
@@ -68,17 +73,26 @@ class ConversationState {
   projects(data) {
     if (!this.shared.enabled) return data;
     const mapped = data.map(project => this.captureProject(project));
+    const providers = new Map((this.connection.listProviders?.() || []).map(provider => [provider.id, provider]));
     for (const entry of this.sync.entries('project', this.machine())) {
       const binding = this.binding(entry.id);
       if (binding && this.nativeProjects.has(binding.nativeId)) continue;
+      if (binding && providers.get(binding.provider)?.connected === false) {
+        const project = { id: binding.nativeId, sharedId: entry.id, provider: binding.provider, name: entry.value.name, roots: [{ path: binding.root }] };
+        this.connection.project?.(binding.provider, { ...project, id: agentTarget(binding.nativeId, 'project').value });
+        mapped.push(project); continue;
+      }
       mapped.push({ id: agentId(entry.value.provider, 'project', 'sync-project:' + entry.id), sharedId: entry.id, provider: entry.value.provider, name: entry.value.name, roots: [], needsFolder: true });
     }
     return mapped;
   }
-  captureThread(thread) {
+  captureThread(thread, archived) {
     if (!this.shared.enabled || !thread?.id || thread.remoteOnly) return thread;
+    archived ||= new Set(this.preferences.read().archivedThreads?.[this.machine()] || []);
+    if (archived.has(thread.id)) return thread;
     this.sync.load();
-    if (this.sync.state.entries[stateKey('thread', this.machine(), thread.id)]?.value === null) return thread;
+    const key = stateKey('thread', this.machine(), thread.id), pending = this.sync.state.pending.findLast(op => op.key === key);
+    if (this.sync.state.entries[key]?.value === null || pending?.value === null) return thread;
     thread = this.history.decorate(thread);
     const access = this.history.owners.get(thread.id);
     if (this.history.enabled && this.history.record(thread.id) && (!access || access.owner !== this.shared.state.device)) {
@@ -89,27 +103,35 @@ class ConversationState {
     const project = Object.hasOwn(thread, 'projectId') ? (thread.projectId ? this.projectId(thread.projectId) || previous?.project || null : null) : previous?.project || null;
     if (previous && previous.updatedAt > (thread.updatedAt || 0)) return thread;
     const value = { id: thread.id, name: thread.name || null, preview: (thread.preview || '').slice(0, 500), createdAt: thread.createdAt || 0, updatedAt: thread.updatedAt || 0, provider: thread.provider || agentTarget(thread.id, 'thread').provider, project };
-    const key = stateKey('thread', this.machine(), thread.id);
-    const pending = this.sync.state.pending.findLast(op => op.key === key);
     if (JSON.stringify(pending?.value || previous) !== JSON.stringify(value)) this.sync.capture('thread', this.machine(), thread.id, value);
     this.history.observe(thread);
     return thread;
   }
   threads(data, projectId, search = '') {
+    const archived = new Set(this.preferences.read().archivedThreads?.[this.machine()] || []);
+    data = data.filter(thread => !archived.has(thread.id));
     if (!this.shared.enabled) return data;
     this.sync.load();
     data = data.filter(thread => this.sync.state.entries[stateKey('thread', this.machine(), thread.id)]?.value !== null);
-    data = data.map(thread => this.captureThread(thread));
+    data = data.map(thread => this.captureThread(thread, archived));
     const ids = new Set(data.map(thread => thread.id));
     for (const { id, value } of this.sync.entries('thread', this.machine())) {
-      if (ids.has(id)) continue;
+      if (ids.has(id) || archived.has(id)) continue;
       const binding = value.project && this.binding(value.project);
-      const localProject = value.project ? binding?.nativeId || agentId(value.provider, 'project', 'sync-project:' + value.project) : null;
-      if ((localProject || null) !== (projectId || null) || search && !(value.name || value.preview).toLowerCase().includes(search.toLowerCase())) continue;
+      const localProject = value.project ? binding?.nativeId || agentId(this.catalog('project', value.project)?.provider || value.provider, 'project', 'sync-project:' + value.project) : null;
+      if (!(search && projectId === undefined) && (localProject || null) !== (projectId || null)) continue;
+      if (search && !(value.name || value.preview).toLowerCase().includes(search.toLowerCase())) continue;
       const local = this.history.record(id);
       data.push({ ...value, id, projectId: localProject, cwd: binding?.root || local?.workspace || (local?.nativeId ? this.options().localCwd : '') || '', sharedProject: value.project, needsFolder: Boolean(value.project && !binding), remoteOnly: !local?.nativeId, status: { type: 'notLoaded' } });
     }
     return data;
+  }
+  archive(id) {
+    const machine = this.machine();
+    this.preferences.archiveThread(machine, id);
+    try { this.sync.capture('thread', machine, id, null); }
+    catch (error) { this.sync.failed(error); }
+    this.changed();
   }
   async bind(id, root) {
     const machine = this.machine(), session = this.connection.session, record = this.catalog('project', id);
@@ -144,7 +166,7 @@ class ConversationState {
     }
     const binding = this.binding(record.project);
     if (!binding) throw new Error('Choose this shared project’s folder on this computer before running messages.');
-    return binding;
+    return { ...binding, provider: record.provider || binding.provider };
   }
   async scheduledTask(task) {
     if (this.activeNamespace !== this.shared.key || this.activeMachine !== this.machine() || this.activeSession !== this.connection.session) return null;
@@ -154,16 +176,17 @@ class ConversationState {
     if (!project) return task.message?.thread.projectId || !record && task.originDevice !== this.shared.state.device ? null : task;
     const binding = this.binding(project, task.machine);
     if (!binding) return null;
-    await this.connection.call('fs/readDirectory', { path: binding.root }, undefined, { provider: binding.provider });
+    const provider = record?.provider || binding.provider;
+    await this.connection.call('fs/readDirectory', { path: binding.root }, undefined, { provider });
     const value = structuredClone(task); value.sourceCwd = task.cwd; value.cwd = binding.root;
     if (value.message) {
       const message = value.message;
       message.thread = { ...message.thread, cwd: binding.root, projectId: binding.nativeId };
       if (message.turnSettings.sandboxPolicy?.type === 'workspaceWrite') message.turnSettings.sandboxPolicy.writableRoots = [binding.root];
-      if (binding.provider === 'codex') message.turnSettings.cwd = binding.root;
+      if (provider === 'codex') message.turnSettings.cwd = binding.root;
       if (task.cwd !== binding.root && message.input.some(part => !['text', 'image', 'skill'].includes(part.type))) throw new Error('This scheduled attachment needs to be reattached on this computer.');
       if (message.input.some(part => part.type === 'skill')) {
-        const result = await this.connection.call('skills/list', { cwds: [binding.root] }, undefined, { provider: binding.provider });
+        const result = await this.connection.call('skills/list', { cwds: [binding.root] }, undefined, { provider });
         const skills = result.data.flatMap(entry => entry.skills || []);
         message.input = message.input.map(part => {
           if (part.type !== 'skill') return part;
@@ -193,7 +216,9 @@ class ConversationState {
   }
   async apply(entry) {
     const { kind, machine, id, value } = entry;
-    if (kind === 'pin') {
+    if (kind === 'thread' && value === null) {
+      this.preferences.archiveThread(machine, id);
+    } else if (kind === 'pin') {
       if (machine === this.machine()) this.pins.set(this.options(), id, Boolean(value));
     } else if (kind === 'note') {
       this.preferences.update({ conversationNote: { machine, threadId: id, text: value || '' } });
@@ -202,7 +227,7 @@ class ConversationState {
     } else if (kind === 'messagePin') {
       const [threadId, itemId] = JSON.parse(id);
       this.preferences.update({ messagePin: { machine, threadId, itemId, ...(value || {}), pinned: Boolean(value) } });
-    } else if (kind === 'shortcuts' && value) this.preferences.update({ shortcuts: value });
+    } else if (kind === 'shortcuts' && value) this.saveShortcutOrder(value);
     else if (kind === 'unread' || kind === 'completion') {
       const markers = this.preferences.read().conversationStates?.[machine] || { unread: [], completions: {} };
       const unread = new Set(markers.unread), completions = { ...markers.completions };
@@ -215,7 +240,9 @@ class ConversationState {
       const pending = () => this.sync.state.pending.some(op => op.key === entry.key);
       let target = value?.target;
       if (!target) {
-        for (const saved of this.drafts.list()) if (saved.target.machine === machine && this.draftIdentity(saved.target).id === id) this.drafts.clear(saved.target);
+        for (const saved of this.drafts.list()) if (saved.target.machine === machine && this.draftIdentity(saved.target).id === id) {
+          this.drafts.clear(saved.target); this.draftRevision++;
+        }
         return;
       }
       if (machine !== this.machine() || project && !binding) return;
@@ -227,7 +254,7 @@ class ConversationState {
       if (pending() || (this.sync.state.entries[entry.key]?.revision || 0) > entry.revision) return;
       const patch = { text: value.text, images };
       for (const field of ['hours', 'model', 'effort', 'mode', 'access', 'runAt']) if (value[field] !== undefined) patch[field] = value[field];
-      this.drafts.save(target, patch);
+      this.drafts.save(target, patch); this.draftRevision++;
     }
   }
   seed() {
@@ -246,10 +273,29 @@ class ConversationState {
     for (const value of this.drafts.list()) this.captureDraft(value.target, true);
     this.sync.state.seeded = true; this.sync.save();
   }
+  saveShortcutOrder(shortcuts) {
+    if (isDeepStrictEqual(this.preferences.read().shortcuts, shortcuts)) return false;
+    this.preferences.update({ shortcuts }); return true;
+  }
+  visiblePreferences(saved = this.preferences.read()) {
+    try { this.sync.load(); } catch (error) { this.sync.failed(error); return saved; }
+    const move = this.sync.pendingShortcutMove();
+    if (!move || isDeepStrictEqual(saved.shortcuts, move.value)) return saved;
+    return { ...saved, shortcuts: move.value, shortcutMoveQueued: true };
+  }
   async tick() {
-    if (!this.shared.enabled) { this.activeNamespace = null; return; }
+    if (!this.shared.enabled) {
+      this.activeNamespace = null;
+      if (this.sync.canCapture()) this.sync.retryShortcutMove();
+      return;
+    }
     this.sync.load();
-    if (!this.connection.ready && !this.sync.state.seeded) return;
+    for (const [machine, ids] of Object.entries(this.preferences.read().archivedThreads || {})) for (const id of ids) {
+      const key = stateKey('thread', machine, id), pending = this.sync.state.pending.findLast(op => op.key === key);
+      if (pending?.value === null || !pending && this.sync.state.entries[key]?.value === null) continue;
+      this.sync.capture('thread', machine, id, null);
+    }
+    if (!this.connection.ready && !this.sync.state.seeded) { this.sync.retryShortcutMove(); return; }
     if (this.connection.ready && (this.activeNamespace !== this.shared.key || this.activeMachine !== this.machine() || this.activeSession !== this.connection.session)) {
       if (this.bootstrapping) return;
       this.bootstrapping = true;
@@ -281,7 +327,7 @@ class ConversationState {
     const paths = this.shared.enabled ? Object.fromEntries(Object.entries(this.sync.state.bindings).filter(([key]) => JSON.parse(key)[0] === this.machine()).map(([, binding]) => [binding.nativeId, this.projectPaths(binding.id)])) : {};
     const ownership = this.history.status();
     const historyErrors = this.history.enabled ? [...this.history.errors].map(([id, failure]) => ({ id, message: failure.message })) : [];
-    return { queueErrors: this.shared.enabled ? this.sync.queueErrors() : [], historyErrors, paths, enabled: this.shared.enabled, error: this.sync.error, conflicts, catalog, historyEnabled: this.history.enabled, ownership };
+    return { queueErrors: this.shared.enabled ? this.sync.queueErrors() : [], historyErrors, paths, enabled: this.shared.enabled, error: this.sync.error, conflicts, catalog, historyEnabled: this.history.enabled, ownership, draftRevision: this.draftRevision };
   }
 }
 module.exports = { ConversationState, completionValue };

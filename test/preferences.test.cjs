@@ -23,6 +23,19 @@ test('theme and per-machine startup projects persist independently through resta
   assert.deepEqual(new PreferencesStore(file).read(), { theme: 'claude-code', startupProjects: { 'access:root@host:22': 'remote-project' } });
 });
 
+test('app archives persist by machine without altering history or other preferences', t => {
+  const file = fixture(t), store = new PreferencesStore(file);
+  store.update({ theme: 'dark' }); store.archiveThread('access:local', 'agent:sample:thread:one'); store.archiveThread('access:local', 'agent:sample:thread:one');
+  const reopened = new PreferencesStore(file);
+  assert.deepEqual(reopened.read().archivedThreads, { 'access:local': ['agent:sample:thread:one'] });
+  assert.equal(reopened.read().theme, 'dark');
+  assert.throws(() => reopened.archiveThread('__proto__', 'chat'));
+  assert.throws(() => reopened.archiveThread('access:local', '__proto__'));
+  fs.mkdirSync(file + '.tmp');
+  assert.throws(() => reopened.archiveThread('access:local', 'failed'));
+  assert.deepEqual(store.read().archivedThreads['access:local'], ['agent:sample:thread:one']);
+});
+
 test('invalid preferences and failed writes leave saved settings unchanged', t => {
   const file = fixture(t); const store = new PreferencesStore(file);
   store.update({ theme: 'dark' });
@@ -120,6 +133,31 @@ test('prompt shortcuts persist, validate inputs, and allow removing all defaults
   assert.throws(() => store.update({ shortcuts: [{ ...shortcut, mode: 'invalid' }] }));
   assert.equal(store.read().shortcuts[0].mode, 'fill');
   store.update({ shortcuts: [] }); assert.deepEqual(new PreferencesStore(file).read().shortcuts, []);
+});
+
+test('shortcut moves preserve the latest saved prompts and list membership', t => {
+  const store = new PreferencesStore(fixture(t));
+  const review = { id: 'review', label: 'Review', prompt: 'Review current changes' };
+  const fix = { id: 'fix', label: 'Fix', prompt: 'Fix the findings', mode: 'fill' };
+  const added = { id: 'added', label: 'Continue', prompt: 'Continue the task' };
+  const updatedReview = { ...review, prompt: 'Peer edited this prompt' };
+  store.update({ shortcuts: [review, fix] });
+  const visible = store.read().shortcuts;
+  store.update({ shortcuts: [updatedReview, fix, added] });
+
+  const moved = store.moveShortcut({ id: visible[0].id, targetId: visible[1].id, after: true });
+  assert.deepEqual(moved.shortcuts, [fix, updatedReview, added]);
+  assert.deepEqual(store.read().shortcuts, [fix, updatedReview, added]);
+  for (const move of [
+    { id: fix.id, targetId: review.id, after: false },
+    { id: 'removed', targetId: review.id, after: true },
+    { id: review.id, targetId: 'removed', after: false }
+  ]) {
+    const result = store.moveShortcut(move, () => assert.fail('An unchanged move attempted to save'));
+    assert.deepEqual(result.shortcuts, [fix, updatedReview, added]);
+    assert.deepEqual(store.read().shortcuts, [fix, updatedReview, added]);
+  }
+  assert.throws(() => store.moveShortcut({ id: review.id, targetId: fix.id, after: 'true' }), /Invalid shortcut move/);
 });
 
 test('completion sound accepts only booleans and survives restarting', t => {

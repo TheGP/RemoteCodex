@@ -169,7 +169,7 @@ class SharedSchedules {
       this.state = { ...data, options: sharingOptions(data.options) };
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
     this.bridge = bridge || new ScheduleBridge(this.state.device);
-    this.locks = new Map(); this.retry = new Map(); this.finished = new Set(); this.receiptChecks = new Map(); this.error = null;
+    this.locks = new Map(); this.editing = new Set(); this.retry = new Map(); this.finished = new Set(); this.receiptChecks = new Map(); this.error = null;
     this.timer = setInterval(() => this.renew().catch(error => this.failed(error)), 20000); this.timer.unref();
   }
   get enabled() { return this.state.options.enabled; }
@@ -192,6 +192,7 @@ class SharedSchedules {
   failed(error) { if (this.error === error.message) return; this.log('schedule.sync.failed', { error: error.message }); this.error = error.message; this.changed(); }
   async configure(value) {
     const options = sharingOptions(value);
+    if (this.enabled && this.state.receipts.length && !this.running && !this.changing && !this.bridge.busy) { await this.online(); await this.flushReceipts(false); }
     if (this.running || this.changing || this.bridge.busy || this.bridge.connecting || this.bridge.pending?.size || this.locks.size || this.state.receipts.length) throw new Error('Wait for schedule sync to finish and close message editors before changing sharing.');
     if (serverKey(options) !== this.key && this.store.tasks.some(task => task.status === 'pending' && task.sharedTo === this.key && !task.sharedImported)) throw new Error('Finish uploading scheduled messages before choosing another server or folder.');
     if (serverKey(options) !== this.key && this.tasks().some(task => ['pending', 'claimed', 'sending', 'unconfirmed'].includes(task.status) || task.active)) throw new Error('Cancel or finish shared schedules before choosing another server or folder.');
@@ -252,9 +253,13 @@ class SharedSchedules {
     await this.refresh(); return task;
   }
   async lock(threadId) {
-    await this.online();
-    const lease = await this.bridge.call('edit-lock', { threadId, machine: this.machine() });
-    this.locks.set(lease.token, { ...lease, threadId, kind: 'edit' }); return lease.token;
+    if (this.editing.has(threadId) || [...this.locks.values()].some(lease => lease.kind === 'edit' && lease.threadId === threadId && lease.expiresAt > this.bridge.now())) throw new Error('This conversation is already being edited on this computer.');
+    this.editing.add(threadId);
+    try {
+      await this.online();
+      const lease = await this.bridge.call('edit-lock', { threadId, machine: this.machine(), recoverOwn: true });
+      this.locks.set(lease.token, { ...lease, threadId, kind: 'edit' }); return lease.token;
+    } finally { this.editing.delete(threadId); }
   }
   async unlock(token) {
     this.locks.delete(token);
@@ -282,11 +287,12 @@ class SharedSchedules {
       else if (eligible.includes(token) || lease.expiresAt <= this.bridge.now()) this.locks.delete(token);
     }
   }
-  async flushReceipts() {
+  async flushReceipts(checkNative = true) {
     for (const receipt of [...this.state.receipts]) {
       if (receipt.server !== this.key) continue;
       const saved = await this.bridge.call('finish', receipt);
       if (receipt.status === 'sent' && saved.status !== 'cancelled' && saved.active !== false) {
+        if (!receipt.completed && (!checkNative || !this.connection.ready || !this.available())) continue;
         if (!receipt.completed && receipt.machine !== this.machine()) continue;
         if (!receipt.completed) {
           const session = this.connection.session, now = this.bridge.now();
@@ -339,7 +345,7 @@ class SharedSchedules {
     let refreshNeeded = false;
     try {
       await this.online(); await this.migrate();
-      if (current()) await this.flushReceipts();
+      await this.flushReceipts(current());
       await this.refresh();
       for (const task of this.tasks().filter(task => task.machine === machine && task.status === 'pending' && Date.parse(task.runAt) <= this.bridge.now())) {
         if (!current()) break;

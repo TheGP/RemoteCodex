@@ -45,8 +45,18 @@ async function transformImages(value, image, selected = false, identity = null) 
     else if (child && typeof child === 'object') await transformImages(child, image, selected, identity);
   }
 }
-async function exportCodexHistory({ thread, logicalId = thread?.id, home, keepBlob, attachmentRoots = [], attachmentStore }) {
+async function exportCodexHistory({ thread, logicalId = thread?.id, home, keepBlob, attachmentRoots = [], attachmentStore, repairReasoningId, missingImageBase, readBlob }) {
   if (!uuid.test(thread?.id) || !uuid.test(logicalId) || thread.ephemeral) throw new Error('This conversation cannot be exported.');
+  if (repairReasoningId !== undefined && (typeof repairReasoningId !== 'string' || !/^rs_[A-Za-z0-9_-]{1,996}$/.test(repairReasoningId))) throw new Error('Invalid reasoning repair identity.');
+  const reasoningRepairs = new Set(), reasoningSummaries = new Set(), visibleReasoning = new Set();
+  let rejectedReasoningExists = false;
+  const damagedReasoning = item => {
+    if (repairReasoningId && item?.type === 'reasoning' && item.id === repairReasoningId) rejectedReasoningExists = true;
+    if (!repairReasoningId || item?.type !== 'reasoning' || typeof item.id !== 'string' || typeof item.encrypted_content !== 'string' || !item.encrypted_content.includes('[AI credential removed]')) return false;
+    reasoningRepairs.add(item.id);
+    if (item.summary?.length || item.content?.length) reasoningSummaries.add(item.id);
+    return true;
+  };
   home = await fs.promises.realpath(home);
   const roots = [];
   for (const name of ['sessions', 'archived_sessions']) {
@@ -71,6 +81,7 @@ async function exportCodexHistory({ thread, logicalId = thread?.id, home, keepBl
     throw new Error('Conversation history is empty.');
   };
   const meta = await readMeta(first.file), seen = new Set(), sources = [], attachments = new Map(), missingImages = new Set();
+  let missingImageIds;
   if (meta.payload.id !== thread.id) throw new Error('Conversation history identity does not match.');
   const images = async (file, _url, selected, identity) => {
     if (typeof file !== 'string') throw new Error('Invalid conversation image reference.');
@@ -86,7 +97,27 @@ async function exportCodexHistory({ thread, logicalId = thread?.id, home, keepBl
     }
     catch (error) {
       if (error.code !== 'ENOENT') throw error;
-      const id = hash(file); missingImages.add(id); return missingToken + id;
+      let id = hash(file);
+      const placeholder = path.basename(file).match(/^missing-([a-f0-9]{64})\.png$/), root = path.dirname(file);
+      let trusted = false;
+      if (placeholder && missingImageBase && attachmentRoots.includes(root)) {
+        try { trusted = await fs.promises.realpath(root) === root; }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+      }
+      if (trusted) {
+        missingImageIds ||= (async () => {
+          const base = missingImageBase;
+          if (base.format !== 'codex-rollout-v1' || base.id !== logicalId || !digest.test(base.digest) || !Number.isSafeInteger(base.bytes) || base.bytes <= 0 || base.bytes > maxBytes || !Array.isArray(base.chunks) || !base.chunks.length || base.chunks.length > 128 || typeof readBlob !== 'function') throw new Error('Invalid cached conversation snapshot.');
+          const ids = new Set();
+          for await (const line of historyRecords(base, readBlob)) await transformImages(parse(line), async reference => {
+            if (typeof reference === 'string' && reference.startsWith(missingToken) && digest.test(reference.slice(missingToken.length))) ids.add(reference.slice(missingToken.length));
+            return reference;
+          });
+          return ids;
+        })();
+        if ((await missingImageIds).has(placeholder[1])) id = placeholder[1];
+      }
+      missingImages.add(id); return missingToken + id;
     }
     const id = keepBlob(image.data);
     attachments.set(id, { hash: id, bytes: image.data.length, name: image.name });
@@ -111,6 +142,9 @@ async function exportCodexHistory({ thread, logicalId = thread?.id, home, keepBl
       end = record.end; const row = parse(record.line);
       if (row.type === 'session_meta') continue;
       if (boundary && (!Number.isSafeInteger(row.ordinal) || row.ordinal >= boundary.end_ordinal_exclusive)) throw new Error('Conversation history boundary does not match its records.');
+      if (repairReasoningId && row.type === 'event_msg' && row.payload?.type === 'item_completed' && row.payload.item?.type === 'Reasoning') visibleReasoning.add(row.payload.item.id);
+      if (row.type === 'response_item' && damagedReasoning(row.payload)) continue;
+      if (repairReasoningId && row.type === 'compacted' && Array.isArray(row.payload?.replacement_history)) row.payload.replacement_history = row.payload.replacement_history.filter(item => !damagedReasoning(item));
       const selected = row.type === 'event_msg' && (row.payload?.type === 'user_message' || ['item_started', 'item_completed'].includes(row.payload?.type) && ['ImageView', 'imageView'].includes(row.payload.item?.type)) || row.type === 'response_item' && row.payload?.type === 'message' && row.payload.role === 'user';
       const identity = { threadId: thread.id, sourceThreadId: boundary ? head.payload.id : thread.id, itemId: Number.isSafeInteger(row.ordinal) ? 'ordinal:' + row.ordinal : null };
       await transformImages(row, images, selected, identity); yield row;
@@ -143,7 +177,13 @@ async function exportCodexHistory({ thread, logicalId = thread?.id, home, keepBl
     const stat = await fs.promises.stat(source.file);
     if (stat.size !== source.stat.size || stat.mtimeMs !== source.stat.mtimeMs || stat.ino !== source.stat.ino) throw new Error('Conversation changed while exporting; it will be retried.');
   }
-  return { format: 'codex-rollout-v1', id: logicalId, digest: checksum.digest('hex'), bytes, chunks, attachments: [...attachments.values()], ...(missingImages.size ? { missingImages: missingImages.size } : {}), blobs: [...new Map([...chunks, ...attachments.values()].map(blob => [blob.hash, { hash: blob.hash, bytes: blob.bytes }])).values()] };
+  if (repairReasoningId && !reasoningRepairs.has(repairReasoningId)) {
+    const error = new Error('The rejected reasoning item has no recognized damage; the original conversation was kept.');
+    if (!rejectedReasoningExists) error.code = 'REASONING_ITEM_ABSENT';
+    throw error;
+  }
+  if ([...reasoningSummaries].some(id => !visibleReasoning.has(id))) throw new Error('Reasoning summaries cannot be preserved safely; the original conversation was kept.');
+  return { format: 'codex-rollout-v1', id: logicalId, digest: checksum.digest('hex'), bytes, chunks, attachments: [...attachments.values()], ...(missingImages.size ? { missingImages: missingImages.size } : {}), ...(repairReasoningId ? { reasoningRepairs: [...reasoningRepairs] } : {}), blobs: [...new Map([...chunks, ...attachments.values()].map(blob => [blob.hash, { hash: blob.hash, bytes: blob.bytes }])).values()] };
 }
 async function importCodexHistory({ manifest, nativeId = manifest?.id, home, cwd, readBlob, directory }) {
   if (manifest?.format !== 'codex-rollout-v1' || !uuid.test(manifest.id) || !digest.test(manifest.digest) || !Number.isSafeInteger(manifest.bytes) || manifest.bytes <= 0 || manifest.bytes > maxBytes || !Array.isArray(manifest.chunks) || !manifest.chunks.length || manifest.chunks.length > 128 || !Array.isArray(manifest.attachments) || manifest.attachments.length > 500 || !path.isAbsolute(cwd)) throw new Error('Invalid shared conversation snapshot.');
@@ -236,6 +276,25 @@ async function* historyRecords(manifest, readBlob) {
     if (bytes !== manifest.bytes || checksum.digest('hex') !== manifest.digest) throw new Error('Cached conversation checksum does not match.');
   } finally { input.destroy(); output.destroy(); }
 }
+async function matchesCodexHistory({ manifest, base, readBlob }) {
+  if (!uuid.test(manifest?.id) || manifest.id !== base?.id || [manifest, base].some(snapshot => snapshot.format !== 'codex-rollout-v1' || !digest.test(snapshot.digest) || !Number.isSafeInteger(snapshot.bytes) || snapshot.bytes <= 0 || snapshot.bytes > maxBytes || !Array.isArray(snapshot.chunks) || !snapshot.chunks.length || snapshot.chunks.length > 128)) return false;
+  const previous = historyRecords(base, readBlob);
+  let first = true;
+  try {
+    for await (const line of historyRecords(manifest, readBlob)) {
+      const older = await previous.next();
+      if (older.done) return false;
+      if (first) {
+        const current = parse(line), original = parse(older.value);
+        if (current.type !== 'session_meta' || original.type !== 'session_meta') return false;
+        for (const row of [current, original]) { delete row.payload.cwd; delete row.payload.runtime_workspace_roots; }
+        if (JSON.stringify(current) !== JSON.stringify(original)) return false;
+        first = false;
+      } else if (line !== older.value) return false;
+    }
+    return (await previous.next()).done;
+  } finally { await previous.return(); }
+}
 async function extendsCodexHistory({ manifest, base, readBlob, allowImageViewChanges = false }) {
   if (manifest?.format !== 'codex-rollout-v1' || base?.format !== manifest.format || !uuid.test(manifest.id) || base.id !== manifest.id || !digest.test(manifest.digest) || !digest.test(base.digest) || !Number.isSafeInteger(base.bytes) || base.bytes <= 0 || !Number.isSafeInteger(manifest.bytes) || manifest.bytes < base.bytes || manifest.bytes > maxBytes || !Array.isArray(manifest.chunks) || !manifest.chunks.length || manifest.chunks.length > 128) return false;
   if (allowImageViewChanges) {
@@ -277,4 +336,4 @@ async function extendsCodexHistory({ manifest, base, readBlob, allowImageViewCha
     return bytes === manifest.bytes && checksum.digest('hex') === manifest.digest && prefix.digest('hex') === base.digest;
   } finally { input.destroy(); output.destroy(); }
 }
-module.exports = { exportCodexHistory, importCodexHistory, extendsCodexHistory, CodexAttachmentStore };
+module.exports = { exportCodexHistory, importCodexHistory, extendsCodexHistory, matchesCodexHistory, CodexAttachmentStore };

@@ -1,9 +1,9 @@
 const { contextBridge, ipcRenderer } = require('electron');
-function draftRequest(operation, target, patch, expected) {
-  const result = ipcRenderer.sendSync(operation, target, patch, expected);
+function draftResult(result) {
   if (result.error) throw new Error(result.error);
   return result.value;
 }
+function draftRequest(operation, ...args) { return draftResult(ipcRenderer.sendSync(operation, ...args)); }
 contextBridge.exposeInMainWorld('agent', {
   settings: () => ipcRenderer.invoke('settings'),
   providers: () => ipcRenderer.invoke('providers'),
@@ -20,11 +20,13 @@ contextBridge.exposeInMainWorld('agent', {
   queues: () => ipcRenderer.invoke('queues'),
   saveQueue: queue => ipcRenderer.invoke('save-queue', queue),
   draft: target => draftRequest('read-draft', target),
-  hasDraft: target => draftRequest('has-draft', target),
-  saveDraft: (target, patch, expected) => draftRequest('save-draft', target, patch, expected),
+  draftIndicators: (machine, ids) => ipcRenderer.invoke('draft-indicators', machine, ids),
+  autosaveDraft: (target, patch, expected, writeId) => ipcRenderer.invoke('autosave-draft', target, patch, expected, writeId).then(draftResult),
+  saveDraft: (target, patch, expected, writeId) => draftRequest('save-draft', target, patch, expected, writeId),
   clearDraft: (target, expected) => draftRequest('clear-draft', target, undefined, expected),
   moveDraft: (source, target) => draftRequest('move-draft', source, target),
   lastDraft: machine => draftRequest('last-draft', machine),
+  editDrafts: threadId => ipcRenderer.invoke('edit-drafts', threadId),
   scheduledTasks: () => ipcRenderer.invoke('scheduled-tasks'),
   scheduleSharing: () => ipcRenderer.invoke('schedule-sharing'),
   scheduleStorage: () => ipcRenderer.invoke('schedule-storage'),
@@ -32,7 +34,9 @@ contextBridge.exposeInMainWorld('agent', {
   syncSchedules: () => ipcRenderer.invoke('sync-schedules'),
   conversationSync: () => ipcRenderer.invoke('conversation-sync'),
   requestConversation: id => ipcRenderer.invoke('request-conversation', id),
+  cancelConversationRequest: id => ipcRenderer.invoke('cancel-conversation-request', id),
   retryHistorySync: id => ipcRenderer.invoke('retry-history-sync', id),
+  retryConversationSync: key => ipcRenderer.invoke('retry-conversation-sync', key),
   resolveSyncConflict: (key, choice, version) => ipcRenderer.invoke('resolve-sync-conflict', key, choice, version),
   mapSyncProject: (id, root) => ipcRenderer.invoke('map-sync-project', id, root),
   scheduledTask: (id, token) => ipcRenderer.invoke('scheduled-task', id, token),

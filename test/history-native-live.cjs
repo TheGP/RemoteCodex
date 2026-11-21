@@ -18,7 +18,7 @@ const { PreferencesStore } = require('../preferences.cjs');
 const timestamp = '2026-11-16T12:00:00.000Z';
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jM9sAAAAASUVORK5CYII=', 'base64');
 const encode = rows => rows.map((row, ordinal) => JSON.stringify({ timestamp, ...row, ordinal }) + '\n').join('');
-const allowed = new Set(['initialize', 'thread/resume', 'thread/read', 'thread/turns/list', 'thread/unsubscribe', 'thread/list', 'fs/readFile']);
+const allowed = new Set(['initialize', 'thread/start', 'thread/resume', 'thread/read', 'thread/turns/list', 'thread/unsubscribe', 'thread/list', 'fs/readFile']);
 const checksum = data => createHash('sha256').update(data).digest('hex');
 
 async function main() {
@@ -41,7 +41,7 @@ async function main() {
       });
       connections.push(connection);
       const call = connection.call.bind(connection);
-      connection.call = (method, params, timeout = 15000) => { assert.ok(allowed.has(method), 'No inference or mutation RPC is allowed: ' + method); requests.push(method); if (process.env.HISTORY_NATIVE_DEBUG) console.log(path.basename(path.dirname(profile.home)), method, params?.threadId || ''); return call(method, params, timeout).catch(error => { error.message = path.basename(path.dirname(profile.home)) + ' ' + method + ': ' + error.message; throw error; }); };
+      connection.call = (method, params, timeout = 15000) => { assert.ok(allowed.has(method), 'No inference or mutation RPC is allowed: ' + method); requests.push(method); if (process.env.HISTORY_NATIVE_DEBUG) console.log(path.basename(path.dirname(profile.home)), method, params?.threadId || ''); return call(method, params, timeout); };
       connection.on('notification', message => {
         notifications.push(message);
         if (message.id !== undefined) connection.rejectRequest(message.id);
@@ -203,6 +203,9 @@ async function main() {
     assert.deepEqual(b.pins.get(b.options), [logicalId]);
     const syncedPin = b.preferences.read().messagePins['access:local'][logicalId][0];
     assert.equal(peerTurns[0].items.find(item => item.id === syncedPin.itemId)?.text, pinned.text);
+    await b.state.history.request(logicalId);
+    await b.state.history.cancelRequest(logicalId); await a.state.history.refresh();
+    assert.equal(a.state.history.owners.get(logicalId).requested, null);
     await b.state.history.request(logicalId); await a.state.tick(); await b.state.history.refresh();
     assert.equal(b.state.history.status().find(owner => owner.id === logicalId).owned, true);
     await b.state.history.verify(logicalId); await b.state.tick();
@@ -223,13 +226,39 @@ async function main() {
     await resume(b.pool, b.profile, logicalId);
     const restored = await read(b.pool, logicalId);
     assert.equal(restored[0].items.find(item => item.id === syncedPin.itemId)?.text, pinned.text);
+    const cached = b.state.history.record(logicalId), cachedManifest = b.state.catalog('history', logicalId);
+    const cold = await importCodexHistory({ manifest: cachedManifest, nativeId: randomUUID(), home: b.profile.home, cwd: b.profile.cwd, directory: path.join(directory, 'cold-cache'), readBlob: id => fs.promises.readFile(b.state.sync.blobFile(id)) });
+    b.state.sync.state.localHistory[logicalId] = { ...cached, authority: null, nativeId: cold.id, path: cold.path, stamp: b.state.history.stamp(cold.path), retiredNativeIds: [...cached.retiredNativeIds, cached.nativeId] };
+    b.state.sync.save(); b.pool.setThreadAliases(b.state.sync.state.localHistory);
+    assert.equal((await b.pool.call('thread/read', { threadId: logicalId, includeTurns: false })).thread.path, cold.path);
+    await b.state.history.read(logicalId, { refresh: true });
+    await b.state.history.verify(logicalId);
+    assert.equal(b.state.history.hasAuthority(logicalId), true);
+    assert.equal((await read(b.pool, logicalId))[0].items.find(item => item.id === syncedPin.itemId)?.text, pinned.text);
+    const { thread: fresh } = await a.pool.call('thread/start', { cwd: a.profile.cwd, historyMode: 'paginated', sandbox: 'read-only', approvalPolicy: 'never', config: { 'features.goals': false } });
+    assert.equal(fresh.ephemeral, false); assert.equal(fs.existsSync(fresh.path), false);
+    await assert.rejects(a.pool.call('thread/turns/list', { threadId: fresh.id, limit: 1, itemsView: 'notLoaded' }), /is not materialized yet; thread\/turns\/list is unavailable before first user message/);
+    const freshOwner = await a.state.history.ownership(fresh.id);
+    await assert.rejects(b.state.history.request(fresh.id), /history|message|sync/i);
+    await a.state.history.refresh(); assert.equal(a.state.history.owners.get(fresh.id).requested, null);
+    assert.equal(await a.state.history.export(fresh, freshOwner), false);
+    assert.equal(a.state.history.errors.has(fresh.id), false); assert.equal(a.state.catalog('history', fresh.id), undefined);
+    await a.state.history.verify(fresh.id);
+    const admitted = await a.state.history.begin(fresh.id);
+    assert.ok(admitted.runToken); assert.equal(a.state.history.hasAuthority(fresh.id), true);
+    a.state.history.uncertain(fresh.id, admitted);
+    assert.equal(await a.state.history.recover(fresh.id, a.state.history.owners.get(fresh.id)), true);
+    const retried = await a.state.history.begin(fresh.id);
+    assert.notEqual(retried.runToken, admitted.runToken);
+    await a.state.history.end(fresh.id, retried);
+    assert.equal(fs.existsSync(fresh.path), false, 'first-message admission must not manufacture native history');
     assert.deepEqual(fs.readFileSync(original), originalBytes);
     assert.equal(fs.existsSync(path.join(a.profile.cwd, 'fixture.txt')), false);
     assert.equal(fs.existsSync(sentinel), false); assert.equal(fs.existsSync(changed), false);
     assert.equal(notifications.some(message => message.method === 'turn/started' || message.method === 'item/started' && ['commandExecution', 'fileChange'].includes(message.params?.item?.type)), false);
     assert.equal(notifications.some(message => message.id !== undefined), false);
     assert.equal(requests.some(method => method === 'turn/start' || method === 'turn/steer'), false);
-    console.log('PASS isolated native history: source/import projection, stable IDs and pin lookup, tool output and diff, PNG display, replacement snapshot, real pool/coordinator handoff and reconnect; no inference or historical command execution.');
+    console.log('PASS isolated native history: stable messages/pins/images/diffs, handoff and cancellation, cold cached-copy loading, empty-chat transfer rejection, first-message admission and uncertain-send recovery before history exists; no inference or historical command execution.');
   } finally {
     states.forEach(state => { state.history.close(); state.sync.close(); }); pools.forEach(pool => pool.disconnect());
     connections.forEach(connection => connection.disconnect());

@@ -10,6 +10,9 @@ const { DraftStore } = require('../drafts.cjs');
 const { PreferencesStore } = require('../preferences.cjs');
 const { hash, stateKey } = require('../sync-state.cjs');
 const { mapProjectPath } = require('../path-mapping.js');
+const { EventEmitter } = require('node:events');
+const { AgentPool, agentId } = require('../agent-pool.cjs');
+const { rendererMethods } = require('../providers.cjs');
 
 const machine = 'access:local';
 function fixture(t) {
@@ -69,6 +72,155 @@ test('fresh native thread capture initializes sync state before the first backgr
   assert.deepEqual(a.calls, []); assert.deepEqual(a.bridgeCalls, []);
   await a.state.tick(); await b.state.tick();
   assert.equal(b.state.catalog('thread', thread.id).name, thread.name);
+});
+
+test('app archives hide provider chats across restart and sync without provider archive support', async t => {
+  const { a, b } = fixture(t), id = agentId('sample', 'thread', 'archive-me');
+  const thread = { id, provider: 'sample', name: 'Keep its native history', cwd: a.root, updatedAt: 1 };
+  a.state.archive(id);
+  assert.equal(a.state.sync.state.pending.find(op => op.kind === 'thread' && op.id === id).value, null, 'archiving an uncatalogued chat must create a tombstone');
+  assert.deepEqual(a.state.threads([thread], null), []);
+  await a.state.sync.tick(); await b.state.sync.tick();
+  assert.deepEqual(b.state.threads([thread], null), []);
+  a.restart(); b.restart();
+  a.shared.enabled = false; b.shared.enabled = false;
+  assert.deepEqual(a.state.threads([thread], null), []);
+  assert.deepEqual(b.state.threads([thread], null), []);
+  assert.deepEqual(a.calls, []); assert.deepEqual(b.calls, []);
+  a.switchMachine('access:other-host:22');
+  assert.deepEqual(a.state.threads([thread], null), [thread], 'archives must stay machine scoped');
+});
+
+test('saved app archives retry failed outbox writes after restart in an already seeded namespace', async t => {
+  const { a, b } = fixture(t), id = agentId('sample', 'thread', 'archive-outbox-failure');
+  const thread = { id, provider: 'sample', name: 'Archive me', cwd: a.root, updatedAt: 1 };
+  a.state.captureThread(thread); await a.state.tick(); await b.state.tick();
+  assert.equal(a.state.sync.state.seeded, true);
+  const outbox = a.state.sync.file + '.outbox', rename = fs.renameSync;
+  const failure = t.mock.method(fs, 'renameSync', (from, to) => {
+    if (to === outbox) throw new Error('Disk full writing archive outbox');
+    return rename(from, to);
+  });
+  a.state.archive(id);
+  assert.match(a.state.sync.error, /Disk full/);
+  assert.deepEqual(a.preferences.read().archivedThreads[machine], [id]);
+  failure.mock.restore(); a.restart();
+  await a.state.tick(); await b.state.tick();
+  assert.equal(a.state.catalog('thread', id), null); assert.equal(b.state.catalog('thread', id), null);
+  assert.deepEqual(b.state.threads([thread], null), []);
+});
+
+test('re-enabling sharing retries uncaptured archives without replacing a pending tombstone each poll', async t => {
+  const { a, b } = fixture(t), id = agentId('sample', 'thread', 'archive-reenable');
+  const thread = { id, provider: 'sample', name: 'Archive me', cwd: a.root, updatedAt: 1 };
+  a.state.captureThread(thread); await a.state.tick(); await b.state.tick();
+  a.shared.enabled = false; await a.state.tick();
+  const failure = t.mock.method(a.state.sync, 'capture', () => { throw new Error('Archive capture failed'); });
+  a.state.archive(id); failure.mock.restore();
+  assert.equal(a.state.sync.state.pending.some(op => op.kind === 'thread'), false);
+  a.shared.enabled = true;
+  const paused = t.mock.method(a.state.sync, 'tick', async () => {});
+  await a.state.tick();
+  const pending = a.state.sync.state.pending.find(op => op.kind === 'thread' && op.id === id);
+  assert.equal(pending.value, null);
+  await a.state.tick();
+  assert.deepEqual(a.state.sync.state.pending.filter(op => op.kind === 'thread' && op.id === id), [pending]);
+  paused.mock.restore(); await a.state.tick(); await b.state.tick();
+  assert.equal(b.state.catalog('thread', id), null);
+  assert.deepEqual(b.state.threads([thread], null), []);
+});
+
+test('late native metadata cannot replace local archives or pending archive tombstones', async t => {
+  for (const remembered of [false, true]) await t.test(String(remembered), async t => {
+    const { a, b } = fixture(t), id = agentId('sample', 'thread', 'archive-late-metadata');
+    const thread = { id, provider: 'sample', name: 'Old title', cwd: a.root, updatedAt: 1 };
+    a.state.captureThread(thread); await a.state.tick(); await b.state.tick();
+    if (remembered) a.preferences.archiveThread(machine, id);
+    else a.state.sync.capture('thread', machine, id, null);
+    const pending = a.state.sync.state.pending.find(op => op.kind === 'thread' && op.id === id);
+    a.state.captureThread({ ...thread, name: 'Late native title', updatedAt: 2 });
+    assert.equal(a.state.sync.state.pending.find(op => op.kind === 'thread' && op.id === id), pending);
+    await a.state.tick(); await b.state.tick();
+    assert.equal(a.state.catalog('thread', id), null); assert.equal(b.state.catalog('thread', id), null);
+    assert.deepEqual(b.state.threads([thread], null), []);
+  });
+});
+
+test('archiving wins over peer metadata queued before the archive reaches that computer', async t => {
+  const { a, b } = fixture(t), id = agentId('sample', 'thread', 'archived-during-rename');
+  const thread = { id, provider: 'sample', name: 'Before archive', cwd: a.root, updatedAt: 1 };
+  a.state.captureThread(thread); await a.state.sync.tick(); await b.state.sync.tick();
+  b.state.captureThread({ ...thread, name: 'Queued peer metadata', updatedAt: 2 });
+  a.state.archive(id); await a.state.sync.tick(); await b.state.sync.tick(); await a.state.sync.tick();
+  assert.equal(a.state.catalog('thread', id), null); assert.equal(b.state.catalog('thread', id), null);
+  assert.deepEqual(b.preferences.read().archivedThreads[machine], [id]);
+  assert.deepEqual(a.state.threads([thread], null), []); assert.deepEqual(b.state.threads([thread], null), []);
+  assert.equal(b.state.sync.state.pending.some(op => op.kind === 'thread'), false);
+});
+
+test('an observed shared archive persists locally even while that chat has queued metadata', async t => {
+  const { a, b } = fixture(t), id = agentId('sample', 'thread', 'archive-pending-metadata');
+  const thread = { id, provider: 'sample', name: 'Archive me', cwd: a.root, updatedAt: 1 };
+  a.state.captureThread(thread); await a.state.sync.tick(); await b.state.sync.tick();
+  b.state.captureThread({ ...thread, updatedAt: 2 });
+  a.state.archive(id); await a.state.sync.tick();
+  const key = stateKey('thread', machine, id);
+  await b.state.sync.applyEntry(a.state.sync.state.entries[key]);
+  b.shared.enabled = false;
+  assert.deepEqual(b.state.threads([thread], null), []);
+  assert.equal(b.state.sync.state.pending.some(op => op.key === key), false);
+});
+
+test('workspace-only chats keep their shared project when its provider is disabled, restarted, and enabled again', async t => {
+  const { a, b } = fixture(t), calls = [], pools = [];
+  const nativeProject = { id: 'native-rapidcode', name: 'Rapidcode', roots: [{ path: a.root }] };
+  const settings = { mode: 'local', localCwd: a.root };
+  const config = enabled => ({ ...settings, providerOptions: { codex: { enabled }, sample: { enabled: true } } });
+  const registry = Object.fromEntries(['codex', 'sample'].map(provider => [provider, {
+    id: provider, name: provider, methods: rendererMethods.filter(method => provider === 'codex' || !method.startsWith('project/')),
+    options: value => ({ mode: value.mode || 'local' }),
+    create() {
+      const adapter = new EventEmitter();
+      Object.assign(adapter, { ready: false, connect: async () => { adapter.ready = true; }, disconnect: () => { calls.push({ provider, method: 'disconnect' }); adapter.ready = false; adapter.emit('disconnected'); }, call: async (method, params) => {
+        calls.push({ provider, method, params });
+        if (method === 'project/list') return { data: [nativeProject], nextCursor: null };
+        if (method === 'thread/list') return { data: provider === 'sample' ? [{ id: 'hi', name: 'hi', cwd: a.root, updatedAt: 1 }] : [], nextCursor: null };
+        if (method === 'turn/start') return { turn: { id: 'still-sample', status: 'inProgress' } };
+        throw new Error('Unexpected native request: ' + method);
+      } });
+      return adapter;
+    }
+  }]));
+  let pool = new AgentPool(registry); pools.push(pool); a.state.connection = pool;
+  t.after(() => pools.forEach(pool => pool.disconnect()));
+  const projects = async () => { a.state.nativeProjects.clear(); return a.state.projects((await pool.call('project/list')).data); };
+  const members = async projectId => projectId.includes('sync-project:') ? a.state.threads([], projectId) : a.state.threads((await pool.call('thread/list', { projectId })).data, projectId);
+  await pool.connect(config(true));
+  const [before] = await projects(), id = agentId('sample', 'thread', 'hi');
+  assert.deepEqual((await members(before.id)).map(thread => thread.id), [id]);
+  await a.state.sync.tick(); await b.state.sync.tick();
+  const sample = pool.connections.get('sample');
+  await pool.reconfigure(config(false));
+  const [disabled] = await projects();
+  assert.equal(disabled.id, before.id); assert.equal(disabled.sharedId, before.sharedId);
+  assert.equal(disabled.needsFolder, undefined); assert.equal(disabled.roots[0].path, a.root);
+  assert.deepEqual((await members(disabled.id)).map(thread => thread.id), [id]);
+  assert.equal(pool.connections.get('sample'), sample); assert.equal(sample.ready, true);
+  assert.equal(calls.some(call => call.provider === 'sample' && call.method === 'disconnect'), false);
+  await pool.call('turn/start', { threadId: id });
+  assert.equal(calls.findLast(call => call.method === 'turn/start').provider, 'sample');
+  assert.equal(a.state.threadBinding(id).provider, 'sample');
+  b.connection.listProviders = () => [{ id: 'codex', connected: false }];
+  assert.equal(b.state.projects([])[0].needsFolder, true, 'another computer must still choose its own folder');
+  assert.deepEqual(b.state.threads([], b.state.projects([])[0].id).map(thread => thread.id), [id], 'the other computer shows the chat inside its unmapped shared project');
+  pool.disconnect(); a.restart(); pool = new AgentPool(registry); pools.push(pool); a.state.connection = pool;
+  await pool.connect(config(false));
+  const [restarted] = await projects();
+  assert.equal(restarted.id, before.id); assert.deepEqual((await members(restarted.id)).map(thread => thread.id), [id]);
+  await pool.reconfigure(config(true));
+  const restored = await projects();
+  assert.deepEqual(restored.map(project => project.id), [before.id]);
+  assert.deepEqual((await members(before.id)).map(thread => thread.id), [id]);
 });
 
 test('shared project catalogs require an explicit local folder mapping before running a peer conversation', async t => {
@@ -357,6 +509,21 @@ test('explicitly clearing projectId ungroups a synced thread while partial metad
   await a.state.tick(); await b.state.tick();
   assert.equal(a.state.catalog('thread', 'shared-chat').project, null); assert.equal(b.state.catalog('thread', 'shared-chat').project, null);
   assert.equal(b.state.threads([], null)[0].id, 'shared-chat'); assert.equal(b.state.threadBinding('shared-chat'), null);
+});
+
+test('a conversation sharing another provider’s project keeps filesystem and scheduled calls on its own provider', async t => {
+  const { a } = fixture(t);
+  const project = a.state.captureProject({ id: 'native-rapidcode', provider: 'codex', name: 'Rapidcode', roots: [{ path: a.root }] });
+  const id = 'agent:zcode:thread:shared-root-chat';
+  a.state.captureThread({ id, provider: 'zcode', name: 'hi', projectId: project.id, updatedAt: 1 });
+  await a.state.tick();
+  assert.equal(a.state.threadBinding(id).provider, 'zcode');
+  assert.equal(a.state.threadBinding(id).root, a.root);
+  const task = { machine, threadId: id, cwd: a.root, message: { thread: { id, provider: 'zcode', cwd: a.root, projectId: project.id }, input: [{ type: 'text', text: 'Follow up' }], turnSettings: { threadId: id } } };
+  const prepared = await a.state.scheduledTask(task);
+  assert.equal(prepared.cwd, a.root);
+  assert.equal(prepared.message.turnSettings.cwd, undefined, 'folder grouping must not add Codex-only settings to ZCode');
+  assert.equal(a.calls.findLast(call => call.method === 'fs/readDirectory').context.provider, 'zcode');
 });
 
 test('scheduled task preparation requires an active machine and maps only local folders, skills and sandbox roots', async t => {

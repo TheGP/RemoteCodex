@@ -9,6 +9,11 @@ const stateKey = (kind, machine, id) => {
 };
 const hash = value => createHash('sha256').update(value).digest('hex');
 const blobGraceMs = 60 * 60 * 1000;
+function retryableWrite(error) {
+  if (Number.isInteger(error.errcode)) return [5, 6, 7, 8, 10, 13, 14].includes(error.errcode & 255);
+  if (error.code) return /^SQLITE_(?:BUSY|LOCKED|NOMEM|READONLY|IOERR|FULL|CANTOPEN)(?:_|$)/.test(error.code) || ['ENOSPC', 'EDQUOT', 'EIO', 'EBUSY', 'EAGAIN', 'EMFILE', 'ENFILE', 'EROFS'].includes(error.code);
+  return /(?:database|disk) is (?:locked|full)|database or disk is full|SQLITE_(?:BUSY|LOCKED|FULL|IOERR)/i.test(error.message);
+}
 
 class StateDatabase {
   constructor(db) {
@@ -57,9 +62,13 @@ class StateDatabase {
         if (!current) {
           this.db.prepare('INSERT INTO sync_owners(machine,id,owner,name,requested,requested_name,epoch) VALUES(?,?,?,?,NULL,NULL,1)').run(args.machine, args.id, owner, args.name);
         } else if (current.owner !== owner && method === 'history-request') {
+          if (!this.get(stateKey('history', args.machine, args.id))?.value) throw new Error('This conversation has not uploaded its history yet. Wait for its owner to sync before requesting a transfer.');
           if (current.requested && current.requested !== owner) throw new Error('Another computer is already waiting for this conversation.');
           this.db.prepare('UPDATE sync_owners SET requested=?,requested_name=? WHERE machine=? AND id=?').run(owner, args.name, args.machine, args.id);
         }
+      } else if (method === 'history-cancel-request') {
+        if (!current || current.requested !== owner) throw new Error('Only the requesting computer can cancel this transfer request.');
+        this.db.prepare('UPDATE sync_owners SET requested=NULL,requested_name=NULL WHERE machine=? AND id=?').run(args.machine, args.id);
       } else if (method === 'history-release') {
         if (!current || current.owner !== owner || current.epoch !== args.epoch || !current.requested || current.busy) throw new Error('Conversation ownership changed or its task is still running.');
         const saved = this.get(stateKey('history', args.machine, args.id));
@@ -87,6 +96,17 @@ class StateDatabase {
       this.collectBlobs(now); return { missing };
     }
     if (method === 'state-get') return this.get(stateKey(args.kind, args.machine, args.id));
+    if (method === 'state-recover') {
+      const op = args.operation, key = stateKey(op?.kind, op?.machine, op?.id);
+      if (op.kind !== 'draft' || !Number.isSafeInteger(args.base) || args.base < 0 || !Array.isArray(args.ancestors) || !args.ancestors.length || args.ancestors.length > 1000 || args.ancestors.some(id => !validId(id))) throw new Error('Invalid conversation recovery request.');
+      const current = this.get(key); let base = args.base;
+      for (const id of args.ancestors) {
+        const receipt = this.db.prepare('SELECT * FROM sync_ops WHERE id=?').get(id);
+        if (receipt && receipt.key !== key) throw new Error('Recovery receipt belongs to another conversation.');
+        if (receipt && receipt.revision === current?.revision) base = receipt.revision;
+      }
+      return this.request('state-push', { operations: [{ ...op, base }], isolateErrors: true }, owner, now)[0];
+    }
     if (method === 'state-pull') {
       if (!Number.isSafeInteger(args.cursor) || args.cursor < 0) throw new Error('Invalid sync cursor.');
       if (!this.nextBlobGc || now >= this.nextBlobGc) this.collectBlobs(now);
@@ -103,7 +123,7 @@ class StateDatabase {
       if (!Array.isArray(args.operations) || !args.operations.length || args.operations.length > 50) throw new Error('Invalid sync operations.');
       if (args.isolateErrors === true) return args.operations.map(op => {
         try { return this.request('state-push', { operations: [op] }, owner, now)[0]; }
-        catch (error) { return { opId: op?.opId, error: error.message }; }
+        catch (error) { return { opId: op?.opId, error: error.message, retryable: retryableWrite(error), ...(error.code ? { code: error.code } : {}) }; }
       });
       const operations = args.operations.map(op => {
         const key = stateKey(op.kind, op.machine, op.id);
@@ -140,7 +160,7 @@ class StateDatabase {
           if (receipt.key !== op.key) throw new Error('Sync operation identity was reused.');
           return { opId: op.opId, revision: receipt.revision, current };
         }
-        if (op.seed && current) return { opId: op.opId, revision: current.revision, current, seeded: true };
+        if (op.seed && current || op.kind === 'thread' && current?.value === null && op.value !== null) return { opId: op.opId, revision: current.revision, current, seeded: true };
         if (['draft', 'note'].includes(op.kind) && op.stale) return { opId: op.opId, conflict: true, current };
         if (op.kind === 'completion' && op.value === null && current?.value?.turnId && op.observedTurn !== current.value.turnId) return { opId: op.opId, conflict: true, current };
         if (['draft', 'shortcuts', 'unread', 'completion', 'history', 'note'].includes(op.kind) && !op.seed && (current?.revision || 0) !== op.base) return { opId: op.opId, conflict: true, current };

@@ -6,7 +6,7 @@ const path = require('node:path');
 const { randomUUID, randomBytes, createHash } = require('node:crypto');
 const { gzipSync, gunzipSync } = require('node:zlib');
 const { pathToFileURL } = require('node:url');
-const { exportCodexHistory, importCodexHistory, extendsCodexHistory, CodexAttachmentStore } = require('../codex-history.cjs');
+const { exportCodexHistory, importCodexHistory, extendsCodexHistory, matchesCodexHistory, CodexAttachmentStore } = require('../codex-history.cjs');
 
 const checksum = data => createHash('sha256').update(data).digest('hex');
 const encode = rows => Buffer.from(rows.map(row => JSON.stringify(row) + '\n').join(''));
@@ -307,6 +307,38 @@ test('deleted source images import as private missing-image paths without consul
   assert.equal(missing, path.join(f.cache, 'attachments', 'missing-' + token.split(':')[1] + '.png'));
   assert.equal(fs.existsSync(missing), false); assert.deepEqual(fs.readFileSync(image), external);
   assert.deepEqual(reads, manifest.chunks.map(chunk => chunk.hash));
+  const reexported = await exportCodexHistory({ thread: { id: imported.id, path: imported.path, cwd: f.receiverCwd }, home: f.receiver, keepBlob: f.keepBlob, attachmentRoots: [path.join(f.cache, 'attachments')], missingImageBase: manifest, readBlob: f.readBlob });
+  assert.equal(reexported.missingImages, 1);
+  assert.equal(decode(f.portable(reexported))[1].payload.content[0].path, token);
+  assert.equal(await matchesCodexHistory({ manifest: reexported, base: manifest, readBlob: f.readBlob }), true);
+});
+
+test('missing-image identity requires a verified source token and its canonical private attachment folder', async t => {
+  for (const kind of ['unknown-token', 'outside-root', 'symlink-root', 'no-base', 'corrupt-base']) await t.test(kind, async t => {
+    const f = fixture(t), manifest = await f.exportThread(f.create([imageRow(1, path.join(f.cwd, 'removed.png'))]));
+    const imported = await f.importManifest(manifest), rows = decode(fs.readFileSync(imported.path));
+    let root = path.join(f.cache, 'attachments'); const original = rows[1].payload.content[0].path;
+    if (kind === 'symlink-root') { const alias = path.join(f.cache, 'alias'); fs.symlinkSync(root, alias); root = alias; }
+    const file = kind === 'unknown-token' ? path.join(root, 'missing-' + 'f'.repeat(64) + '.png') : kind === 'outside-root' ? path.join(f.receiverCwd, path.basename(original)) : kind === 'symlink-root' ? path.join(root, path.basename(original)) : original;
+    rows[1].payload.content[0].path = file; fs.writeFileSync(imported.path, encode(rows));
+    const exporting = exportCodexHistory({ thread: { id: imported.id, path: imported.path, cwd: f.receiverCwd }, home: f.receiver, keepBlob: f.keepBlob, attachmentRoots: [root], missingImageBase: kind === 'no-base' ? undefined : kind === 'corrupt-base' ? { ...manifest, digest: '0'.repeat(64) } : manifest, readBlob: f.readBlob });
+    if (kind === 'corrupt-base') await assert.rejects(exporting, /checksum/);
+    else assert.equal(decode(f.portable(await exporting))[1].payload.content[0].path, 'remote-codex-missing-image:' + checksum(Buffer.from(file)));
+  });
+});
+
+test('missing images in one message all wait for the verified placeholder identities', async t => {
+  const f = fixture(t);
+  const row = { ...user(1), payload: { ...user(1).payload, local_images: ['one.png', 'two.png'].map(name => path.join(f.cwd, name)) } };
+  const manifest = await f.exportThread(f.create([row]));
+  const imported = await f.importManifest(manifest);
+  const reexported = await exportCodexHistory({
+    thread: { id: imported.id, path: imported.path, cwd: f.receiverCwd }, home: f.receiver,
+    keepBlob: f.keepBlob, attachmentRoots: [path.join(f.cache, 'attachments')],
+    missingImageBase: manifest, readBlob: f.readBlob
+  });
+  assert.equal(reexported.missingImages, 2);
+  assert.equal(await matchesCodexHistory({ manifest: reexported, base: manifest, readBlob: f.readBlob }), true);
 });
 
 test('genuine user-selected PNGs outside the workspace and native ImageView file URIs are portable', async t => {
@@ -346,6 +378,24 @@ test('concurrent native imports safely share newly created calendar storage fold
   assert.notEqual(results[0].value.path, results[1].value.path);
 });
 
+
+test('loaded history equality permits local workspace metadata but rejects changed, missing and extra messages', async t => {
+  const f = fixture(t), thread = f.create(), base = await f.exportThread(thread);
+  const rows = decode(f.portable(base));
+  rows[0].payload.cwd = f.receiverCwd; rows[0].payload.runtime_workspace_roots = [f.receiverCwd];
+  const local = f.replaceRows(base, rows);
+  const matches = (manifest = local, reference = base) => matchesCodexHistory({ manifest, base: reference, readBlob: f.readBlob });
+  assert.equal(await matches(), true);
+  assert.equal(await matches(f.replaceRows(local, [...rows, user(3, 'Unsynced message')])), false);
+  assert.equal(await matches(f.replaceRows(local, rows.slice(0, -1))), false);
+  const changed = structuredClone(rows); changed[1].payload.message = 'Edited message';
+  assert.equal(await matches(f.replaceRows(local, changed)), false);
+  const identity = structuredClone(rows); identity[0].payload.id = randomUUID();
+  assert.equal(await matches(f.replaceRows(local, identity)), false);
+  assert.equal(await matches({ ...local, id: randomUUID() }), false);
+  assert.equal(await matches({ ...local, bytes: 0 }), false);
+  await assert.rejects(matches(local, { ...base, digest: checksum(Buffer.from('wrong digest')) }), /checksum/);
+});
 
 test('history ancestry checks verify exact canonical prefixes and complete checksums across compressed chunks', async t => {
   const f = fixture(t), thread = f.create([user(1, 'Unicode: 確認碼 and 😀'), assistant(2)]);
@@ -467,4 +517,46 @@ test('selecting remote history cannot reuse a competing local attachment capture
   store.capture({ threadId: nativeId, item: { type: 'imageView', id: itemId, path: selectedPath.href }, home: f.receiver });
   assert.equal((await exportCopy()).digest, first.digest);
   assert.deepEqual((await exportCopy()).attachments, first.attachments);
+});
+
+test('reasoning repair removes only scrubbed replay payloads and preserves visible history and valid ciphertext', async t => {
+  const f = fixture(t), id = 'rs_damaged';
+  const event = { timestamp, ordinal: 2, type: 'event_msg', payload: { type: 'item_completed', item: { type: 'Reasoning', id, summary_text: ['Visible reasoning'], raw_content: [] } } };
+  const damaged = { timestamp, ordinal: 3, type: 'response_item', payload: { type: 'reasoning', id, summary: [], encrypted_content: 'gAAAA_[AI credential removed]' } };
+  const valid = { timestamp, ordinal: 4, type: 'response_item', payload: { type: 'reasoning', id: 'rs_valid', summary: [], encrypted_content: 'gAAAA_valid_ciphertext==' } };
+  const thread = f.create([user(1, 'Keep literal [AI credential removed] in messages'), event, damaged, valid, assistant(5)]), original = fs.readFileSync(thread.path);
+  const normal = await f.exportThread(thread), repaired = await exportCodexHistory({ thread, home: f.home, keepBlob: f.keepBlob, repairReasoningId: id });
+  assert.equal(normal.reasoningRepairs, undefined); assert.deepEqual(repaired.reasoningRepairs, [id]);
+  assert.deepEqual(decode(f.portable(repaired)), decode(f.portable(normal)).filter(row => row.payload?.id !== id));
+  const nativeId = randomUUID(), imported = await f.importManifest(repaired, { nativeId });
+  assert.deepEqual(decode(fs.readFileSync(imported.path)).slice(1), decode(f.portable(repaired)).slice(1));
+  assert.deepEqual(fs.readFileSync(thread.path), original);
+  assert.deepEqual(decode(f.portable(repaired)).find(row => row.payload?.item?.id === id), event);
+});
+
+test('reasoning repair also removes damaged replay items inside compaction replacements without altering summaries', async t => {
+  const f = fixture(t), id = 'rs_compacted_damage';
+  const keep = { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[AI credential removed] remains readable' }] };
+  const valid = { type: 'reasoning', id: 'rs_valid', summary: [], encrypted_content: 'valid' };
+  const compacted = { timestamp, type: 'compacted', ordinal: 2, payload: { message: 'Summary [AI credential removed]', replacement_history: [keep, { type: 'reasoning', id, summary: [], encrypted_content: 'broken[AI credential removed]' }, valid] } };
+  const thread = f.create([user(1), compacted, assistant(3)]);
+  const repaired = await exportCodexHistory({ thread, home: f.home, keepBlob: f.keepBlob, repairReasoningId: id });
+  assert.deepEqual(repaired.reasoningRepairs, [id]);
+  assert.deepEqual(decode(f.portable(repaired)).find(row => row.type === 'compacted'), { ...compacted, payload: { ...compacted.payload, replacement_history: [keep, valid] } });
+});
+
+test('reasoning repair refuses unmatched errors and unmarked encrypted items instead of silently discarding context', async t => {
+  const f = fixture(t), thread = f.create([{ timestamp, type: 'response_item', ordinal: 1, payload: { type: 'reasoning', id: 'rs_intact', summary: [], encrypted_content: 'gAAAA_valid_ciphertext==' } }, assistant(2)]), original = fs.readFileSync(thread.path);
+  for (const id of ['rs_unknown', 'rs_intact', 'bad-id', {}, '']) await assert.rejects(exportCodexHistory({ thread, home: f.home, keepBlob: f.keepBlob, repairReasoningId: id }), /recognized damage|Invalid reasoning repair/);
+  await assert.rejects(exportCodexHistory({ thread, home: f.home, keepBlob: f.keepBlob, repairReasoningId: 'rs_unknown' }), error => error.code === 'REASONING_ITEM_ABSENT');
+  await assert.rejects(exportCodexHistory({ thread, home: f.home, keepBlob: f.keepBlob, repairReasoningId: 'rs_intact' }), error => !error.code && /recognized damage/.test(error.message));
+  assert.deepEqual(fs.readFileSync(thread.path), original);
+});
+
+test('reasoning repair refuses to discard a summary without a preserved visible reasoning event', async t => {
+  const f = fixture(t), id = 'rs_summary';
+  const thread = f.create([{ timestamp, type: 'response_item', ordinal: 1, payload: { type: 'reasoning', id, summary: [{ type: 'summary_text', text: 'Keep visible summary' }], encrypted_content: '[AI credential removed]' } }]);
+  const original = fs.readFileSync(thread.path);
+  await assert.rejects(exportCodexHistory({ thread, home: f.home, keepBlob: f.keepBlob, repairReasoningId: id }), /summaries cannot be preserved/);
+  assert.deepEqual(fs.readFileSync(thread.path), original);
 });

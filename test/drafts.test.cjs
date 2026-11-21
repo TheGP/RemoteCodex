@@ -29,19 +29,19 @@ test('typed text, images and send choices survive fresh store instances without 
   assert.equal(store.read(target).images[0].url, image.url);
 });
 
-test('draft markers read metadata without loading images and stay separate by chat and machine', t => {
+test('draft markers read metadata without loading images and stay separate by chat and machine', async t => {
   const store = fixture(t);
-  assert.equal(store.hasContent(target), false);
-  store.save(target, { text: ' \n ' }); assert.equal(store.hasContent(target), false);
+  const ids = [target.threadId, 'other-chat'];
+  assert.deepEqual(await store.indicators(target.machine, ids), []);
+  store.save(target, { text: ' \n ' }); assert.deepEqual(await store.indicators(target.machine, ids), []);
   store.save(target, { text: 'Unsent prompt' });
-  assert.equal(new DraftStore(store.directory).hasContent(target), true);
-  assert.equal(store.hasContent({ ...target, threadId: 'other-chat' }), false);
-  assert.equal(store.hasContent({ ...target, machine: 'access:other-machine' }), false);
+  assert.deepEqual(await new DraftStore(store.directory).indicators(target.machine, ids), [target.threadId]);
+  assert.deepEqual(await store.indicators('access:other-machine', ids), []);
   store.save(target, { text: '', images: [image] });
   fs.unlinkSync(path.join(store.folder(target), store.metadata(target).images[0].file));
-  assert.equal(store.hasContent(target), true);
+  assert.deepEqual(await store.indicators(target.machine, ids), [target.threadId]);
   assert.throws(() => store.read(target), /ENOENT/);
-  store.clear(target); assert.equal(store.hasContent(target), false);
+  store.clear(target); assert.deepEqual(await store.indicators(target.machine, ids), []);
 });
 
 test('drafts stay separate across chats, machines, projects, folders and editor types', t => {
@@ -106,6 +106,7 @@ test('editor IPC keeps stale typed text locally and flags conflicting text or sc
   const { EventEmitter } = require('node:events');
   const { registerDraftIpc } = require('../drafts.cjs');
   const store = fixture(t), ipc = new EventEmitter(), captures = [];
+  ipc.handle = ipc.on;
   registerDraftIpc(ipc, store, () => {}, () => {}, (target, stale) => captures.push({ target, stale }));
   const editor = { ...target, kind: 'edit-message', itemId: 'turn' };
   store.save(editor, { text: 'Peer edited this' });
@@ -127,9 +128,33 @@ test('editor Cancel uses the same stale baseline check before clearing a newer s
   const { EventEmitter } = require('node:events');
   const { registerDraftIpc } = require('../drafts.cjs');
   const store = fixture(t), ipc = new EventEmitter(), captured = [];
+  ipc.handle = ipc.on;
   registerDraftIpc(ipc, store, () => {}, () => {}, (target, stale) => captured.push(stale));
   const editor = { ...target, kind: 'edit-message', itemId: 'cancel-turn' };
   store.save(editor, { text: 'New peer draft' });
   const event = {}; ipc.emit('clear-draft', event, editor, undefined, { text: 'Old visible draft' });
   assert.equal(event.returnValue.error, undefined); assert.equal(store.read(editor), null); assert.equal(captured.at(-1), true);
+});
+
+
+test('a forced save supersedes an in-flight autosave in either IPC delivery order', t => {
+  const { EventEmitter } = require('node:events');
+  const { randomUUID } = require('node:crypto');
+  const { registerDraftIpc } = require('../drafts.cjs');
+  const store = fixture(t), ipc = new EventEmitter(), sender = {}, captures = [];
+  ipc.handle = ipc.on;
+  registerDraftIpc(ipc, store, () => {}, () => {}, (_target, stale) => captures.push(stale));
+
+  for (const autosaveFirst of [true, false]) {
+    const writeId = randomUUID(), expected = { text: 'Existing draft' };
+    store.save(target, expected);
+    const autosave = () => ipc.emit('autosave-draft', { sender }, target, { text: 'Earlier typing' }, expected, writeId);
+    if (autosaveFirst) autosave();
+    const event = { sender };
+    ipc.emit('save-draft', event, target, { text: 'Latest text on close' }, expected, writeId);
+    assert.equal(event.returnValue.error, undefined);
+    if (!autosaveFirst) autosave();
+    assert.equal(store.read(target).text, 'Latest text on close');
+    assert.equal(captures.some(Boolean), false, 'The pending autosave looked like a remote draft edit');
+  }
 });

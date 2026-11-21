@@ -612,3 +612,127 @@ test('stale pull and image responses cannot apply entries or advance a replaceme
     assert.equal(Object.values(replacement.entries).some(entry => entry.id === 'old-incoming'), false);
   });
 });
+
+test('structured transient server failures retry the same operation after cooldown and restart, while constraint errors stay paused', async t => {
+  const { a, b } = fixture(t), prepare = a.database.db.prepare.bind(a.database.db); let fail = true, now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  t.mock.method(a.database.db, 'prepare', sql => {
+    if (fail && sql.startsWith('INSERT INTO sync_entries')) { fail = false; throw Object.assign(new Error('Opaque write failure'), { code: 'ERR_SQLITE_ERROR', errcode: 13 }); }
+    return prepare(sql);
+  });
+  a.edit('note', 'retry-storage', 'Survives temporary full storage'); const opId = a.sync.state.pending[0].opId;
+  await a.sync.tick(); assert.equal(a.sync.state.pending[0].retryable, true); assert.equal(a.sync.state.pending[0].retryAt, now + 60000);
+  const count = a.calls.filter(call => call.method === 'state-push').length; a.restart();
+  now += 59999; await a.sync.tick(); assert.equal(a.calls.filter(call => call.method === 'state-push').length, count);
+  now++; await a.sync.tick(); await b.sync.tick();
+  assert.equal(b.local.get(stateKey('note', machine, 'retry-storage')), 'Survives temporary full storage');
+  assert.deepEqual(a.calls.filter(call => call.method === 'state-push').map(call => call.args.operations[0].opId), [opId, opId]);
+  t.mock.restoreAll();
+  const invalid = operation('pin', 'permanent', 'invalid');
+  const [rejected] = a.database.request('state-push', { operations: [invalid], isolateErrors: true }, 'computer-0').result;
+  assert.equal(rejected.retryable, false);
+  t.mock.method(a.database.db, 'prepare', sql => { if (sql.startsWith('INSERT INTO sync_entries')) throw Object.assign(new Error('database or disk is full'), { code: 'ERR_SQLITE_ERROR', errcode: 19 }); return prepare(sql); });
+  const [constraint] = a.database.request('state-push', { operations: [operation('note', 'constraint', 'value')], isolateErrors: true }, 'computer-0').result;
+  assert.equal(constraint.retryable, false, 'a real constraint code must not be reclassified from its message');
+});
+
+test('corrected drafts escape missing attachment ancestors only after atomic receipt and revision proof', async t => {
+  for (const scenario of ['remove', 'replace', 'replace-bounded', 'concurrent', 'lost-ack']) await t.test(scenario, async t => {
+    const { a, b } = fixture(t), key = stateKey('draft', machine, 'corrected');
+    a.edit('draft', 'corrected', draft('Shared original')); await a.sync.tick(); await b.sync.tick();
+    const bytes = Buffer.from('Old missing image'), id = a.sync.keepBlob(bytes);
+    const replacement = ['replace', 'replace-bounded'].includes(scenario) ? Array.from({ length: scenario === 'replace-bounded' ? 6 : 1 }, (_, index) => ({ hash: a.sync.keepBlob(Buffer.from('Valid replacement ' + index)), name: index + '.png', mime: 'image/png' })) : [];
+    a.edit('draft', 'corrected', { ...draft('Old attachment'), images: [{ hash: id, name: 'old.png', mime: 'image/png' }] });
+    const root = a.sync.state.pending[0], call = a.shared.bridge.call; let corrected = false, lost = false;
+    fs.unlinkSync(a.sync.blobFile(id));
+    a.shared.bridge.call = async (method, args) => {
+      const result = await call(method, args);
+      if (method === 'blob-prepare' && !corrected) {
+        corrected = true; a.edit('draft', 'corrected', { ...draft('Keep corrected text'), images: replacement });
+        if (scenario === 'concurrent') { b.edit('draft', 'corrected', draft('Genuine remote edit')); await b.sync.tick(); }
+      }
+      if (method === 'state-recover' && scenario === 'lost-ack' && !lost) { lost = true; throw new Error('Recovery ACK lost'); }
+      return result;
+    };
+    await a.sync.tick(); assert.equal(a.sync.state.pending.length, 2); assert.ok(root.blobError);
+    if (scenario === 'lost-ack') { await assert.rejects(a.sync.tick(), /Recovery ACK lost/); a.restart(); }
+    await a.sync.tick();
+    if (scenario === 'replace-bounded') {
+      assert.equal(a.sync.state.pending.length, 2); assert.equal(a.calls.filter(call => call.method === 'blob-put').length, 4);
+      assert.equal(a.calls.some(call => call.method === 'state-recover'), false);
+      await a.sync.tick();
+    }
+    if (scenario === 'concurrent') {
+      assert.equal(a.sync.state.pending.length, 2); assert.equal(a.sync.conflicts()[0].local.text, 'Keep corrected text');
+      assert.equal(a.sync.conflicts()[0].remote.value.text, 'Genuine remote edit');
+      await a.sync.resolve(key, 'local'); await a.sync.tick();
+    }
+    await b.sync.tick();
+    assert.equal(b.local.get(key).text, 'Keep corrected text'); assert.equal(b.local.get(key).images.length, replacement.length);
+    assert.equal(a.sync.pending(), false);
+    assert.equal(a.calls.some(call => call.method === 'blob-put' && call.args.hash === id), false);
+    a.database.request('blob-put', { hash: id, data: bytes.toString('base64') }, 'computer-0');
+    const [late] = a.database.request('state-push', { operations: [root] }, 'computer-0').result;
+    assert.equal(late.conflict, true); assert.equal(late.current.value.text, 'Keep corrected text');
+  });
+});
+
+test('reattaching and typing during failed child recovery preserves the newest draft and its parent link', async t => {
+  for (const phase of ['blob-prepare', 'state-recover']) await t.test(phase, async t => {
+    const { a, b } = fixture(t), key = stateKey('draft', machine, 'reattached');
+    const first = a.sync.keepBlob(Buffer.from('missing root image'));
+    const secondBytes = Buffer.from('reattached child image'), second = a.sync.keepBlob(secondBytes);
+    const image = id => ({ hash: id, name: 'image.png', mime: 'image/png' });
+    const call = a.shared.bridge.call;
+    let childCreated = false;
+    a.shared.bridge.call = async (method, args) => {
+      if (method === 'blob-prepare' && !childCreated) {
+        childCreated = true;
+        a.edit('draft', 'reattached', { ...draft('Failed child'), images: [image(second)] });
+      }
+      return call(method, args);
+    };
+    a.edit('draft', 'reattached', { ...draft('Failed root'), images: [image(first)] });
+    fs.unlinkSync(a.sync.blobFile(first)); fs.unlinkSync(a.sync.blobFile(second));
+    await a.sync.tick(); await a.sync.tick();
+    assert.equal(a.sync.state.pending.length, 2);
+    assert.ok(a.sync.state.pending.every(op => op.blobError));
+    let edited = false;
+    a.shared.bridge.call = async (method, args) => {
+      if (method === phase && !edited) {
+        edited = true; a.sync.keepBlob(secondBytes);
+        a.edit('draft', 'reattached', { ...draft('Newest reattached text'), images: [image(second)] });
+      }
+      return call(method, args);
+    };
+    if (phase === 'state-recover') a.database.request('blob-put', { hash: second, data: secondBytes.toString('base64') }, 'computer-0');
+    await a.sync.tick();
+    assert.equal(edited, true);
+    await a.sync.tick(); await b.sync.tick();
+    assert.equal(b.local.get(key).text, 'Newest reattached text');
+    assert.deepEqual(b.local.get(key).images, [image(second)]);
+    assert.equal(a.sync.pending(), false);
+    assert.deepEqual(a.sync.queueErrors(), []);
+  });
+});
+
+test('manual metadata retry retains parent revisions and cannot make malformed values valid', async t => {
+  const { a } = fixture(t), key = stateKey('pin', machine, 'manual-retry');
+  a.edit('pin', 'manual-retry', 'invalid'); await a.sync.tick();
+  const op = a.sync.state.pending[0], base = op.base, id = op.opId;
+  a.sync.retry(key); await a.sync.tick();
+  assert.equal(a.sync.state.pending[0].opId, id); assert.equal(a.sync.state.pending[0].base, base);
+  assert.match(a.sync.queueErrors()[0].message, /Invalid synced marker/);
+});
+
+test('draft recovery accepts a committed ancestor receipt but never rebases across an unrelated current version', async t => {
+  const { a } = fixture(t), root = operation('draft', 'receipt-proof', draft('Committed parent'), 'committed-parent');
+  const [saved] = a.database.request('state-push', { operations: [root] }, 'computer-0').result;
+  const child = operation('draft', 'receipt-proof', draft('Corrected child'), 'corrected-child', null);
+  const accepted = a.database.request('state-recover', { operation: child, ancestors: [root.opId], base: 0 }, 'computer-0').result;
+  assert.ok(accepted.revision > saved.revision); assert.equal(accepted.current.value.text, 'Corrected child');
+  const next = operation('draft', 'receipt-proof', draft('Another child'), 'another-child', null);
+  const rejected = a.database.request('state-recover', { operation: next, ancestors: [root.opId], base: 0 }, 'computer-0').result;
+  assert.equal(rejected.conflict, true); assert.equal(rejected.current.value.text, 'Corrected child');
+  assert.throws(() => a.database.request('state-recover', { operation: { ...next, id: 'different-chat' }, ancestors: [root.opId], base: 0 }, 'computer-0'), /another conversation/);
+});

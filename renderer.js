@@ -10,7 +10,8 @@ const linkContexts = new WeakMap();
 const completionSound = { audio: null, lastAt: -Infinity };
 const messageDateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
 const schedules = { tasks: [], generation: 0 };
-const drafts = { target: null, snapshot: null, images: [], suspended: false, restoring: false, pending: new Map(), dirty: false, timer: null, saveStarted: null };
+const drafts = { target: null, snapshot: null, images: [], suspended: false, restoring: false, pending: new Map(), dirty: false, timer: null, autosave: null, indicators: null, syncedRevision: null };
+const composerAutosaveDelay = 3000;
 const editorDrafts = new Map();
 const timelineView = { following: true, reading: null };
 const pinnedMessages = { saving: false, jumping: null };
@@ -22,8 +23,8 @@ for (let days = 1; days <= 7; days++) $('send-time').add(new Option(`${days} day
 const threadDrag = { source: null, pending: new Set(), orderPending: new Set(), type: 'application/x-remote-codex-thread' };
 const projectDrag = { source: null, pending: null, type: 'application/x-remote-codex-project' };
 const queueDrag = { source: null, type: 'application/x-remote-codex-queue' };
-const usage = { threads: new Map(), account: null, reading: null, generation: 0, updatedAt: 0, error: null, timer: null };
-const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), manualUnread: null, queues: new Map(), nativeQueues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Map(), newThreads: new Set(), titleTask: Promise.resolve(), titleRetries: new Map(), images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), failedPins: new Set(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
+const usage = { threads: new Map(), account: null, reading: null, generation: 0, updatedAt: 0, error: null, timer: null, model: null };
+const state = { owned: new Set(), resuming: new Map(), writerConflicts: new Set(), completions: new Map(), unread: new Set(), manualUnread: null, queues: new Map(), nativeQueues: new Map(), dispatching: new Set(), finished: new Set(), names: new Map(), titling: new Map(), newThreads: new Set(), titleTask: Promise.resolve(), titleRetries: new Map(), images: [], connected: false, connecting: false, threads: [], pinnedIds: new Set(), pinnedThreads: new Map(), failedPins: new Set(), pinning: new Set(), thread: null, threadCursor: null, turnCursor: null, active: new Map(), items: new Map(), requests: new Map(), requestCards: new Map(), models: [], loading: false, historyLoadFailed: false, sending: false, selection: 0, historyEvents: null, listGeneration: 0, folderPath: null, folderGeneration: 0 };
 const slash = { index: 0, matches: [], dismissed: null, skills: [], cwd: null, loading: false, generation: 0, skillOnly: false };
 const modes = { plan: false, catalog: [], threads: new Map() };
 const compacting = new Map();
@@ -56,11 +57,11 @@ function modelUnavailable(model = $('model').value, provider = selectedProvider(
 const supports = (method, provider = selectedProvider()) => !agentMetadata(provider)?.methods || agentMetadata(provider).methods.includes(method);
 const supportsAny = method => (state.options?.agents || agents.available).some(agent => supports(method, agent.id)) || (!(state.options?.agents || agents.available).length && supports(method));
 const catalogMethods = new Set(['model/list', 'collaborationMode/list', 'thread/list', 'project/list']);
-function rpc(method, params = {}) {
+function rpc(method, params = {}, repairReasoning = false) {
   const aggregate = catalogMethods.has(method) && !params.provider && !params.projectId && !params.threadId;
   const provider = params.provider || (params.threadId ? identityProvider(params.threadId) : params.model ? identityProvider(params.model) : params.projectId ? identityProvider(params.projectId) : selectedProvider());
-  if (!aggregate && !supports(method, provider)) return Promise.reject(new Error(`${agentName(provider)} does not support ${method}.`));
-  return api.rpc(method, params, aggregate ? undefined : { provider });
+  if (!aggregate && method !== 'thread/archive' && !supports(method, provider)) return Promise.reject(new Error(`${agentName(provider)} does not support ${method}.`));
+  return api.rpc(method, params, aggregate ? undefined : { provider, ...(repairReasoning ? { repairReasoning: true } : {}) });
 }
 function reportProviderErrors(errors = []) {
   if (!errors.length) return;
@@ -89,11 +90,16 @@ function syncComposerAgent() {
   const provider = selectedProvider();
   for (const option of $('model').options) option.disabled = option.dataset.unavailable === 'true' || Boolean(state.thread && identityProvider(option.value) !== provider) || agentMetadata(identityProvider(option.value))?.connected === false;
   if (state.thread && identityProvider($('model').value) !== provider) $('model').value = agentMetadata(provider)?.defaultModel ?? (provider === 'codex' ? '' : `agent:${provider}:model:`);
-  if (agents.current !== provider) {
+  const changedProvider = agents.current !== provider;
+  const usageModel = provider === 'zcode' ? $('model').value : null;
+  if (changedProvider) {
     agents.current = provider;
-    usage.generation++; usage.account = null; usage.reading = null; usage.error = null; usage.updatedAt = 0;
     slash.generation++; slash.skills = []; slash.cwd = null; slash.loading = false; hideSlash();
     if ($('usage-panel').matches(':popover-open')) $('usage-panel').hidePopover();
+  }
+  if (changedProvider || usage.model !== usageModel) {
+    usage.model = usageModel;
+    usage.generation++; usage.account = null; usage.reading = null; usage.error = null; usage.updatedAt = 0;
     if (state.connected && !state.connecting) refreshUsage();
   }
   connectionLabels();
@@ -126,27 +132,57 @@ const composerExpected = saved => Object.fromEntries(['text', 'hours', 'model', 
 function composerSnapshot() { return { text: $('prompt').value, hours: Number($('send-time').value), model: $('model').value, effort: $('effort').value, mode: modes.plan ? 'plan' : 'default', access: $('permissions').value }; }
 function scheduleComposerDraft() {
   if (!api.saveDraft || !drafts.target || drafts.suspended || drafts.restoring || state.sending || state.loading) return;
-  const target = drafts.target; drafts.dirty = true;
-  drafts.saveStarted ??= performance.now();
+  drafts.dirty = true;
   clearTimeout(drafts.timer);
-  drafts.timer = setTimeout(() => {
-    if (drafts.target === target) saveComposerDraft();
-    else { drafts.timer = null; drafts.saveStarted = null; }
-  }, Math.max(0, Math.min(200, 1000 - (performance.now() - drafts.saveStarted))));
+  drafts.timer = setTimeout(() => saveComposerDraft(true), composerAutosaveDelay);
 }
-function saveComposerDraft() {
-  clearTimeout(drafts.timer); drafts.timer = null; drafts.saveStarted = null;
+function saveComposerDraft(deferred = false) {
+  clearTimeout(drafts.timer); drafts.timer = null;
   if (!api.saveDraft || !drafts.target || drafts.suspended || drafts.restoring || state.sending || state.loading) return false;
-  const snapshot = composerSnapshot(); const images = state.images.filter(image => image.url);
+  const pending = drafts.autosave;
+  if (deferred && pending) return false;
+  const target = drafts.target, snapshot = composerSnapshot(), images = state.images.filter(image => image.url);
   const changedImages = images.length !== drafts.images.length || images.some((image, index) => image !== drafts.images[index]?.image || image.url !== drafts.images[index]?.url);
-  if (!changedImages && drafts.snapshot && Object.keys(snapshot).every(key => snapshot[key] === drafts.snapshot[key])) { drafts.dirty = false; return true; }
-  try {
-    api.saveDraft(drafts.target, { ...snapshot, ...(changedImages ? { images } : {}) }, drafts.expected);
-    drafts.expected = composerExpected(snapshot.text || images.length ? snapshot : null);
-    drafts.snapshot = snapshot; drafts.images = images.map(image => ({ image, url: image.url })); drafts.dirty = false;
-    cacheDraftIndicator(drafts.target, Boolean(snapshot.text.trim() || images.length));
+  if (!pending && !changedImages && drafts.snapshot && Object.keys(snapshot).every(key => snapshot[key] === drafts.snapshot[key])) {
+    const recheckSync = deferred && drafts.dirty && drafts.syncedRevision !== conversationSync.status?.draftRevision;
+    drafts.dirty = false;
+    if (recheckSync && conversationSync.status?.draftRevision != null) refreshConversationSync().catch(showError);
     return true;
-  } catch (error) { trace('draft.save.failed', { threadId: drafts.target.threadId, error: error.message }); showError(`Could not save unsent draft: ${error.message}`); return false; }
+  }
+  const patch = { ...snapshot, ...(changedImages || pending?.hasImages ? { images } : {}) };
+  const saved = () => {
+    drafts.expected = composerExpected(snapshot.text || images.length ? snapshot : null);
+    drafts.snapshot = snapshot;
+    drafts.images = images.map(image => ({ image, url: image.url }));
+    const current = composerSnapshot();
+    drafts.dirty = Object.keys(snapshot).some(key => snapshot[key] !== current[key]);
+    if (!drafts.dirty) cacheDraftIndicator(target, Boolean(snapshot.text.trim() || images.length));
+  };
+  const failed = error => {
+    drafts.dirty = true;
+    trace('draft.save.failed', { threadId: target.threadId, error: error.message });
+    showError(`Could not save unsent draft: ${error.message}`);
+  };
+  if (deferred && api.autosaveDraft) {
+    const request = { id: crypto.randomUUID(), hasImages: changedImages };
+    drafts.autosave = request;
+    api.autosaveDraft(target, patch, drafts.expected, request.id).then(() => {
+      if (drafts.autosave !== request) return;
+      drafts.autosave = null;
+      saved();
+      if (drafts.dirty && !drafts.timer) scheduleComposerDraft();
+    }, error => {
+      if (drafts.autosave !== request) return;
+      drafts.autosave = null; failed(error);
+    });
+    return false;
+  }
+  drafts.autosave = null;
+  try {
+    api.saveDraft(target, patch, drafts.expected, pending?.id);
+    saved();
+    return true;
+  } catch (error) { failed(error); return false; }
 }
 function clearDraft(target, expected = target && editorDrafts.get(JSON.stringify(target))?.expected) {
   if (!api.clearDraft || !target) return;
@@ -155,6 +191,7 @@ function clearDraft(target, expected = target && editorDrafts.get(JSON.stringify
 function cacheDraftIndicator(target, pending) {
   if (target?.kind !== 'composer' || !target.threadId) return;
   const key = target.machine + ':' + target.threadId;
+  if (drafts.indicators?.machine === target.machine) drafts.indicators.localChanges.add(target.threadId);
   if (drafts.pending.get(key) === pending) return;
   drafts.pending.set(key, pending); if (target.machine === accessKey()) renderThreadIndicators(target.threadId);
 }
@@ -196,6 +233,7 @@ function activateComposerDraft() {
   try {
     const saved = api.draft(target);
     drafts.target = target;
+    drafts.syncedRevision = conversationSync.status?.draftRevision;
     drafts.expected = composerExpected(saved);
     if (saved) {
       $('prompt').value = saved.text; state.images = saved.images; $('send-time').value = String(saved.hours ?? 0);
@@ -220,11 +258,40 @@ async function restoreLastDraft() {
     const result = await rpc('thread/read', { threadId: saved.target.threadId, includeTurns: false });
     if (state.options !== options) return;
     await openThread(result.thread);
+    if (state.options !== options || state.thread?.id !== result.thread.id) return;
     if (saved.target.kind === 'edit-message') {
-      const find = () => [...state.items.values()].find(record => record.turnId === saved.target.itemId && record.item.type === 'userMessage');
-      while (!find() && state.turnCursor) { const cursor = state.turnCursor; await $('older-turns').onclick(); if (cursor === state.turnCursor || state.options !== options) break; }
-      if (find() && !state.active.has(result.thread.id)) openMessageEdit(find());
-      else if (!$('prompt').value) { $('prompt').value = saved.draft.text; saveComposerDraft(); }
+      const nativeEdit = supportsNativeEdit(result.thread);
+      const legacyNativeDraft = nativeEdit && saved.target.itemId.startsWith(`agent:${threadProvider(result.thread)}:turn:`);
+      const messagesInTurn = () => [...state.items.values()].filter(record => record.turnId === saved.target.itemId && record.item.type === 'userMessage');
+      const find = () => nativeEdit ? state.items.get(saved.target.itemId) || messagesInTurn()[0] : messagesInTurn()[0];
+      const selection = state.selection;
+      while (!legacyNativeDraft && !find() && state.turnCursor) {
+        const cursor = state.turnCursor;
+        await $('older-turns').onclick();
+        if (state.options !== options || state.selection !== selection) return;
+        if (cursor === state.turnCursor) break;
+      }
+      if (state.options !== options || state.thread?.id !== result.thread.id) return;
+      const record = find();
+      if (record?.item.type === 'userMessage' && !state.active.has(result.thread.id)) {
+        if (!nativeEdit && openMessageEdit(record)) return;
+        if (nativeEdit && record.item.canEdit === true) {
+          if (record.item.id === saved.target.itemId && openMessageEdit(record)) return;
+          // A page boundary can split a ZCode turn across pages.
+          if (legacyNativeDraft && !state.turnCursor && messagesInTurn().length === 1 && api.moveDraft) {
+            const target = editorTarget('edit-message', result.thread, record.item.id);
+            if (!api.draft?.(target)) {
+              api.moveDraft(saved.target, target);
+              if (openMessageEdit(record)) return;
+            }
+          }
+        }
+      }
+      if (nativeEdit && api.editDrafts) {
+        showError('Your edit draft is saved. Right-click the conversation and choose Recover edit drafts.');
+        return;
+      }
+      if (!$('prompt').value) { $('prompt').value = saved.draft.text; saveComposerDraft(); }
     } else if (saved.target.kind === 'edit-queue') {
       const queue = state.queues.get(queueKey(result.thread.id)); const message = queue?.messages.find(message => message.draftId === saved.target.itemId);
       if (message) editQueuedMessage(queue, message);
@@ -258,6 +325,7 @@ async function savePreferences(patch) {
   preferences.threadOrders = orders;
   preferences.threadOrderCutoffs = cutoffs;
   preferences.messagePins = messagePins;
+  renderShortcutSaveStatus(saved.shortcutMoveQueued);
 }
 $('theme-select').onchange = async () => {
   const theme = $('theme-select').value; const previous = document.documentElement.dataset.theme || 'system';
@@ -422,16 +490,33 @@ function fillSettings(options) {
 }
 
 function isWriterConflict(error) { return /already has an active writer/i.test(error.message || String(error)); }
+function errorMessage(raw) {
+  const cleaned = raw.replace(/^Error invoking remote method '[^']+':\s*/, '').replace(/^Error:\s*/, '');
+  let value = cleaned, message = cleaned, code;
+  for (let depth = 0; depth < 8; depth++) {
+    if (typeof value === 'string') {
+      try { value = JSON.parse(value); } catch { message = value; break; }
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) break;
+    if (typeof value.code === 'string' || typeof value.code === 'number') code = value.code;
+    if (value.error && typeof value.error === 'object') { value = value.error; continue; }
+    if (typeof value.message !== 'string') break;
+    message = value.message; value = message;
+  }
+  return code === undefined ? message : `${message} (${code})`;
+}
 function showError(error) {
   state.retryError = null;
   state.titleError = null;
   state.providerError = null;
-  let message = (error.message || String(error)).replace(/^Error invoking remote method '[^']+':\s*/, '').replace(/^Error:\s*/, '');
+  const raw = error.message || String(error);
+  let message = errorMessage(raw);
   if (isWriterConflict(error)) {
     if (state.writerConflicts.has(queueKey(state.thread?.id))) { $('error').hidden = true; updateBusy(); return; }
     message = `Another ${agentName()} session owns this chat.`;
   }
-  $('error-text').textContent = message; $('error-text').title = message;
+  $('error-text').textContent = message; $('error-text').title = raw;
+  $('error-text').scrollTop = 0;
   $('error').hidden = false;
 }
 function status(text) {
@@ -447,16 +532,78 @@ function status(text) {
 function canStopTurn() {
   return state.connected && !state.connecting && !state.sending && !state.loading && !state.commandBusy && state.owned.has(state.thread?.id) && state.active.has(state.thread?.id) && !$('prompt').value.trim() && !state.images.length;
 }
-function conversationAccess() { return conversationSync.historyEnabled && state.options?.mode === 'local' && selectedProvider() === 'codex' && state.thread ? conversationSync.ownership.get(state.thread.id) : null; }
+function conversationAccess() {
+  if (state.options?.mode !== 'local' || selectedProvider() !== 'codex' || !state.thread) return null;
+  const access = conversationSync.ownership.get(state.thread.id);
+  return (conversationSync.historyEnabled || conversationSync.status?.enabled && access?.waiting) ? access : null;
+}
 function conversationReadOnly() { const access = conversationAccess(); return Boolean(access && (!access.owned || access.requested)); }
+function syncBelongsHere(entry) {
+  let { kind, id, machine } = entry;
+  if (!id && entry.key) { try { [kind, machine, id] = JSON.parse(entry.key); } catch { return false; } }
+  if (kind === 'shortcuts') return true;
+  if (machine && machine !== accessKey()) return false;
+  if (kind === 'draft' || kind === 'messagePin') { try { const parts = JSON.parse(id); id = kind === 'draft' ? parts[1] : parts[0]; } catch { return false; } }
+  return typeof id === 'string' && id === state.thread?.id;
+}
+function renderHeaderSync() {
+  const indicator = $('conversation-sync-status'), access = conversationAccess();
+  const sync = conversationSync.statusOptions === state.options ? conversationSync.status : null;
+  const failure = sync?.historyErrors?.find(entry => entry.id === state.thread?.id)?.message || sync?.queueErrors?.find(syncBelongsHere)?.message || sync?.conflicts?.find(syncBelongsHere) && 'Changes need your choice' || sync?.error;
+  indicator.hidden = !state.thread || !failure && !access?.syncPending;
+  indicator.dataset.status = failure ? 'error' : 'pending';
+  indicator.setAttribute('aria-label', failure ? 'Sync needs attention' : 'History upload pending');
+  $('conversation-sync-tooltip').textContent = failure ? 'Sync needs attention: ' + failure : 'History upload pending';
+  const panel = $('conversation-sync-panel'), target = queueKey(state.thread?.id);
+  if (indicator.hidden || panel.dataset.target !== target) {
+    if (panel.matches(':popover-open')) panel.hidePopover();
+    hideSyncTooltip();
+  }
+  panel.dataset.target = target;
+  positionSyncPanel($('conversation-sync-tooltip'));
+}
+function positionSyncPanel(panel = $('conversation-sync-panel')) {
+  if (!panel.matches(':popover-open')) return;
+  const anchor = $('conversation-sync-status').getBoundingClientRect(), bounds = panel.getBoundingClientRect();
+  panel.style.left = `${Math.max(12, Math.min(innerWidth - bounds.width - 12, anchor.right - bounds.width))}px`;
+  panel.style.top = `${Math.max(12, Math.min(innerHeight - bounds.height - 12, anchor.bottom + 10))}px`;
+}
+function hideSyncTooltip() {
+  const tooltip = $('conversation-sync-tooltip');
+  if (tooltip.matches(':popover-open')) tooltip.hidePopover();
+}
+function showSyncTooltip() {
+  if ($('conversation-sync-status').hidden || $('conversation-sync-panel').matches(':popover-open')) return;
+  const tooltip = $('conversation-sync-tooltip');
+  if (!tooltip.matches(':popover-open')) tooltip.showPopover();
+  positionSyncPanel(tooltip);
+}
+$('conversation-sync-status').onpointerenter = showSyncTooltip;
+$('conversation-sync-status').onpointerleave = hideSyncTooltip;
+$('conversation-sync-status').onfocus = showSyncTooltip;
+$('conversation-sync-status').onblur = hideSyncTooltip;
+$('conversation-sync-status').onclick = () => {
+  hideSyncTooltip();
+  const panel = $('conversation-sync-panel');
+  if (panel.matches(':popover-open')) { panel.hidePopover(); return; }
+  renderConversationSyncNotice();
+  if ($('conversation-sync-status').hidden) return;
+  panel.showPopover(); positionSyncPanel();
+};
+$('conversation-sync-panel').addEventListener('toggle', event => $('conversation-sync-status').setAttribute('aria-expanded', String(event.newState === 'open')));
+$('close-conversation-sync').onclick = () => $('conversation-sync-panel').hidePopover();
+addEventListener('resize', () => { positionSyncPanel(); positionSyncPanel($('conversation-sync-tooltip')); });
 function renderConversationAccess() {
   const access = conversationAccess(), panel = $('conversation-ownership');
-  panel.hidden = !access || access.owned && !access.requested && !access.syncPending && !access.needsHistory;
-  $('conversation-owner').textContent = !access ? '' : access.owned ? access.requested ? 'Transfer requested · finish the current task to hand over' : access.needsHistory ? 'Load the shared history to continue on this computer' : access.syncPending ? 'Local chat · history upload pending' : '' : access.waiting ? `Waiting for ${access.name} to finish and sync` : `${access.busy ? 'Running on' : 'Read only · owned by'} ${access.name}`;
+  panel.hidden = !access || access.owned && !access.requested && !access.needsHistory;
+  $('conversation-owner').textContent = !access ? '' : access.owned ? access.requested ? 'Transfer requested · finish the current task to hand over' : access.needsHistory ? 'Load the shared history to continue on this computer' : '' : access.waiting ? `Waiting for ${access.name} to finish and sync` : `${access.busy ? 'Running on' : 'Read only · owned by'} ${access.name}`;
   const button = $('take-conversation'); button.hidden = Boolean(access?.owned); button.textContent = access?.waiting ? 'Transfer requested' : 'Use on this computer';
   button.disabled = !state.connected || state.loading || state.sending || Boolean(access?.waiting) || Boolean(conversationSync.requesting);
+  $('cancel-conversation-request').hidden = !access?.waiting;
+  $('cancel-conversation-request').disabled = Boolean(conversationSync.requesting);
   $('load-synced-history').hidden = !access?.updatesAvailable;
   $('load-synced-history').disabled = state.loading || state.sending || state.active.has(state.thread?.id);
+  renderHeaderSync();
 }
 $('load-synced-history').onclick = () => { if (state.thread && !state.loading && !state.sending && !state.active.has(state.thread.id)) return openThread(state.thread, true, true).then(refreshConversationSync).catch(showError); };
 $('take-conversation').onclick = async () => {
@@ -464,6 +611,14 @@ $('take-conversation').onclick = async () => {
   const thread = state.thread, options = state.options;
   conversationSync.requesting = true; renderConversationAccess();
   try { await api.requestConversation(thread.id); if (state.options === options) await refreshConversationSync(); }
+  catch (error) { if (state.options === options) showError(error); }
+  finally { conversationSync.requesting = false; renderConversationAccess(); }
+};
+$('cancel-conversation-request').onclick = async () => {
+  if (!state.thread || !conversationAccess()?.waiting || conversationSync.requesting) return;
+  const thread = state.thread, options = state.options;
+  conversationSync.requesting = true; renderConversationAccess();
+  try { await api.cancelConversationRequest(thread.id); if (state.options === options) await refreshConversationSync(); }
   catch (error) { if (state.options === options) showError(error); }
   finally { conversationSync.requesting = false; renderConversationAccess(); }
 };
@@ -515,7 +670,7 @@ function updateBusy() {
   $('plan-mode').hidden = !modes.plan;
   $('browse-workspace').disabled = !state.connected || state.sending || state.loading;
   $('choose-project').disabled = !state.connected || state.sending || state.loading;
-  $('resend-message').disabled = Boolean(state.resending);
+  $('resend-message').disabled = Boolean(state.resending || state.messageEdit?.uncertain);
   $('cancel-message-edit').disabled = Boolean(state.resending);
   $('edited-message').readOnly = Boolean(state.resending);
   renderQueue();
@@ -524,16 +679,22 @@ function updateBusy() {
   renderUsage();
   renderMessagePins();
   updateMessageEdits();
-  if (!drafts.timer) saveComposerDraft();
+  if (!drafts.timer && !drafts.autosave && !drafts.dirty) saveComposerDraft();
 }
 function updateMessageEdits() {
   const turns = new Set();
+  const nativeEdit = supportsNativeEdit(state.thread);
   for (const button of $('timeline').querySelectorAll('.edit-message')) {
     const turnId = button.dataset.turnId;
-    button.hidden = turns.has(turnId); turns.add(turnId);
-    button.disabled = conversationReadOnly() || modelUnavailable() || !supports('thread/revert') || !state.connected || state.sending || state.commandBusy || state.loading || state.active.has(state.thread?.id);
+    button.hidden = turns.has(turnId) || Boolean(nativeEdit && button.dataset.canEdit !== 'true');
+    if (!button.hidden) turns.add(turnId);
+    button.disabled = conversationReadOnly() || state.sending || state.commandBusy || state.loading || state.active.has(state.thread?.id)
+      || (nativeEdit ? Boolean(state.nativeQueues.get(state.thread?.id)?.items.length) : !state.connected || modelUnavailable() || !supports('thread/revert'));
     button.title = state.active.has(state.thread?.id) ? 'Stop the running task before editing' : 'Edit and resend in this conversation';
   }
+}
+function supportsNativeEdit(thread) {
+  return agentMetadata(threadProvider(thread))?.methods?.includes('thread/edit') === true;
 }
 function mergeRateLimit(previous = {}, incoming = {}) {
   const merged = { ...previous };
@@ -555,13 +716,17 @@ async function refreshUsage() {
   const request = { options: state.options, generation: usage.generation, updates: [] }; usage.reading = request;
   renderUsage();
   try {
-    const result = await rpc('account/rateLimits/read', { excludeResetCreditDetails: false });
+    const model = selectedProvider() === 'zcode' ? $('model').value : '';
+    const result = await rpc('account/rateLimits/read', { excludeResetCreditDetails: false, ...(model ? { model } : {}) });
     if (request.options !== state.options || request.generation !== usage.generation || !state.connected) return;
     usage.account = result;
     for (const snapshot of request.updates) applyRateLimit(snapshot);
     usage.updatedAt = Date.now(); usage.error = null;
   } catch (error) {
-    if (request.options === state.options && request.generation === usage.generation) usage.error = error.message;
+    if (request.options === state.options && request.generation === usage.generation) {
+      if (selectedProvider() === 'zcode') usage.account = null;
+      usage.error = error.message;
+    }
   } finally { if (usage.reading === request) { usage.reading = null; renderUsage(); } }
 }
 function usageWindowLabel(minutes, fallback) {
@@ -621,8 +786,14 @@ function renderUsage() {
     }
     details.push(section);
   }
+  if (account?.plan) {
+    if (account.plan.name) { const name = document.createElement('p'); name.textContent = account.plan.name; details.push(name); }
+    details.push(usageDateRow('Plan ends', account.plan.expiresAt));
+    if (account.plan.renewsAt) details.push(usageDateRow('Plan renews', account.plan.renewsAt));
+  }
   const notices = [];
-  if (!windows.length) notices.push(usage.reading ? 'Loading reset times…' : 'No reset time reported.');
+  if (account?.usageMessage) notices.push(account.usageMessage);
+  if (!windows.length && !account?.usageMessage && !usage.error) notices.push(usage.reading ? 'Loading reset times…' : 'No reset time reported.');
   if (account?.ordinaryUsageAllowed === false) notices.push('Usage currently blocked.');
   if (usage.error) notices.push(`Could not refresh: ${usage.error}`);
   for (const text of notices) { const paragraph = document.createElement('p'); paragraph.textContent = text; details.push(paragraph); }
@@ -772,10 +943,20 @@ function renderThreads() {
   const focusedThread = $('threads').contains(document.activeElement) ? document.activeElement.closest('.thread')?.dataset.threadId : null;
   const fragment = document.createDocumentFragment();
   const search = $('search').value.trim().toLowerCase();
+  if (!state.connected && (search || state.threadSearch)) {
+    const empty = document.createElement('p');
+    empty.className = 'muted list-empty';
+    empty.textContent = 'Connect to search conversations.';
+    $('threads').replaceChildren(empty);
+    $('more-threads').hidden = true;
+    return;
+  }
+  const matchingIds = state.threadSearch?.term === search ? state.threadSearch.ids : null;
+  const matchesSearch = thread => !search || matchingIds?.has(thread.id) || titleOf(thread).toLowerCase().includes(search);
   const projectIds = new Set(projects.data.map(project => project.id));
   const available = [...new Map([...state.pinnedThreads.values(), ...state.threads].map(thread => [thread.id, thread])).values()];
-  const pinned = [...state.pinnedIds].map(id => available.find(thread => thread.id === id) || { id, preview: state.failedPins.has(id) ? 'Could not load conversation' : 'Loading conversation…' }).filter(thread => !projectIds.has(thread.projectId) && (!search || titleOf(thread).toLowerCase().includes(search)));
-  const recent = state.threads.filter(thread => !state.pinnedIds.has(thread.id) && !projectIds.has(thread.projectId));
+  const pinned = [...state.pinnedIds].map(id => available.find(thread => thread.id === id) || { id, preview: state.failedPins.has(id) ? 'Could not load conversation' : 'Loading conversation…' }).filter(thread => !projectIds.has(thread.projectId) && matchesSearch(thread));
+  const recent = state.threads.filter(thread => !state.pinnedIds.has(thread.id) && !projectIds.has(thread.projectId) && matchesSearch(thread));
   const heading = (text, target = fragment) => {
     const label = document.createElement('div'); label.className = 'list-heading thread-group'; label.textContent = text; target.append(label);
   };
@@ -790,7 +971,11 @@ function renderThreads() {
     button.append(name);
     button.oncontextmenu = event => { event.preventDefault(); showThreadMenu(thread, event.clientX, event.clientY); };
     button.title = titleOf(thread);
-    button.onclick = () => { button.focus({ preventScroll: true }); return openThread(thread).catch(showError); };
+    button.onclick = () => {
+      button.focus({ preventScroll: true });
+      if (state.thread?.id === thread.id && !state.historyLoadFailed) return;
+      return openThread(thread).catch(showError);
+    };
     button.draggable = state.connected && !threadDrag.orderPending.has(JSON.stringify([accessKey(), thread.projectId]));
     button.ondragstart = event => {
       if (!button.draggable || threadDrag.pending.has(queueKey(thread.id)) || state.archiving?.threadId === thread.id || !event.dataTransfer) { event.preventDefault(); return; }
@@ -819,7 +1004,7 @@ function renderThreads() {
   pinned.forEach(thread => row(thread));
   let hasProjectGroups = false;
   for (const project of projects.data) {
-    const members = sortProjectThreads(available.filter(thread => thread.projectId === project.id), project.id).filter(thread => !search || titleOf(thread).toLowerCase().includes(search));
+    const members = sortProjectThreads(available.filter(thread => thread.projectId === project.id && matchesSearch(thread)), project.id);
     const hiddenBySearch = Boolean(search && !members.length);
     if (!hiddenBySearch) hasProjectGroups = true;
     const group = document.createElement('section'); group.className = 'project-group'; group.dataset.projectId = project.id;
@@ -852,7 +1037,7 @@ function renderThreads() {
       map.onclick = () => chooseSharedProjectFolder(project).catch(showError); conversations.prepend(map);
     }
     if (!members.length && !search && !project.needsFolder) { const empty = document.createElement('p'); empty.className = 'project-empty'; empty.textContent = 'No conversations yet'; conversations.append(empty); }
-    if (projects.cursors.get(project.id)) {
+    if (!search && projects.cursors.get(project.id)) {
       const more = document.createElement('button'); more.className = 'project-more'; more.textContent = 'Load more conversations';
       more.onclick = async () => { more.disabled = true; try { await loadThreads(true, project.id); } catch (error) { showError(error); } finally { more.disabled = false; } };
       conversations.append(more);
@@ -878,6 +1063,7 @@ function renderThreads() {
   if (focusedThread) [...$('threads').querySelectorAll('.thread')].find(button => button.dataset.threadId === focusedThread)?.focus({ preventScroll: true });
   $('more-threads').hidden = !state.threadCursor;
   renderThreadIndicators();
+  refreshDraftIndicators();
   for (const thread of available) requestTitle(thread);
 }
 
@@ -927,31 +1113,63 @@ function interactionStatus(threadId) {
   const request = [...state.requests.values()].find(request => !request.params.threadId || request.params.threadId === threadId);
   return request ? ['item/tool/requestUserInput', 'mcpServer/elicitation/request'].includes(request.method) ? 'Waiting for your answer' : 'Waiting for your approval' : null;
 }
+function refreshDraftIndicators(refresh = false) {
+  if (!api.draftIndicators) return;
+  const machine = accessKey();
+  if (drafts.indicators?.machine === machine) {
+    drafts.indicators.again = true;
+    drafts.indicators.refresh ||= refresh;
+    return;
+  }
+  const visible = new Set([...$('threads').querySelectorAll('.thread')].map(button => button.dataset.threadId));
+  if (refresh) {
+    const current = new Set([...visible].map(id => machine + ':' + id));
+    for (const key of drafts.pending.keys()) if (!current.has(key)) drafts.pending.delete(key);
+  }
+  const ids = [...visible].filter(id => refresh || !drafts.pending.has(machine + ':' + id));
+  if (!ids.length) return;
+  const request = { machine, localChanges: new Set(), again: false, refresh: false };
+  drafts.indicators = request;
+  api.draftIndicators(machine, ids).then(pending => {
+    if (drafts.indicators !== request || machine !== accessKey() || request.refresh) return;
+    const present = new Set(pending), changed = new Set();
+    for (const id of ids) {
+      if (request.localChanges.has(id)) continue;
+      const key = machine + ':' + id, value = present.has(id);
+      if (Boolean(drafts.pending.get(key)) !== value) changed.add(id);
+      drafts.pending.set(key, value);
+    }
+    if (changed.size) renderThreadIndicators(changed);
+  }).catch(error => {
+    if (drafts.indicators === request && machine === accessKey()) showError(`Could not check unsent drafts: ${error.message}`);
+  }).finally(() => {
+    if (drafts.indicators !== request) return;
+    drafts.indicators = null;
+    if (request.again && machine === accessKey()) refreshDraftIndicators(request.refresh);
+  });
+}
 function renderThreadIndicators(threadId = null) {
   renderFinishedButton();
   const finished = new Set(preferences.finishedThreads?.[accessKey()] || []);
   const threads = new Map([...state.threads, ...state.pinnedThreads.values()].map(thread => [thread.id, thread]));
-  const selector = threadId ? `.thread[data-thread-id="${CSS.escape(threadId)}"]` : '.thread';
+  const selector = typeof threadId === 'string' ? `.thread[data-thread-id="${CSS.escape(threadId)}"]` : '.thread';
   for (const button of $('threads').querySelectorAll(selector)) {
-    const threadId = button.dataset.threadId;
-    const thread = threads.get(threadId);
-    const waiting = interactionStatus(threadId);
-    const compact = state.connected && compacting.has(threadId);
-    const working = !waiting && state.connected && (compact || state.active.has(threadId) || state.dispatching.has(queueKey(threadId)) || thread?.status?.type === 'active');
-    const completion = state.completions.get(queueKey(threadId));
+    const id = button.dataset.threadId;
+    if (threadId instanceof Set && !threadId.has(id)) continue;
+    const thread = threads.get(id);
+    const key = queueKey(id);
+    const waiting = interactionStatus(id);
+    const compact = state.connected && compacting.has(id);
+    const working = !waiting && state.connected && (compact || state.active.has(id) || state.dispatching.has(key) || thread?.status?.type === 'active');
+    const completion = state.completions.get(key);
     const interrupted = completion === 'interrupted';
-    const unread = state.unread.has(queueKey(threadId));
-    const key = queueKey(threadId);
-    if (!drafts.pending.has(key)) {
-      try { drafts.pending.set(key, Boolean(api.hasDraft?.({ machine: accessKey(), kind: 'composer', threadId, cwd: thread?.cwd || '', projectId: thread?.projectId || null }))); }
-      catch (error) { drafts.pending.set(key, false); showError(`Could not check unsent draft: ${error.message}`); }
-    }
-    const visibleDraft = state.thread?.id === threadId && drafts.target?.threadId === threadId && drafts.target.machine === accessKey() && !drafts.suspended && !state.loading;
+    const unread = state.unread.has(key);
+    const visibleDraft = state.thread?.id === id && drafts.target?.threadId === id && drafts.target.machine === accessKey() && !drafts.suspended && !state.loading;
     const pending = visibleDraft ? Boolean($('prompt').value.trim() || state.images.length) : drafts.pending.get(key);
     button.classList.toggle('unread', unread);
-    button.classList.toggle('is-finished', finished.has(threadId));
+    button.classList.toggle('is-finished', finished.has(id));
     const label = waiting || (compact ? 'Compacting context…' : working ? 'Working…' : interrupted ? 'Interrupted' : pending ? 'Unsent prompt' : unread ? 'Unread' : completion === 'completed' ? 'Finished' : completion === 'failed' ? 'Failed' : '');
-    const scheduled = scheduledFor(threadId);
+    const scheduled = scheduledFor(id);
     let clock = button.querySelector('.thread-schedule');
     const scheduledLabel = scheduled.length ? `${scheduled.length} scheduled message(s); next ${new Date(scheduled[0].runAt).toLocaleString()}` : '';
     if (!scheduled.length) clock?.remove();
@@ -961,18 +1179,23 @@ function renderThreadIndicators(threadId = null) {
         clock.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
         button.append(clock);
       }
-      clock.title = scheduledLabel; clock.setAttribute('aria-label', scheduledLabel);
+      if (clock.title !== scheduledLabel) { clock.title = scheduledLabel; clock.setAttribute('aria-label', scheduledLabel); }
     }
-    const description = [finished.has(threadId) ? 'Marked finished' : '', label, pending && (waiting || working || interrupted) ? 'Unsent prompt' : '', (pending || interrupted) && unread ? 'Unread' : '', scheduledLabel].filter(Boolean).join(' · ');
-    const title = button.querySelector('strong').textContent;
-    button.title = title + (description ? ' · ' + description : '');
-    if (description) button.setAttribute('aria-label', button.title); else button.removeAttribute('aria-label');
+    const description = [finished.has(id) ? 'Marked finished' : '', label, pending && (waiting || working || interrupted) ? 'Unsent prompt' : '', (pending || interrupted) && unread ? 'Unread' : '', scheduledLabel].filter(Boolean).join(' · ');
+    const title = button.querySelector('strong').textContent + (description ? ' · ' + description : '');
+    if (button.title !== title) {
+      button.title = title;
+      if (description) button.setAttribute('aria-label', title); else button.removeAttribute('aria-label');
+    }
     let indicator = button.querySelector('.thread-state');
     if (!label) { indicator?.remove(); continue; }
-    if (!indicator) { indicator = document.createElement('span'); indicator.setAttribute('role', 'img'); }
-    button.prepend(indicator);
-    indicator.className = 'thread-state ' + (waiting ? 'waiting' : working ? 'working' : interrupted ? 'failed' : pending ? 'draft' : unread ? 'unread' : completion);
-    indicator.setAttribute('aria-label', label); indicator.title = label;
+    if (!indicator) {
+      indicator = document.createElement('span'); indicator.setAttribute('role', 'img');
+      button.prepend(indicator);
+    }
+    const indicatorClass = 'thread-state ' + (waiting ? 'waiting' : working ? 'working' : interrupted ? 'failed' : pending ? 'draft' : unread ? 'unread' : completion);
+    if (indicator.className !== indicatorClass) indicator.className = indicatorClass;
+    if (indicator.title !== label) { indicator.title = label; indicator.setAttribute('aria-label', label); }
   }
 }
 function renderFinishedButton() {
@@ -1033,7 +1256,8 @@ function setCompletion(threadId, status = null) {
   const next = new Map(state.completions);
   if (status) next.set(key, status); else next.delete(key);
   try {
-    saveConversationMarkers(conversationMarkers(state.unread, next), { threadId, field: 'completion', value: status, turnId: observedTurns.get(queueKey(threadId)) });
+    const seenTurnIds = !status && state.thread?.id === threadId ? [...new Set([...state.items.values()].map(record => record.turnId).filter(Boolean))].slice(-1000) : [];
+    saveConversationMarkers(conversationMarkers(state.unread, next), { threadId, field: 'completion', value: status, turnId: observedTurns.get(queueKey(threadId)), seenTurnIds });
     state.completions = next; return true;
   } catch (error) { showError(`Could not save conversation markers: ${error.message}`); return false; }
 }
@@ -1085,6 +1309,24 @@ function conversationArrow(event) {
 function setThreadRuntimeStatus(threadId, status) {
   for (const thread of [...state.threads, ...state.pinnedThreads.values(), ...(state.thread ? [state.thread] : [])]) if (thread.id === threadId) thread.status = status;
 }
+const activeChecks = new Map();
+async function reconcileActiveTurn(threadId, retry) {
+  const turnId = state.active.get(threadId), options = state.options;
+  if (!turnId || !state.connected || !state.owned.has(threadId) || !supports('thread/turns/list', identityProvider(threadId))) return;
+  const previous = activeChecks.get(threadId);
+  if (previous?.turnId === turnId && previous.options === options) { if (retry) previous.retry = retry; return previous.promise; }
+  const check = { options, turnId, retry };
+  activeChecks.set(threadId, check);
+  const current = () => state.connected && state.options === options && activeChecks.get(threadId) === check && state.active.get(threadId) === turnId && !(state.loading && state.thread?.id === threadId);
+  check.promise = (async () => {
+    const history = await rpc('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
+    if (!current()) return;
+    const latest = history.data[0];
+    if (latest?.status === 'inProgress') { state.active.set(threadId, latest.id); setThreadRuntimeStatus(threadId, { type: 'active' }); updateBusy(); renderQueue(); }
+    else if (latest?.id === turnId && ['completed', 'failed', 'interrupted'].includes(latest.status)) handleNotification({ method: 'turn/completed', params: { threadId, turn: latest } }, check.retry);
+  })().finally(() => { if (activeChecks.get(threadId) === check) activeChecks.delete(threadId); });
+  return check.promise;
+}
 function finishCompaction(threadId, turnId) {
   if (!turnId || compacting.get(threadId)?.turnId === turnId) compacting.delete(threadId);
 }
@@ -1104,28 +1346,63 @@ async function togglePin(thread) {
     if (state.options === options) { state.pinning.delete(thread.id); renderThreads(); }
   }
 }
+let searchTimer, pendingThreadSearch;
+const pendingPinReads = new Map();
+function resetThreadListRequests(renderOffline = false) {
+  state.listGeneration++;
+  clearTimeout(searchTimer);
+  pendingThreadSearch = null;
+  pendingPinReads.clear();
+  $('search-progress').hidden = true;
+  if (renderOffline && ($('search').value.trim() || state.threadSearch)) renderThreads();
+}
 async function loadThreads(more = false, projectId = null) {
   if (!state.connected) return;
-  const generation = more ? state.listGeneration : ++state.listGeneration;
+  if (!more) clearTimeout(searchTimer);
   const searchTerm = $('search').value.trim() || null;
   const query = JSON.stringify([accessKey(), searchTerm, projects.data.map(project => project.id).sort()]);
+  if (!more && searchTerm && pendingThreadSearch?.query === query && pendingThreadSearch.generation === state.listGeneration) return pendingThreadSearch.promise;
+  const generation = more ? state.listGeneration : ++state.listGeneration;
+  const request = { query, generation, needsRefresh: false };
+  const current = () => state.connected && generation === state.listGeneration && ($('search').value.trim() || null) === searchTerm;
+  const usable = () => current() && !request.needsRefresh;
+  request.promise = loadThreadPage({ more, projectId, query, searchTerm, current: usable }).catch(error => {
+    if (!usable()) return;
+    if (!more && !$('search-progress').hidden) {
+      $('threads').replaceChildren();
+      $('more-threads').hidden = true;
+    }
+    throw error;
+  }).finally(() => {
+    if (pendingThreadSearch === request) pendingThreadSearch = null;
+    if (more || !current()) return;
+    if (request.needsRefresh) return loadThreads();
+    $('search-progress').hidden = true;
+  });
+  if (!more && searchTerm) pendingThreadSearch = request;
+  return request.promise;
+}
+async function loadThreadPage({ more, projectId, query, searchTerm, current }) {
   const sameQuery = state.threadQuery === query;
-  const filters = more ? [projectId] : [null, ...projects.data.map(project => project.id)];
+  if (more && !sameQuery) return;
+  const filters = searchTerm ? [null] : more ? [projectId] : [null, ...projects.data.map(project => project.id)];
   const results = await Promise.allSettled(filters.map(async id => {
-    const limit = id && !projects.expanded.has(id) ? 5 : 50;
+    const compact = id && !projects.expanded.has(id);
+    const fullPageSize = id ? 30 : 50;
+    const limit = compact ? 5 : fullPageSize;
     const loaded = state.threadCoverage?.get(id) || 0;
-    const target = !more && sameQuery && limit === 50 ? loaded : 0;
+    const target = !more && sameQuery && !compact ? loaded : 0;
     const data = [], errors = []; let cursor = more ? (id ? projects.cursors.get(id) : state.threadCursor) : null;
     do {
-      const page = await rpc('thread/list', { limit, sortKey: 'updated_at', modelProviders: [], searchTerm, cursor, ...(projects.data.length ? { projectId: id } : {}) });
+      const page = await rpc('thread/list', { limit, sortKey: 'updated_at', modelProviders: [], searchTerm, cursor, ...(!searchTerm && projects.data.length ? { projectId: id } : {}) });
       data.push(...page.data); errors.push(...page.errors || []); cursor = page.nextCursor;
-    } while (cursor && data.length < target && generation === state.listGeneration);
+    } while (cursor && data.length < target && current());
     return { data, nextCursor: cursor, errors };
   }));
-  if (generation !== state.listGeneration) return;
+  if (!current()) return;
   if (results.every(result => result.status === 'rejected')) throw results[0].reason;
   const pages = results.map((result, index) => result.status === 'fulfilled' ? result.value : {
-    data: sameQuery ? state.threads.filter(thread => !projects.data.length || (thread.projectId || null) === filters[index]) : [],
+    data: sameQuery ? state.threads.filter(thread => searchTerm || !projects.data.length || (thread.projectId || null) === filters[index]) : [],
     nextCursor: sameQuery ? (filters[index] ? projects.cursors.get(filters[index]) : state.threadCursor) : null,
     errors: [{ provider: filters[index] ? identityProvider(filters[index]) : null, message: result.reason.message }]
   });
@@ -1142,7 +1419,7 @@ async function loadThreads(more = false, projectId = null) {
     const dates = pages[index].data.filter(thread => known.has(thread.id) && Number.isSafeInteger(thread.createdAt) && thread.createdAt >= 0).map(thread => thread.createdAt);
     if (!dates.length) continue;
     const saved = await api.savePreferences({ threadOrder: { machine, projectId: id, cutoff: Math.max(...dates) } });
-    if (generation !== state.listGeneration) return;
+    if (!current()) return;
     preferences.threadOrderCutoffs[machine] = { ...saved.threadOrderCutoffs[machine], ...preferences.threadOrderCutoffs[machine] };
   }
   const combined = [...(more ? state.threads : []), ...pages.flatMap(page => page.data)];
@@ -1156,20 +1433,48 @@ async function loadThreads(more = false, projectId = null) {
     }
   }
   state.threads = [...new Map(combined.map(thread => [thread.id, thread])).values()];
+  state.threadSearch = searchTerm ? { term: searchTerm.toLowerCase(), ids: new Set(state.threads.map(thread => thread.id)) } : null;
   if (!more || !sameQuery) state.threadCoverage = new Map();
   filters.forEach((id, index) => state.threadCoverage.set(id, (more ? state.threadCoverage.get(id) || 0 : 0) + pages[index].data.length));
   state.threadQuery = query;
   if (!more) projects.cursors.clear();
   filters.forEach((id, index) => { if (id) projects.cursors.set(id, pages[index].nextCursor); else state.threadCursor = pages[index].nextCursor; });
   for (const thread of state.threads) if (state.pinnedIds.has(thread.id)) state.pinnedThreads.set(thread.id, thread);
-  const missing = [...state.pinnedIds].filter(id => !state.pinnedThreads.has(id));
-  for (const id of missing) state.failedPins.delete(id);
-  const pinned = await Promise.allSettled(missing.map(threadId => rpc('thread/read', { threadId, includeTurns: false })));
-  if (generation !== state.listGeneration) return;
-  state.failedPins = new Set(missing.filter((id, index) => pinned[index].status === 'rejected'));
-  for (const result of pinned) if (result.status === 'fulfilled' && state.pinnedIds.has(result.value.thread.id)) state.pinnedThreads.set(result.value.thread.id, result.value.thread);
+  const refreshPins = loadMissingPins(current);
+  if (!searchTerm) await refreshPins;
+  if (!current()) return;
   renderThreads();
   updateSettingsActions();
+  if (searchTerm) refreshPins.then(updated => { if (updated && current()) renderThreads(); }).catch(error => { if (current()) showError(error); });
+}
+async function loadMissingPins(current) {
+  const missing = [...state.pinnedIds].filter(id => !state.pinnedThreads.has(id));
+  if (!missing.length) {
+    state.failedPins.clear();
+    return false;
+  }
+  for (const id of missing) state.failedPins.delete(id);
+  const pinned = await Promise.allSettled(missing.map(readMissingPin));
+  if (!current()) return;
+  for (const [index, id] of missing.entries()) {
+    if (!state.pinnedIds.has(id) || state.pinnedThreads.has(id)) continue;
+    const result = pinned[index];
+    if (result.status === 'rejected') state.failedPins.add(id);
+    else if (result.value.thread.id === id) {
+      state.failedPins.delete(id);
+      state.pinnedThreads.set(id, result.value.thread);
+    }
+  }
+  return true;
+}
+function readMissingPin(threadId) {
+  const pending = pendingPinReads.get(threadId);
+  if (pending) return pending;
+  const request = rpc('thread/read', { threadId, includeTurns: false }).finally(() => {
+    if (pendingPinReads.get(threadId) === request) pendingPinReads.delete(threadId);
+  });
+  pendingPinReads.set(threadId, request);
+  return request;
 }
 function resetThread(folder) {
   setTimelineFollowing(true);
@@ -1186,6 +1491,7 @@ function resetThread(folder) {
   renderImages();
   state.historyEvents = null;
   state.loading = false;
+  state.historyLoadFailed = false;
   state.thread = null;
   $('send-time').value = '0';
   state.items.clear();
@@ -1265,12 +1571,14 @@ async function openThread(thread, allowBusy = false, refreshHistory = false) {
   }
   setTimelineFollowing(true);
   pinnedMessages.jumping = null; state.olderHistory = null; $('older-turns').disabled = false;
+  state.turnCursor = null; $('older-turns').hidden = true;
   if (state.thread?.id !== thread.id) { saveComposerDraft(); drafts.target = null; }
   const selection = ++state.selection;
   imageLoads.clear(); $('image-preview-dialog').close();
   $('error').hidden = true;
   if (state.thread?.id !== thread.id) { state.images = []; renderImages(); }
   state.loading = true;
+  state.historyLoadFailed = false;
   state.items.clear();
   state.historyEvents = [];
   $('messages').replaceChildren();
@@ -1315,6 +1623,9 @@ async function openThread(thread, allowBusy = false, refreshHistory = false) {
     scrollToBottom(true);
     if (!isManuallyUnread(thread.id)) setUnread(thread.id, false);
     setCompletion(thread.id); renderThreadIndicators();
+  } catch (error) {
+    if (selection === state.selection) state.historyLoadFailed = true;
+    throw error;
   } finally {
     if (selection === state.selection) { state.loading = false; state.historyEvents = null; updateBusy(); flushQueue(thread.id).catch(showError); }
   }
@@ -1559,6 +1870,12 @@ function renderFileSummary(turnId) {
     span.append(plus, minus); return span;
   };
   card.firstElementChild.replaceChildren(document.createTextNode(`${files.size} file${files.size === 1 ? '' : 's'} changed`), counts([...files.values()].reduce((sum, file) => sum + file.added, 0), [...files.values()].reduce((sum, file) => sum + file.removed, 0)));
+  const nonTestFiles = [...files.values()].filter(file => !isTestFile(file.path));
+  if (nonTestFiles.length !== files.size) {
+    const summary = document.createElement('span'); summary.className = 'change-non-test-summary';
+    summary.append(document.createTextNode(`Excluding tests: ${nonTestFiles.length} file${nonTestFiles.length === 1 ? '' : 's'}`), counts(nonTestFiles.reduce((sum, file) => sum + file.added, 0), nonTestFiles.reduce((sum, file) => sum + file.removed, 0)));
+    card.firstElementChild.append(summary);
+  }
   const rows = card.lastElementChild;
   const entries = new Map([...rows.children].map(entry => [entry.dataset.fileId, entry]));
   let next = rows.firstElementChild;
@@ -1675,6 +1992,8 @@ function renderItem(item, prepend = false, turnId = null, container = $('message
       edit.onclick = () => openMessageEdit(record);
       record.label.append(edit);
     }
+    const edit = record.label.querySelector('.edit-message');
+    if (edit) edit.dataset.canEdit = String(item.canEdit === true);
     record.body.replaceChildren();
     for (const part of item.content || []) {
       if (part.type === 'text') record.body.append(document.createTextNode(part.text));
@@ -1968,29 +2287,25 @@ function policy() {
 function renderConversationSyncNotice() {
   const notice = $('conversation-sync-notice');
   const sync = conversationSync.status;
+  renderHeaderSync();
   if (!sync || conversationSync.statusOptions !== state.options) { notice.hidden = true; return; }
-  const belongsHere = entry => {
-    let kind = entry.kind, id = entry.id;
-    if (!id && entry.key) { try { [kind, , id] = JSON.parse(entry.key); } catch { return true; } }
-    if (kind === 'draft' || kind === 'messagePin') { try { const parts = JSON.parse(id); id = kind === 'draft' ? parts[1] : parts[0]; } catch { return true; } }
-    return kind === 'shortcuts' || typeof id === 'string' && id === state.thread?.id;
-  };
   const historyError = sync.historyErrors?.find(failure => failure.id === state.thread?.id);
-  const queueError = sync.queueErrors?.find(belongsHere);
-  const message = sync.error ? 'Sync paused: ' + sync.error : historyError ? 'Local history kept · upload paused: ' + historyError.message : queueError ? 'Sync needs attention: ' + queueError.message : null;
-  const conflict = sync.conflicts.find(belongsHere);
+  const queueError = sync.queueErrors?.find(syncBelongsHere);
+  const message = sync.error ? 'Sync paused: ' + sync.error : historyError ? 'Local history kept · upload paused: ' + historyError.message : queueError ? 'Sync needs attention: ' + queueError.message : conversationAccess()?.syncPending ? 'History upload pending' : null;
+  const conflict = sync.conflicts.find(syncBelongsHere);
   notice.hidden = !message && !conflict;
-  const signature = JSON.stringify([message, conflict, state.thread?.id]);
+  const signature = JSON.stringify([message, conflict, queueError?.key, state.thread?.id]);
   if (notice.dataset.signature !== signature) {
     notice.dataset.signature = signature; notice.replaceChildren();
     if (message) { const error = document.createElement('span'); error.textContent = message; notice.append(error); }
-    if ((historyError || queueError?.kind === 'history') && state.thread && api.retryHistorySync) {
+    const retryHistory = historyError || queueError?.kind === 'history';
+    if (state.thread && (retryHistory ? api.retryHistorySync : queueError && api.retryConversationSync)) {
       const button = document.createElement('button'), thread = state.thread, options = state.options;
       button.type = 'button'; button.className = 'subtle'; button.textContent = 'Retry sync';
       button.onclick = async () => {
         if (state.options !== options || state.thread?.id !== thread.id) return;
         button.disabled = true;
-        try { await api.retryHistorySync(thread.id); await refreshConversationSync(); }
+        try { await (retryHistory ? api.retryHistorySync(thread.id) : api.retryConversationSync(queueError.key)); await refreshConversationSync(); }
         catch (error) { showError(error); }
         finally { button.disabled = false; }
       };
@@ -2018,6 +2333,7 @@ function renderConversationSyncNotice() {
       }
     }
   }
+  positionSyncPanel();
 }
 async function refreshConversationSync() {
   if (!api.conversationSync || !state.options) return;
@@ -2027,8 +2343,12 @@ async function refreshConversationSync() {
     do {
       conversationSync.again = false;
       const options = state.options, snapshot = drafts.snapshot, target = drafts.target, editors = new Map(editorDrafts);
+      const markerMachine = accessKey(), markers = preferences.conversationStates[markerMachine], shortcuts = preferences.shortcuts;
       const [saved, pins, sync] = await Promise.all([api.preferences(), api.pins(), api.conversationSync()]);
       if (options !== state.options) continue;
+      const draftsChanged = sync.draftRevision == null || (conversationSync.status?.draftRevision ?? 0) !== sync.draftRevision;
+      const wasReadOnly = conversationReadOnly();
+      conversationSync.status = sync; conversationSync.statusOptions = options;
       const pathsChanged = JSON.stringify(conversationSync.paths) !== JSON.stringify(sync.paths || {});
       conversationSync.paths = sync.paths || {}; conversationSync.pathsMachine = accessKey();
       if (pathsChanged) for (const turnId of new Set([...state.items.values()].filter(record => record.item.type === 'fileChange').map(record => record.turnId))) renderFileSummary(turnId);
@@ -2037,21 +2357,57 @@ async function refreshConversationSync() {
       conversationSync.ownership = new Map((sync.ownership || []).map(access => [access.id, access]));
       const access = conversationAccess();
       if (previousAccess?.waiting && access?.owned && !access.requested && !state.loading && !state.sending && !state.active.has(state.thread?.id)) await openThread(state.thread, true, true);
-      updateSendButton(); updateMessageEdits();
+      if (options !== state.options) continue;
+      updateSendButton();
+      if (wasReadOnly !== conversationReadOnly()) updateMessageEdits();
       refreshEditorDrafts(editors);
+      const latestMarkers = preferences.conversationStates[markerMachine];
       preferences.conversationStates = saved.conversationStates || {};
+      if (latestMarkers !== markers) {
+        preferences.conversationStates = { ...preferences.conversationStates, [markerMachine]: latestMarkers };
+        conversationSync.again = true;
+      }
+      const changedRows = new Set();
+      const collectChanges = (before = [], after = []) => {
+        const previous = new Set(before), current = new Set(after);
+        for (const id of previous) if (!current.has(id)) changedRows.add(id);
+        for (const id of current) if (!previous.has(id)) changedRows.add(id);
+      };
+      const nextMarkers = preferences.conversationStates[markerMachine];
+      if (JSON.stringify(latestMarkers) !== JSON.stringify(nextMarkers) || !nextMarkers) {
+        collectChanges(latestMarkers?.unread, nextMarkers?.unread);
+        const previous = latestMarkers?.completions || {}, current = nextMarkers?.completions || {};
+        for (const id of new Set([...Object.keys(previous), ...Object.keys(current)])) if (previous[id] !== current[id]) changedRows.add(id);
+        restoreUnread();
+      }
+      const oldPins = currentMessagePins();
       preferences.messagePins = saved.messagePins || {};
+      if (JSON.stringify(oldPins) !== JSON.stringify(currentMessagePins())) renderMessagePins();
+      collectChanges(preferences.finishedThreads?.[markerMachine], saved.finishedThreads?.[markerMachine]);
       preferences.finishedThreads = saved.finishedThreads || {};
-      preferences.conversationNotes = saved.conversationNotes || {}; renderConversationNote();
-      preferences.shortcuts = saved.shortcuts;
-      const pinsChanged = JSON.stringify([...state.pinnedIds].sort()) !== JSON.stringify([...pins].sort());
-      restoreUnread(); state.pinnedIds = new Set(pins);
-      for (const id of state.pinnedThreads.keys()) if (!state.pinnedIds.has(id)) state.pinnedThreads.delete(id);
-      for (const thread of state.threads) if (state.pinnedIds.has(thread.id)) state.pinnedThreads.set(thread.id, thread);
-      drafts.pending.clear(); renderThreads(); renderMessagePins(); renderShortcuts();
-      conversationSync.status = sync; conversationSync.statusOptions = options; renderConversationSyncNotice();
-      if (!state.loading && !state.sending && !drafts.suspended && !drafts.dirty && target && target === drafts.target && snapshot === drafts.snapshot) {
+      const selectedId = state.thread?.id;
+      const previousNote = preferences.conversationNotes?.[markerMachine]?.[selectedId];
+      preferences.conversationNotes = saved.conversationNotes || {};
+      if (previousNote !== preferences.conversationNotes[markerMachine]?.[selectedId]) renderConversationNote();
+      if (preferences.shortcuts !== shortcuts) conversationSync.again = true;
+      else {
+        if (JSON.stringify(shortcuts) !== JSON.stringify(saved.shortcuts)) {
+          preferences.shortcuts = saved.shortcuts; renderShortcuts();
+        }
+        renderShortcutSaveStatus(saved.shortcutMoveQueued);
+      }
+      const pinsChanged = pins.length !== state.pinnedIds.size || pins.some(id => !state.pinnedIds.has(id));
+      if (pinsChanged) {
+        state.pinnedIds = new Set(pins);
+        for (const id of state.pinnedThreads.keys()) if (!state.pinnedIds.has(id)) state.pinnedThreads.delete(id);
+        for (const thread of state.threads) if (state.pinnedIds.has(thread.id)) state.pinnedThreads.set(thread.id, thread);
+        renderThreads();
+      } else if (changedRows.size) renderThreadIndicators(changedRows);
+      if (draftsChanged) refreshDraftIndicators(true);
+      renderConversationSyncNotice();
+      if ((sync.draftRevision == null || drafts.syncedRevision !== sync.draftRevision) && !state.loading && !state.sending && !drafts.suspended && !drafts.dirty && target && target === drafts.target && snapshot === drafts.snapshot) {
         const value = api.draft(target);
+        drafts.syncedRevision = sync.draftRevision;
         if ((value?.text || '') !== $('prompt').value || JSON.stringify(value?.images || []) !== JSON.stringify(state.images)) {
           drafts.target = null; activateComposerDraft(); updateBusy();
         }
@@ -2206,9 +2562,12 @@ async function retryQueue(queue) {
   if (queueLocked(queue)) return;
   trace('queue.retry', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length });
   const retry = {}; queue.retry = retry;
+  const current = () => queue.retry === retry && state.connected && queue.machine === accessKey() && state.queues.get(queue.key) === queue;
   await ensureWritable(queue.thread.id);
-  if (queue.retry !== retry || !state.connected || queue.machine !== accessKey()) return;
-  queue.paused = false; await persistQueue(queue); renderQueue(); await flushQueue(queue.thread.id);
+  if (!current()) return;
+  await reconcileActiveTurn(queue.thread.id, retry);
+  if (!current()) return;
+  queue.paused = false; await persistQueue(queue); renderQueue(); await flushQueue(queue.thread.id, true);
 }
 function renderQueue() {
   const queue = state.queues.get(queueKey(state.thread?.id));
@@ -2249,8 +2608,14 @@ function renderQueue() {
       button.onclick = () => { if (!queueLocked(queue)) return run().catch(showError); }; row.append(button);
     };
     action('Edit', async () => editQueuedMessage(queue, message));
-    if (state.owned.has(queue.thread.id) && state.active.has(queue.thread.id)) action('Steer', async () => { await sendQueued(queue, message, true); await flushQueue(queue.thread.id); });
-    else if (queue.paused) action('Retry', async () => retryQueue(queue));
+    if (queue.paused) action('Retry', async () => retryQueue(queue));
+    if (state.owned.has(queue.thread.id) && state.active.has(queue.thread.id)) action('Steer', async () => {
+      const options = state.options;
+      await reconcileActiveTurn(queue.thread.id);
+      if (state.options !== options || queue.machine !== accessKey() || state.queues.get(queue.key) !== queue) return;
+      if (!state.active.has(queue.thread.id)) throw new Error('This turn finished. Use Retry to send a follow-up.');
+      await sendQueued(queue, message, true); await flushQueue(queue.thread.id);
+    });
     action('×', async () => { const previous = queue.messages; queue.messages = queue.messages.filter(entry => entry !== message); try { await persistQueue(queue); } catch (error) { queue.messages = previous; throw error; } finally { renderQueue(); } });
     row.lastChild.setAttribute('aria-label', 'Remove queued message');
     $('queued-messages').append(row);
@@ -2357,7 +2722,7 @@ async function ensureWritable(threadId) {
   return pending;
 }
 
-async function submitMessage(message, steer = false) {
+async function submitMessage(message, steer = false, repairReasoning = false) {
   const key = message.machine + ':' + message.thread.id;
   if (state.dispatching.has(key)) throw new Error('A message is already being sent.');
   const turnId = state.active.get(message.thread.id);
@@ -2374,7 +2739,7 @@ async function submitMessage(message, steer = false) {
     else {
       const settings = turnSettings(message);
       if (message.review) await rpc('thread/settings/update', settings);
-      const result = message.review ? await rpc('review/start', { threadId: message.thread.id, target: { type: 'uncommittedChanges' }, delivery: 'inline' }) : await rpc('turn/start', { ...settings, input: message.input });
+      const result = message.review ? await rpc('review/start', { threadId: message.thread.id, target: { type: 'uncommittedChanges' }, delivery: 'inline' }) : await rpc('turn/start', { ...settings, input: message.input }, repairReasoning);
       if (accessKey() === message.machine && result.turn.status === 'inProgress' && !state.finished.has(result.turn.id)) state.active.set(message.thread.id, result.turn.id);
     }
     if (accessKey() === message.machine) { state.newThreads.delete(message.thread.id); requestTitle({ ...message.thread, preview: message.text }); }
@@ -2385,7 +2750,7 @@ async function submitMessage(message, steer = false) {
     throw error;
   } finally { state.dispatching.delete(key); updateBusy(); }
 }
-async function sendQueued(queue, message, steer = false) {
+async function sendQueued(queue, message, steer = false, repairReasoning = false) {
   const ready = () => state.connected && accessKey() === queue.machine && state.queues.get(queue.key) === queue && (steer ? queue.messages.includes(message) : queue.messages[0] === message) && !state.sending && !state.dispatching.has(queue.key) && !queue.saving && !queueLocked(queue) && (steer || !queue.paused && !queue.editing && !state.active.has(queue.thread.id));
   const deferred = phase => trace('queue.deferred', { machine: queue.machine, threadId: queue.thread.id, phase, connected: state.connected, working: state.active.has(queue.thread.id), paused: queue.paused, queueLength: queue.messages.length });
   if (!ready()) return;
@@ -2394,7 +2759,7 @@ async function sendQueued(queue, message, steer = false) {
     if (!ready()) { deferred('after-save'); return; }
     if (!state.owned.has(queue.thread.id)) await ensureWritable(queue.thread.id);
     if (!ready()) { deferred('after-resume'); return; }
-    await submitMessage(message, steer);
+    await submitMessage(message, steer, repairReasoning);
     queue.messages = queue.messages.filter(entry => entry !== message);
     await persistQueue(queue);
   } catch (error) {
@@ -2404,17 +2769,17 @@ async function sendQueued(queue, message, steer = false) {
   }
   renderQueue();
 }
-async function flushQueue(threadId) {
+async function flushQueue(threadId, repairReasoning = false) {
   const queue = state.queues.get(queueKey(threadId));
   if (!queue || queue.paused || queue.editing || queue.saving || queueLocked(queue) || !state.connected || state.sending || state.dispatching.has(queue.key) || state.active.has(threadId) || (state.loading && state.thread?.id === threadId)) return;
   const message = queue.messages[0];
   if (!message) return;
-  await sendQueued(queue, message);
+  await sendQueued(queue, message, false, repairReasoning);
   if (!queue.paused && queue.messages.length && !state.active.has(threadId)) await flushQueue(threadId);
 }
 function shortcutUnavailable(shortcut) {
   if (shortcut?.mode === 'fill') return state.connecting || state.sending || state.loading || state.commandBusy || drafts.suspended;
-  return conversationReadOnly() || modelUnavailable() || !state.connected || state.connecting || state.sending || state.loading || state.commandBusy || state.images.some(image => !image.url) || queueLocked(state.queues.get(queueKey(state.thread?.id)));
+  return conversationReadOnly() || modelUnavailable() || !state.connected || state.connecting || state.loading || state.commandBusy || queueLocked(state.queues.get(queueKey(state.thread?.id)));
 }
 function promptSkillNames(text) { return [...new Set(text.split(/\s+/).filter(token => /^\$[a-zA-Z_][\w:.-]*$/.test(token)).map(token => token.slice(1)))]; }
 async function resolvePromptSkills(text, required = false) {
@@ -2435,40 +2800,105 @@ async function runShortcut(shortcut) {
     prompt.focus(); prompt.setSelectionRange(prompt.value.length, prompt.value.length);
     return;
   }
-  const options = state.options; const selection = state.selection;
-  let skills = [];
-  state.sending = true; updateBusy();
-  try { skills = await resolvePromptSkills(shortcut.prompt, true); }
-  catch (error) { showError(error); return; }
-  finally { state.sending = false; updateBusy(); }
-  if (options === state.options && selection === state.selection && state.connected) await send(null, false, { shortcut: shortcut.prompt, skills });
+  const options = state.options, selection = state.selection, failure = state.lastSendFailure;
+  let pendingSend = state.sendOperation;
+  const last = state.shortcutTask;
+  const previous = last?.options === options && last?.selection === selection ? last : null;
+  const waiting = previous && !previous.finished;
+  const current = () => options === state.options && selection === state.selection && state.connected;
+  const job = { finished: false, options, selection };
+  job.promise = (previous?.promise || Promise.resolve()).then(async result => {
+    if (!current()) return;
+    if (pendingSend) { await pendingSend.ready; if (!current() || !state.thread) return; }
+    const skills = await resolvePromptSkills(shortcut.prompt, true);
+    if (state.sendOperation && state.sendOperation !== pendingSend) {
+      pendingSend = state.sendOperation;
+      await pendingSend.ready;
+      if (!current() || !state.thread) return;
+    }
+    const failed = state.lastSendFailure;
+    const sendFailed = failed !== failure && failed?.options === options && failed?.selection === selection;
+    if (current() && !shortcutUnavailable(shortcut)) return send(null, false, { shortcut: shortcut.prompt, skills, paused: pendingSend?.failed || sendFailed || waiting && result?.failed && result.options === options && result.selection === selection });
+  }).catch(error => { if (current()) showError(error); }).finally(() => { job.finished = true; });
+  state.shortcutTask = job;
+  return job.promise;
 }
 const defaultShortcuts = [{ id: 'review', label: 'Review', prompt: '$cr ur changes' }];
+const shortcutDragType = 'application/x-remote-codex-shortcut';
+let draggedShortcut = null;
 function promptShortcuts() { return preferences.shortcuts ?? defaultShortcuts; }
 function editShortcut(shortcut = null) {
+  if (state.savingShortcut) return;
   state.shortcutEdit = shortcut;
   $('shortcut-label').value = shortcut?.label || ''; $('shortcut-prompt').value = shortcut?.prompt || '';
   $('shortcut-mode').value = shortcut?.mode || 'send';
   $('delete-shortcut').hidden = !shortcut; $('shortcut-error').hidden = true;
   $('shortcut-dialog').showModal(); $('shortcut-label').focus();
 }
+function bindShortcutDrag(button, id) {
+  const removeTarget = () => button.classList.remove('shortcut-drop-before', 'shortcut-drop-after');
+  const valid = event => draggedShortcut && draggedShortcut.id !== id && !state.savingShortcut && event.dataTransfer?.types.includes(shortcutDragType);
+  const after = event => {
+    const { left, width } = button.getBoundingClientRect();
+    return event.clientX >= left + width / 2;
+  };
+  button.draggable = true;
+  button.ondragstart = event => {
+    if (state.savingShortcut || !event.dataTransfer) { event.preventDefault(); return; }
+    draggedShortcut = { id, button };
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData(shortcutDragType, id);
+    button.classList.add('shortcut-dragging');
+  };
+  button.ondragend = () => { if (draggedShortcut?.button === button) clearShortcutDrag(); };
+  button.ondragover = event => {
+    if (!valid(event)) return;
+    event.preventDefault(); event.dataTransfer.dropEffect = 'move';
+    const dropAfter = after(event);
+    button.classList.toggle('shortcut-drop-before', !dropAfter);
+    button.classList.toggle('shortcut-drop-after', dropAfter);
+  };
+  button.ondragleave = removeTarget;
+  button.ondrop = event => {
+    if (!valid(event) || event.dataTransfer.getData(shortcutDragType) !== draggedShortcut.id) return;
+    event.preventDefault();
+    const shortcutMove = { id: draggedShortcut.id, targetId: id, after: after(event) };
+    clearShortcutDrag();
+    return persistShortcuts({ shortcutMove });
+  };
+}
+function clearShortcutDrag() {
+  draggedShortcut = null;
+  for (const button of $('shortcut-buttons').children) button.classList.remove('shortcut-dragging', 'shortcut-drop-before', 'shortcut-drop-after');
+}
+function renderShortcutSaveStatus(queued) {
+  preferences.shortcutMoveQueued = Boolean(queued);
+  $('shortcut-save-status').hidden = !queued;
+}
 function renderShortcuts() {
+  draggedShortcut = null;
   $('shortcut-buttons').replaceChildren();
-  for (const shortcut of promptShortcuts()) {
+  const shortcuts = promptShortcuts();
+  for (const shortcut of shortcuts) {
     const button = document.createElement('button'); button.type = 'button'; button.textContent = shortcut.label;
     button.dataset.mode = shortcut.mode || 'send'; button.disabled = shortcutUnavailable(shortcut);
     button.title = `${shortcut.prompt}\n${shortcut.mode === 'fill' ? 'Fill prompt only' : 'Send or queue immediately'} · Right-click to edit`;
+    if (shortcuts.length > 1) { button.title += ' · Drag to reorder'; bindShortcutDrag(button, shortcut.id); }
     button.onclick = () => runShortcut(shortcut);
     button.oncontextmenu = event => { event.preventDefault(); editShortcut(shortcut); };
     $('shortcut-buttons').append(button);
   }
 }
-async function persistShortcuts(shortcuts) {
+async function persistShortcuts(patch) {
   if (state.savingShortcut) return;
   state.savingShortcut = true;
+  const editing = $('shortcut-dialog').open;
   for (const button of $('shortcut-form').querySelectorAll('button')) button.disabled = true;
-  try { await savePreferences({ shortcuts }); renderShortcuts(); updateBusy(); $('shortcut-dialog').close(); }
-  catch (error) { $('shortcut-error').textContent = error.message; $('shortcut-error').hidden = false; }
+  try { await savePreferences(patch); renderShortcuts(); if (editing) $('shortcut-dialog').close(); }
+  catch (error) {
+    if (editing) { $('shortcut-error').textContent = error.message; $('shortcut-error').hidden = false; }
+    else showError(`Could not reorder shortcuts: ${error.message}`);
+  }
   finally { state.savingShortcut = false; for (const button of $('shortcut-form').querySelectorAll('button')) button.disabled = false; }
 }
 $('add-shortcut').onclick = () => editShortcut();
@@ -2478,10 +2908,21 @@ $('shortcut-form').onsubmit = event => {
   event.preventDefault();
   const shortcut = { id: state.shortcutEdit?.id || crypto.randomUUID(), label: $('shortcut-label').value.trim(), prompt: $('shortcut-prompt').value, mode: $('shortcut-mode').value };
   if (!shortcut.label || !shortcut.prompt.trim()) return;
-  return persistShortcuts(state.shortcutEdit ? promptShortcuts().map(item => item.id === shortcut.id ? shortcut : item) : [...promptShortcuts(), shortcut]);
+  const shortcuts = state.shortcutEdit ? promptShortcuts().map(item => item.id === shortcut.id ? shortcut : item) : [...promptShortcuts(), shortcut];
+  return persistShortcuts({ shortcuts });
 };
-$('delete-shortcut').onclick = () => persistShortcuts(promptShortcuts().filter(item => item.id !== state.shortcutEdit?.id));
+$('delete-shortcut').onclick = () => persistShortcuts({ shortcuts: promptShortcuts().filter(item => item.id !== state.shortcutEdit?.id) });
 renderShortcuts();
+async function enqueueMessage(message, paused = false) {
+  const key = message.machine + ':' + message.thread.id;
+  const queue = state.queues.get(key) || { key, machine: message.machine, thread: message.thread, messages: [], paused: false };
+  if (!queue.messages.length) queue.paused = Boolean(paused);
+  else if (paused) queue.paused = true;
+  queue.messages.push(message); state.queues.set(key, queue);
+  try { await persistQueue(queue); } catch (error) { queue.messages = queue.messages.filter(entry => entry !== message); throw error; }
+  trace('send.queued', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, paused: queue.paused });
+  return queue;
+}
 async function send(event, steer = false, action = null) {
   event?.preventDefault();
   if (state.connecting || queueLocked(state.queues.get(queueKey(state.thread?.id)))) return;
@@ -2490,7 +2931,7 @@ async function send(event, steer = false, action = null) {
   if (!action && !steer && /^\/[a-z-]*(?:\s|$)/i.test(text)) { await executeSlash(text); return; }
   if (state.commandBusy && !action) return;
   const images = shortcut ? [] : [...state.images];
-  if ((!text && !images.length) || images.some(image => !image.url) || !state.connected || state.sending || state.loading) return;
+  if ((!text && !images.length) || images.some(image => !image.url) || !state.connected || state.sending && (!shortcut || !state.thread) || state.loading) return;
   if (modelUnavailable()) { showError(`${agentName()} model is unavailable. Reconnect or select another model.`); return; }
   if (conversationReadOnly()) { showError('Use this conversation on this computer before sending messages.'); return; }
   $('error').hidden = true;
@@ -2501,6 +2942,16 @@ async function send(event, steer = false, action = null) {
   const message = { draftId: crypto.randomUUID(), text, images, input, access, review: Boolean(action?.review), mode: modes.plan ? 'plan' : 'default', model: $('model').value, effort: $('effort').value, machine: accessKey(), thread: state.thread };
   const options = state.options; const selection = state.selection;
   trace('send.requested', { machine: message.machine, threadId: state.thread?.id, delayHours, working: state.active.has(state.thread?.id), status: state.thread?.status?.type, queueLength: state.queues.get(queueKey(state.thread?.id))?.messages.length || 0, paused: Boolean(state.queues.get(queueKey(state.thread?.id))?.paused) });
+  if (shortcut && message.thread) {
+    try {
+      const queue = await enqueueMessage(message, action.paused);
+      flushQueue(message.thread.id, true).catch(showError);
+      return { failed: queue.paused, options, selection };
+    } catch (error) { showError(error); return { failed: true, options, selection }; }
+  }
+  let readyThread;
+  const operation = { failed: false, options, selection, ready: new Promise(resolve => { readyThread = resolve; }) };
+  state.sendOperation = operation;
   state.sending = true; updateBusy();
   try {
     if (!action?.skills && promptSkillNames(text).length) {
@@ -2526,6 +2977,8 @@ async function send(event, steer = false, action = null) {
         applyName(result.thread.id, name);
       }
     } else if (!delayHours && !state.owned.has(state.thread.id)) await ensureWritable(state.thread.id);
+    readyThread();
+    if (shortcut) { await enqueueMessage(message, action.paused); return operation; }
     if (delayHours) {
       await api.scheduleMessage({ ...message, turnSettings: turnSettings(message) }, delayHours);
       trace('send.scheduled', { machine: message.machine, threadId: message.thread.id, delayHours });
@@ -2535,26 +2988,28 @@ async function send(event, steer = false, action = null) {
     }
     const key = queueKey(state.thread.id);
     if (!steer && (state.active.has(state.thread.id) || state.dispatching.has(key) || state.queues.get(key)?.messages.length)) {
-      const queue = state.queues.get(key) || { key, machine: message.machine, thread: state.thread, messages: [], paused: false };
-      if (!queue.messages.length) queue.paused = false;
-      queue.messages.push(message); state.queues.set(key, queue);
-      try { await persistQueue(queue); } catch (error) { queue.messages = queue.messages.filter(entry => entry !== message); throw error; }
-      trace('send.queued', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, paused: queue.paused });
+      await enqueueMessage(message);
       if (!shortcut) { $('prompt').value = ''; hideSlash(); state.images = []; renderImages(); }
       return;
     }
     if (!shortcut) { $('prompt').value = ''; hideSlash(); state.images = []; renderImages(); }
-    await submitMessage(message, steer);
+    await submitMessage(message, steer, true);
   } catch (error) {
+    operation.failed = true; state.lastSendFailure = operation;
     trace('send.failed', { machine: message.machine, threadId: message.thread?.id, error: error.message });
+    const queue = message.thread && state.queues.get(message.machine + ':' + message.thread.id);
+    if (queue?.messages.length) await pauseQueue(queue, 'send-failed').catch(showError);
     if (delayHours) $('send-time').value = String(delayHours);
     if (!shortcut && options === state.options && selection === state.selection) { if (!$('prompt').value) $('prompt').value = rawText; state.images = images; renderImages(); }
     showError(error);
   } finally {
+    if (state.sendOperation === operation) state.sendOperation = null;
+    readyThread();
     state.sending = false; updateBusy();
     if (options === state.options && selection === state.selection && originalDraft && drafts.target && JSON.stringify(originalDraft) !== JSON.stringify(drafts.target) && saveComposerDraft()) clearDraft(originalDraft);
     for (const queue of state.queues.values()) if (queue.machine === accessKey()) flushQueue(queue.thread.id).catch(showError);
   }
+  return operation;
 }
 function applyName(threadId, name) {
   if (typeof name !== 'string' || !name.trim()) return;
@@ -2604,10 +3059,11 @@ function showThreadMenu(thread, x, y) {
   $('project-menu').hidden = true;
   state.contextThread = thread;
   const menu = $('thread-menu'); menu.hidden = false;
+  $('recover-edit-drafts').hidden = !api.editDrafts || !supportsNativeEdit(thread);
   $('clone-conversation').disabled = !supports('thread/fork', threadProvider(thread)) || !state.connected || state.sending || state.commandBusy || state.loading;
   $('mark-unread').disabled = state.unread.has(queueKey(thread.id));
   $('archive-conversation').disabled = !canArchiveConversation(thread);
-  $('archive-conversation').title = state.active.has(thread.id) || thread.status?.type === 'active' ? 'Stop the running task before archiving' : state.queues.get(queueKey(thread.id))?.messages.length ? 'Send or remove queued messages before archiving' : scheduledFor(thread.id).some(task => task.status === 'pending') ? 'Cancel scheduled messages before archiving' : '';
+  $('archive-conversation').title = state.active.has(thread.id) || thread.status?.type === 'active' ? 'Stop the running task before archiving' : state.queues.get(queueKey(thread.id))?.messages.length || state.nativeQueues.get(thread.id)?.items.length ? 'Send or remove queued messages before archiving' : scheduledFor(thread.id).some(task => task.status === 'pending') ? 'Cancel scheduled messages before archiving' : '';
   menu.style.left = Math.max(0, Math.min(x, innerWidth - menu.offsetWidth)) + 'px';
   menu.style.top = Math.max(0, Math.min(y, innerHeight - menu.offsetHeight)) + 'px';
   $('clone-conversation').focus();
@@ -2615,7 +3071,7 @@ function showThreadMenu(thread, x, y) {
 function canArchiveConversation(thread) {
   const key = queueKey(thread?.id);
   const queue = state.queues.get(key);
-  return Boolean(thread?.id && state.connected && !state.connecting && !state.sending && !state.commandBusy && !state.loading && !state.pinning.has(thread.id) && !state.active.has(thread.id) && thread.status?.type !== 'active' && !state.dispatching.has(key) && !queue?.messages.length && !queue?.saving && !scheduledFor(thread?.id).some(task => task.status === 'pending'));
+  return Boolean(thread?.id && state.connected && !state.connecting && !state.sending && !state.commandBusy && !state.loading && !state.pinning.has(thread.id) && !state.active.has(thread.id) && thread.status?.type !== 'active' && !state.dispatching.has(key) && !queue?.messages.length && !queue?.saving && !state.nativeQueues.get(thread.id)?.items.length && !scheduledFor(thread?.id).some(task => task.status === 'pending'));
 }
 async function archiveConversation(thread) {
   if (!canArchiveConversation(thread)) return;
@@ -2638,27 +3094,36 @@ async function archiveConversation(thread) {
   finally { if (state.archiving === operation) { state.archiving = null; state.commandBusy = false; updateBusy(); renderThreads(); } }
 }
 function openMessageEdit(record) {
-  if (!state.connected || state.sending || state.commandBusy || state.loading || !record.turnId || state.items.get(record.item.id) !== record) return;
+  const nativeEdit = supportsNativeEdit(state.thread);
+  if (state.sending || state.commandBusy || state.loading || !record.turnId || state.items.get(record.item.id) !== record
+    || (nativeEdit ? record.item.canEdit !== true || conversationReadOnly() : !state.connected)) return;
   const queue = state.queues.get(queueKey(state.thread.id));
   if (state.active.has(state.thread.id) || state.dispatching.has(queueKey(state.thread.id)) || queue?.saving || queueLocked(queue)) { showError('Wait for the running task before editing earlier messages.'); return; }
-  const draftTarget = editorTarget('edit-message', state.thread, record.turnId);
-  state.messageEdit = { thread: state.thread, turnId: record.turnId, content: record.item.content || [], options: state.options, queue, draftTarget };
+  if (nativeEdit && state.nativeQueues.get(state.thread.id)?.items.length) { showError('Send or remove queued messages before editing.'); return; }
+  const draftTarget = editorTarget('edit-message', state.thread, nativeEdit ? record.item.id : record.turnId);
+  const content = record.item.content || [];
+  const attachmentCount = nativeEdit ? record.item.attachmentCount || 0 : content.filter(part => part.type !== 'text' && part.type !== 'skill').length;
+  state.messageEdit = { thread: state.thread, turnId: record.turnId, itemId: record.item.id, content, attachmentCount, options: state.options, queue, draftTarget };
   if (queue) queue.editing = true;
   $('edit-message-error').textContent = ''; $('edit-message-error').hidden = true;
   $('edited-message').value = editorText(draftTarget, state.messageEdit.content.filter(part => part.type === 'text').map(part => part.text).join('\n'));
-  const count = state.messageEdit.content.filter(part => part.type !== 'text' && part.type !== 'skill').length;
-  $('edited-message-attachments').textContent = count ? `${count} attachment(s) will be kept.` : '';
+  $('edited-message-attachments').textContent = attachmentCount ? `${attachmentCount} attachment(s) will be kept.` : '';
+  $('cancel-message-edit').textContent = 'Cancel';
+  $('resend-message').disabled = false;
   $('edit-message-dialog').showModal(); $('edited-message').focus();
+  return true;
 }
 async function resendMessage(target, text) {
-  if (!target || !state.connected || state.sending || state.commandBusy || state.loading || target.options !== state.options || target.thread.id !== state.thread?.id) return;
+  if (!target || target.uncertain || state.sending || state.commandBusy || state.loading || target.options !== state.options || target.thread.id !== state.thread?.id) return;
   const expected = editorDrafts.get(JSON.stringify(target.draftTarget))?.expected;
   const thread = target.thread; const machine = accessKey(); const key = queueKey(thread.id);
+  const nativeEdit = supportsNativeEdit(thread);
   const operation = {}; state.resending = operation; state.commandBusy = true; updateBusy();
   const current = () => state.resending === operation && state.options === target.options && state.connected && state.thread?.id === thread.id;
-  let lock, queue, reverted = false, saved = false;
+  let lock, queue, reverted = false, saved = false, editAccepted = false;
   $('edit-message-error').textContent = ''; $('edit-message-error').hidden = true;
   try {
+    if (!state.connected) throw new Error('Connect to a coding agent before resending.');
     if (modelUnavailable()) throw new Error('Selected model is unavailable. Reconnect or select another model before resending.');
     const message = { draftId: crypto.randomUUID(), text, images: [], input: [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...target.content.filter(part => !['text', 'skill'].includes(part.type)), ...skillInputs(text, target.content.filter(part => part.type === 'skill'), thread.cwd)], access: policy(), mode: modes.plan ? 'plan' : 'default', model: $('model').value, effort: $('effort').value, machine, thread };
     turnSettings(message);
@@ -2673,8 +3138,18 @@ async function resendMessage(target, text) {
     if (queue?.messages.length) await pauseQueue(queue, 'history-edit');
     if (!current()) return;
     if (modelUnavailable(message.model, threadProvider(thread))) throw new Error('Selected model is unavailable. Reconnect or select another model before resending.');
+    if (nativeEdit) {
+      const result = await rpc('thread/edit', { ...turnSettings(message), beforeTurnId: target.turnId, itemId: target.itemId, input: message.input });
+      editAccepted = true;
+      if (!current()) return;
+      clearDraft(target.draftTarget, expected);
+      $('edit-message-dialog').close();
+      await openThread(result.thread, true);
+      if (current() && result.turn?.error?.message) showError(result.turn.error.message);
+      return;
+    }
     turnSettings(message);
-    const result = await rpc('thread/revert', { threadId: thread.id, beforeTurnId: target.turnId });
+    const result = await rpc('thread/revert', { threadId: thread.id, beforeTurnId: target.turnId }, true);
     reverted = true;
     trace('edit.reverted', { machine, threadId: thread.id, turnId: target.turnId });
     queue = state.queues.get(key) || { key, machine, thread, messages: [], paused: true };
@@ -2686,14 +3161,18 @@ async function resendMessage(target, text) {
     $('edit-message-dialog').close();
     await openThread(result.thread, true);
     if (!current()) return;
-    await submitMessage(message);
+    await submitMessage(message, false, true);
     const previous = queue.messages;
     queue.messages = queue.messages.filter(entry => entry !== message);
     try { await persistQueue(queue); } catch (error) { queue.messages = previous; throw error; }
   } catch (error) {
     trace('edit.failed', { machine, threadId: thread.id, error: error.message });
     if (state.resending === operation && state.options === target.options) {
-      const message = reverted ? saved ? `Edited message was not confirmed; its draft is saved in this conversation's paused queue. Check history before retrying. ${error.message}` : `History was updated, but the draft could not be saved. Keep the edited text before closing. ${error.message}` : error.message || String(error);
+      if (nativeEdit && !editAccepted && /Edit may have been submitted; check conversation history before retrying\./.test(error.message)) {
+        target.uncertain = true;
+        $('cancel-message-edit').textContent = 'Check history';
+      }
+      const message = editAccepted ? `The edit was sent, but the conversation could not reload. ${error.message}` : reverted ? saved ? `Edited message was not confirmed; its draft is saved in this conversation's paused queue. Check history before retrying. ${error.message}` : `History was updated, but the draft could not be saved. Keep the edited text before closing. ${error.message}` : error.message || String(error);
       if ($('edit-message-dialog').open) { $('edit-message-error').textContent = message; $('edit-message-error').hidden = false; }
       else showError(message);
     }
@@ -2755,6 +3234,7 @@ async function connect(options) {
       if (state.options !== current) return;
       if (result?.options) Object.assign(state.options, result.options);
       state.connected = result?.connected ?? result?.options?.agents?.some(agent => agent.connected !== false && agent.enabled !== false && agent.available !== false) ?? state.connected;
+      if (!state.connected) resetThreadListRequests(true);
       if (changed && state.connected) {
         await refreshAgentCatalogs();
         if (result?.reconnected?.length) await refreshProjects();
@@ -2806,8 +3286,9 @@ async function connect(options) {
   state.pinning.clear();
   state.threadCursor = null;
   state.threadQuery = null;
+  state.threadSearch = null;
   state.threadCoverage = new Map();
-  state.listGeneration++;
+  resetThreadListRequests();
   state.folderGeneration++;
   $('folder-dialog').close();
   state.active.clear(); compacting.clear();
@@ -2849,7 +3330,7 @@ async function connect(options) {
     state.connecting = false; status(state.connected ? connectedStatus() : connected ? 'Not connected' : 'Agents disabled');
   }
 }
-function handleNotification(message) {
+function handleNotification(message, reconciledRetry) {
   if (message.machine && message.machine !== accessKey()) return;
   if (message.method === 'scheduler/updated') { refreshSchedules().catch(showError); return; }
   if (message.method === 'conversations/synced') { refreshConversationSync().catch(showError); return; }
@@ -2857,7 +3338,7 @@ function handleNotification(message) {
   if (method === 'provider/queue/updated') {
     if (params.queue?.items?.length) state.nativeQueues.set(params.threadId, params.queue);
     else state.nativeQueues.delete(params.threadId);
-    if (state.thread?.id === params.threadId) renderQueue();
+    if (state.thread?.id === params.threadId) { renderQueue(); updateMessageEdits(); }
     return;
   }
   if (['item/started', 'item/completed'].includes(method) && params.item?.type === 'contextCompaction') {
@@ -2903,6 +3384,7 @@ function handleNotification(message) {
   }
   if (method === 'provider/closed') {
     const provider = message.provider || params.provider;
+    for (const threadId of activeChecks.keys()) if (identityProvider(threadId) === provider) activeChecks.delete(threadId);
     for (const threadId of state.nativeQueues.keys()) if (identityProvider(threadId) === provider) state.nativeQueues.delete(threadId);
     const agent = agentMetadata(provider); if (agent) agent.connected = false;
     for (const map of [state.active, state.resuming]) for (const threadId of map.keys()) if (identityProvider(threadId) === provider) map.delete(threadId);
@@ -2912,6 +3394,7 @@ function handleNotification(message) {
     for (const [key, request] of state.requests) if (request.provider === provider || identityProvider(request.params.threadId) === provider) state.requests.delete(key);
     for (const queue of state.queues.values()) if (queue.machine === accessKey() && threadProvider(queue.thread) === provider) pauseQueue(queue, 'provider-closed').catch(showError);
     if (selectedProvider() === provider) {
+      if (state.loading) state.historyLoadFailed = true;
       state.selection++; state.loading = false; state.historyEvents = null;
       if (!params.reconfigured) {
         showError(`${agentName(provider)} disconnected: ${params.message || 'Connection closed'}`);
@@ -2921,12 +3404,15 @@ function handleNotification(message) {
     syncComposerAgent(); renderRequests(); updateBusy(); return;
   }
   if (method === 'connection/closed') {
+    activeChecks.clear();
     clearQueueDrag(false);
     clearThreadDrag();
     clearProjectDrag(); $('project-menu').hidden = true;
     pauseQueues('connection-closed');
     state.nativeQueues.clear();
     state.connected = false; state.owned.clear(); state.resuming.clear(); state.active.clear(); state.requests.clear(); compacting.clear();
+    resetThreadListRequests(true);
+    if (state.loading) state.historyLoadFailed = true;
     state.selection++; state.loading = false; state.historyEvents = null;
     $('folder-dialog').close();
     status('Disconnected'); renderRequests(); showError(params.message);
@@ -2935,6 +3421,7 @@ function handleNotification(message) {
   if (id !== undefined) {
     const supported = ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput', 'item/permissions/requestApproval', 'mcpServer/elicitation/request'];
     if (supported.includes(method)) {
+      activeChecks.delete(params.threadId);
       const fresh = !state.requests.has(id);
       state.requests.set(id, message); renderRequests();
       if (fresh && state.connected) playCompletionSound();
@@ -2946,8 +3433,15 @@ function handleNotification(message) {
   if (method === 'project/changed') { refreshProjects().catch(showError); return; }
   if (method === 'thread/project/updated') { applyProject(params.threadId, params.projectId); loadThreads().catch(showError); return; }
   if (method === 'serverRequest/resolved') { state.requests.delete(params.requestId); renderRequests(); return; }
-  if (method === 'thread/status/changed') { if (params.status?.type !== 'active') finishCompaction(params.threadId); setThreadRuntimeStatus(params.threadId, params.status); updateBusy(); return; }
+  if (method === 'thread/status/changed') {
+    if (params.status?.type === 'active') activeChecks.delete(params.threadId);
+    if (params.status?.type !== 'active') finishCompaction(params.threadId);
+    setThreadRuntimeStatus(params.threadId, params.status); updateBusy();
+    if (params.status?.type === 'idle') reconcileActiveTurn(params.threadId).catch(error => trace('turn.reconcile.failed', { threadId: params.threadId, error: error.message }));
+    return;
+  }
   if (method === 'turn/started' && !state.finished.has(params.turn.id)) {
+    activeChecks.delete(params.threadId);
     if (compacting.get(params.threadId)?.turnId !== params.turn.id) finishCompaction(params.threadId);
     state.owned.add(params.threadId); state.writerConflicts.delete(queueKey(params.threadId));
     setCompletion(params.threadId);
@@ -2955,6 +3449,7 @@ function handleNotification(message) {
     state.active.set(params.threadId, params.turn.id); updateBusy();
   }
   if (method === 'turn/completed') {
+    activeChecks.delete(params.threadId);
     observedTurns.set(queueKey(params.threadId), params.turn.id);
     finishCompaction(params.threadId, params.turn.id);
     const activeTurn = state.active.get(params.threadId);
@@ -2966,7 +3461,7 @@ function handleNotification(message) {
       }
       const queue = state.queues.get(queueKey(params.threadId));
       if (state.connected && params.turn.status === 'completed' && (!queue?.messages.length || queue.paused)) playCompletionSound();
-      if (queue && ['failed', 'interrupted'].includes(params.turn.status)) pauseQueue(queue, 'turn-' + params.turn.status).catch(showError);
+      if (queue && ['failed', 'interrupted'].includes(params.turn.status) && (!reconciledRetry || queue.retry !== reconciledRetry)) pauseQueue(queue, 'turn-' + params.turn.status).catch(showError);
     }
     state.finished.add(params.turn.id);
     if (state.finished.size > 1000) state.finished.delete(state.finished.values().next().value);
@@ -2981,7 +3476,8 @@ function handleNotification(message) {
   if (method === 'error') {
     if (!params.willRetry) { finishCompaction(params.threadId, params.turnId); updateBusy(); }
     const queue = state.queues.get(queueKey(params.threadId));
-    if (queue && !params.willRetry) { pauseQueue(queue, 'native-error').catch(showError); renderQueue(); }
+    const currentTurn = !params.turnId || !state.active.has(params.threadId) || state.active.get(params.threadId) === params.turnId;
+    if (queue && !params.willRetry && currentTurn) { pauseQueue(queue, 'native-error').catch(showError); renderQueue(); }
     showError(params.error?.message || params.message || `${agentName()} reported an error.`);
     if (params.willRetry && params.threadId && params.turnId) state.retryError = { threadId: params.threadId, turnId: params.turnId };
   }
@@ -3339,6 +3835,8 @@ function bindProjectDrag(group, header, project) {
   });
 }
 function applyProject(threadId, projectId) {
+  if (pendingThreadSearch?.generation === state.listGeneration) pendingThreadSearch.needsRefresh = true;
+  pendingPinReads.delete(threadId);
   for (const thread of [...state.threads, ...state.pinnedThreads.values(), ...(state.thread ? [state.thread] : [])]) if (thread.id === threadId) thread.projectId = projectId;
   if (state.thread?.id === threadId) projects.selected = projectId;
   renderThreads();
@@ -3521,8 +4019,52 @@ $('unread-shortcut').textContent = navigator.platform.includes('Mac') ? 'U · �
 $('mark-unread').setAttribute('aria-keyshortcuts', navigator.platform.includes('Mac') ? 'U Meta+Shift+U' : 'U Control+Shift+U');
 $('clone-conversation').onclick = () => cloneConversation(state.contextThread);
 $('archive-conversation').onclick = () => archiveConversation(state.contextThread);
-$('cancel-message-edit').onclick = () => { clearDraft(state.messageEdit?.draftTarget); $('edit-message-dialog').close(); };
-$('edit-message-dialog').oncancel = event => { if (state.resending) event.preventDefault(); else clearDraft(state.messageEdit?.draftTarget); };
+async function dismissMessageEdit() {
+  const target = state.messageEdit;
+  if (!target?.uncertain) clearDraft(target?.draftTarget);
+  $('edit-message-dialog').close();
+  if (target?.uncertain && target.options === state.options && state.thread?.id === target.thread.id && state.connected) {
+    try {
+      await openThread(target.thread);
+      if (target.options === state.options && state.thread?.id === target.thread.id && !state.items.has(target.itemId) && api.editDrafts) {
+        showError('Your edit draft is saved. Right-click the conversation and choose Recover edit drafts.');
+      }
+    }
+    catch (error) { showError(error); }
+  }
+}
+$('recover-edit-drafts').onclick = async () => {
+  const thread = state.contextThread, options = state.options;
+  $('thread-menu').hidden = true;
+  if (!thread || !api.editDrafts) return;
+  try {
+    const saved = await api.editDrafts(thread.id);
+    if (options !== state.options || thread !== state.contextThread) return;
+    const picker = $('edit-drafts-picker'), input = $('edit-drafts-text'), copy = $('copy-edit-draft'), status = $('edit-drafts-status');
+    picker.replaceChildren(...saved.map((draft, index) => new Option(new Date(draft.updatedAt).toLocaleString(), index)));
+    picker.hidden = saved.length < 2;
+    input.hidden = copy.hidden = !saved.length;
+    picker.onchange = () => {
+      input.value = saved[Number(picker.value)]?.text ?? '';
+      copy.disabled = !input.value;
+      status.textContent = !saved.length ? 'No saved edit drafts.' : input.value ? '' : 'This draft has no text.';
+    };
+    picker.onchange();
+    if (!$('edit-drafts-dialog').open) $('edit-drafts-dialog').showModal();
+  } catch (error) { showError(error); }
+};
+$('close-edit-drafts').onclick = () => $('edit-drafts-dialog').close();
+$('copy-edit-draft').onclick = async () => {
+  try {
+    await api.copyText($('edit-drafts-text').value);
+    $('edit-drafts-status').textContent = 'Copied';
+  } catch { $('edit-drafts-status').textContent = 'Could not copy the draft.'; }
+};
+$('cancel-message-edit').onclick = dismissMessageEdit;
+$('edit-message-dialog').oncancel = event => {
+  event.preventDefault();
+  if (!state.resending) void dismissMessageEdit();
+};
 $('edited-message').oninput = () => saveEditorDraft(state.messageEdit?.draftTarget, $('edited-message').value);
 $('edit-message-dialog').onclose = () => {
   if ($('edit-message-dialog').open) return;
@@ -3532,7 +4074,7 @@ $('edit-message-dialog').onclose = () => {
 $('edit-message-form').onsubmit = async event => {
   event.preventDefault();
   const target = state.messageEdit; const text = $('edited-message').value.trim();
-  if (!target || !text && !target.content.some(part => !['text', 'skill'].includes(part.type))) return;
+  if (!target || target.uncertain || !text && !target.attachmentCount) return;
   saveEditorDraft(target.draftTarget, $('edited-message').value);
   await resendMessage(target, text);
 };
@@ -3571,7 +4113,14 @@ function restoreAccess() {
   const saved = localStorage.getItem(accessKey());
   $('permissions').value = ['read-only', 'workspace-write', 'danger-full-access'].includes(saved) ? saved : 'workspace-write';
 }
-$('prompt').oninput = () => { slash.dismissed = null; slash.index = 0; slash.skillOnly = false; scheduleComposerDraft(); cacheDraftIndicator(drafts.target, Boolean($('prompt').value.trim() || state.images.length)); updateSendButton(); updateSlash(); };
+$('prompt').oninput = () => {
+  const text = $('prompt').value;
+  slash.dismissed = null; slash.index = 0; slash.skillOnly = false;
+  scheduleComposerDraft();
+  cacheDraftIndicator(drafts.target, Boolean(text.trim() || state.images.length));
+  if (($('send').type === 'button') !== canStopTurn()) updateSendButton();
+  if (text.startsWith('/') || !$('slash-menu').hidden) updateSlash();
+};
 $('prompt').addEventListener('blur', () => saveComposerDraft());
 $('prompt').onkeydown = promptKeydown;
 $('plan-mode').onclick = () => { modes.plan = false; if (state.thread) modes.threads.set(state.thread.id, false); updateBusy(); };
@@ -3589,8 +4138,15 @@ $('more-threads').onclick = async () => {
   $('more-threads').disabled = true;
   try { await loadThreads(true); } catch (error) { showError(error); } finally { $('more-threads').disabled = false; }
 };
-let searchTimer;
-$('search').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => loadThreads().catch(showError), 250); };
+$('search').oninput = () => {
+  clearTimeout(searchTimer);
+  if (!state.connected) { renderThreads(); return; }
+  state.listGeneration++;
+  $('search-progress').hidden = false;
+  const search = () => loadThreads().catch(showError);
+  if ($('search').value.trim()) searchTimer = setTimeout(search, 250);
+  else search();
+};
 $('send').onclick = event => { if (canStopTurn()) { event.preventDefault(); return stopTurn(); } };
 function loadOlderTurns() {
   if (!state.thread || !state.turnCursor || state.loading) return Promise.resolve();
@@ -3672,11 +4228,12 @@ document.addEventListener('contextmenu', async event => {
 document.addEventListener('drop', event => { if (threadDrag.source && event.dataTransfer?.types.includes(threadDrag.type)) { event.preventDefault(); clearThreadDrag(); } });
 document.addEventListener('drop', event => { if (queueDrag.source && event.dataTransfer?.types.includes(queueDrag.type)) { event.preventDefault(); clearQueueDrag(); } });
 document.addEventListener('drop', event => { if (projectDrag.source && event.dataTransfer?.types.includes(projectDrag.type)) { event.preventDefault(); clearProjectDrag(); } });
-document.addEventListener('keydown', event => { if (event.key === 'Escape') { $('thread-menu').hidden = true; $('project-menu').hidden = true; clearProjectDrag(); } });
+document.addEventListener('keydown', event => { if (event.key === 'Escape') { hideSyncTooltip(); $('thread-menu').hidden = true; $('project-menu').hidden = true; clearProjectDrag(); } });
 async function init() {
   if (!api) { showError('Open Remote Codex as a desktop app to connect to Codex.'); return; }
   api.onNotification(handleNotification);
-  Object.assign(preferences, await api.preferences()); applyTheme(preferences.theme); renderShortcuts();
+  Object.assign(preferences, await api.preferences()); applyTheme(preferences.theme);
+  renderShortcuts(); renderShortcutSaveStatus(preferences.shortcutMoveQueued);
   await restoreQueues();
   await refreshSchedules();
   const options = await api.settings();

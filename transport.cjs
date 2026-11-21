@@ -148,7 +148,7 @@ class CodexConnection extends EventEmitter {
         clearTimeout(request.timer);
         this.emit('diagnostic', { event: message.error ? 'rpc.failed' : 'rpc.completed', details: { ...request.diagnostic, durationMs: Date.now() - request.startedAt, status: message.result?.turn?.status || message.result?.thread?.status?.type, error: message.error?.message } });
         this.emit('rpc', { phase: 'finished', requestId: message.id, method: request.method, threadId: request.threadId, result: message.result });
-        if (message.error) request.reject(new Error(message.error.message));
+        if (message.error) request.reject(Object.assign(new Error(message.error.message), { code: message.error.code }));
         else request.resolve(request.method === 'thread/turns/list' ? { ...message.result, receivedSequence } : message.result);
       }
     };

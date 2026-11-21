@@ -79,7 +79,7 @@ test('simultaneous claims from independent SQLite workers select exactly one own
 });
 
 test('one pending handoff request is idempotent, blocks sends and excludes a third requester', t => {
-  const f = fixture(t); f.claim(0);
+  const f = fixture(t); f.claim(0); f.publish(0, 1);
   assert.equal(f.ask(0).requested, null);
   const requested = f.ask(1);
   assert.equal(requested.owner, f.owners[0]); assert.equal(requested.requested, f.owners[1]);
@@ -97,9 +97,10 @@ test('ownership transfers only after the current owner publishes the exact curre
   const f = fixture(t); f.claim(0);
   const unpublished = hash(Buffer.from('Not uploaded'));
   assert.throws(() => f.release(0, 1, unpublished), /ownership changed/);
+  assert.throws(() => f.ask(1), /not uploaded/);
+  const saved = f.publish(0, 1);
   f.ask(1);
   assert.throws(() => f.release(0, 1, unpublished), /uploading conversation history/);
-  const saved = f.publish(0, 1);
   assert.throws(() => f.release(1, 1, saved.value.digest), /ownership changed/);
   assert.throws(() => f.release(0, 2, saved.value.digest), /ownership changed/);
   assert.throws(() => f.release(0, 1, unpublished), /uploading conversation history/);
@@ -183,8 +184,8 @@ test('active reservations survive restart, block handoff, and can only be ended 
   assert.match(first.run_token, /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
   assert.throws(() => begin(0), /already has a running task/);
   assert.throws(() => begin(1), /this computer/);
-  const requested = f.ask(1); assert.equal(requested.busy, 1);
   const saved = f.publish(0, 1);
+  const requested = f.ask(1); assert.equal(requested.busy, 1);
   assert.throws(() => f.release(0, 1, saved.value.digest), /still running/);
   assert.throws(() => end(1), /ownership changed/);
   assert.throws(() => end(0, 2), /ownership changed/);
@@ -292,4 +293,19 @@ test('migration keeps an old busy row recoverable but subsequent runs require th
   assert.equal(restored.busy, 1); assert.equal(restored.run_token, begun.run_token);
   assert.deepEqual(request(0, 'history-end', { runToken: null }), begun);
   assert.equal(request(0, 'history-end', { runToken: begun.run_token }).busy, 0);
+});
+
+test('unpublished peer histories cannot reserve a transfer and only its requester can cancel without changing the active run', t => {
+  const f = fixture(t); f.claim(0);
+  const active = f.request(0, 'history-begin', { machine, id: f.id, epoch: 1 });
+  assert.throws(() => f.ask(1), /not uploaded/);
+  assert.deepEqual(f.request(0, 'history-owners', { machine }).owners[0], active);
+  f.publish(0, 1); const requested = f.ask(1);
+  for (const client of [0, 2]) assert.throws(() => f.request(client, 'history-cancel-request', { machine, id: f.id }), /Only the requesting computer/);
+  assert.deepEqual(f.request(0, 'history-owners', { machine }).owners[0], requested);
+  const cancelled = f.request(1, 'history-cancel-request', { machine, id: f.id });
+  assert.equal(cancelled.requested, null); assert.equal(cancelled.requested_name, null);
+  assert.equal(cancelled.owner, active.owner); assert.equal(cancelled.epoch, active.epoch);
+  assert.equal(cancelled.busy, active.busy); assert.equal(cancelled.run_token, active.run_token);
+  assert.deepEqual(f.verify(0, 1), cancelled);
 });

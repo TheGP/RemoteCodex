@@ -134,6 +134,23 @@ async function main() {
     const selection = registry && providerSdk.resolveInitialModelSelection({ configuredDefault: runtime.configuredDefaultModelSelection, registry });
     return { models, defaultModelSelection: selection?.selection || null };
   }
+  async function accountUsage(modelSelection) {
+    const selection = modelSelection || catalog().defaultModelSelection;
+    const provider = selection && runtime.runtime.registryService.getProvider(selection.providerId);
+    const access = provider?.config.access;
+    if (!provider || !provider.models.some(model => model.modelId === selection.modelId)) throw new Error('Select an available ZCode model and reopen usage.');
+    if (access?.type !== 'zhipu-account' || access.mode !== 'individual-coding-plan') return { usageMessage: 'ZCode quota is available for individual Coding Plan models.' };
+    return readZCodeUsage({
+      family: access.accountType,
+      authenticate: async (abortSignal, expectedAccountScope) => {
+        const result = await runtime.providerRuntimeHeadersPort.refreshBeforeModelRequest({
+          providerId: selection.providerId, modelId: selection.modelId, accountAccess: access,
+          reason: 'initial', abortSignal, expectedAccountScope
+        });
+        return result.requestAuth;
+      }
+    });
+  }
   function validWorkspace(workspace) {
     if (!workspace || workspace.workspaceIdentity || workspace.remoteSessionId || typeof workspace.workspacePath !== 'string' || !path.isAbsolute(workspace.workspacePath) || workspace.workspaceKey !== workspace.workspacePath) return false;
     try { return fs.realpathSync(workspace.workspacePath) === fs.realpathSync(cwd); } catch { return false; }
@@ -223,6 +240,13 @@ async function main() {
     catch { close(1, 'Invalid ZCode client protocol data.'); return; }
     if (message.method === 'remote-codex/catalog') {
       if (message.id !== undefined) writeParent({ id: message.id, result: catalog() });
+      return;
+    }
+    if (message.method === 'remote-codex/usage' && message.id !== undefined) {
+      accountUsage(message.params?.modelSelection).then(
+        result => { if (!disposed) writeParent({ id: message.id, result }); },
+        error => { if (!disposed) writeParent({ id: message.id, error: { code: -32000, message: error.message } }); }
+      );
       return;
     }
     if (typeof message.method === 'string' && message.method.startsWith('remote-codex/')) {

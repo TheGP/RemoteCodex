@@ -1,7 +1,7 @@
 const readline = require('node:readline');
 const { randomUUID, createHash } = require('node:crypto');
 
-const sessions = new Map(), subscriptions = new Map(), uploads = new Map();
+const sessions = new Map(), subscriptions = new Map(), uploads = new Map(), deferredEdits = new Map();
 const at = 1_763_000_000_000;
 let ordinal = 0;
 const write = message => process.stdout.write(JSON.stringify(message) + '\n');
@@ -24,7 +24,7 @@ function snapshot(sessionId, title = 'Fixture conversation') {
 const old = snapshot('history-session');
 old.rows.window = [
   row(1, 'history-turn', 'turnHeader', { origin: 'userInput', executionKind: 'agent', sourceCommandId: 'old-command', state: 'completedSuccess', startedAt: at, endedAt: at + 3 }),
-  row(2, 'history-turn', 'userInput', { text: 'Saved question', origin: 'realUser', sourceCommandId: 'old-command' }),
+  row(2, 'history-turn', 'userInput', { text: 'Saved question', origin: 'realUser', sourceCommandId: 'old-command', actions: { canEdit: true, editDisposition: 'rewind' }, attachments: [{ attachmentId: 'original-image', name: 'original.png', mimeType: 'image/png' }] }),
   row(3, 'history-turn', 'assistantText', { text: 'Saved answer', state: 'complete' })
 ];
 old.rows.totalCount = 3; old.rows.firstRowId = 1; sessions.set(old.sessionId, old);
@@ -58,6 +58,7 @@ function delta(sessionId, operations, fragments = false) {
   const value = sessions.get(sessionId), from = value.seq;
   for (const operation of operations) {
     if (operation.op === 'state.updated') Object.assign(value, operation.patch);
+    else if (operation.op === 'row.removed') value.rows.window = value.rows.window.filter(row => row.rowId < operation.fromRowId);
     else if (operation.op === 'row.appended') value.rows.window.push(operation.row);
     else if (operation.op === 'row.upserted') { const index = value.rows.window.findIndex(entry => entry.rowId === operation.row.rowId); if (index >= 0) value.rows.window[index] = operation.row; }
     else if (operation.op === 'row.delta') {
@@ -81,20 +82,36 @@ function command(request) {
     const id = payload.sessionId || 'created-session'; sessions.set(id, snapshot(id, 'New conversation'));
     return ack(request, envelope, { type: 'createSession', sessionId: id });
   }
-  if (envelope.type === 'sendText') {
+  if (envelope.type === 'sendText' || envelope.type === 'editUserQuery') {
+    const editing = envelope.type === 'editUserQuery', text = editing ? payload.newText : payload.text;
+    let attachments = payload.attachments;
+    const first = Math.max(value.nextRowId || 0, ...value.rows.window.map(entry => entry.rowId)) + 1;
+    if (editing) {
+      const user = value.rows.window.find(entry => entry.rowId === payload.target.rowId && entry.entityId === payload.target.entityId);
+      const latest = value.rows.window.findLast(entry => entry.kind === 'userInput' && entry.origin === 'realUser');
+      if (!user || user !== latest || user.actions?.canEdit !== true) return respond(request, { commandId: envelope.commandId, status: 'rejected', revisionAtDecision: value.revision, reasonCode: 'guard.latestQueryEditOnly' });
+      attachments ??= user.attachments;
+      if (text === 'reject edit') return respond(request, { commandId: envelope.commandId, status: 'rejected', revisionAtDecision: value.revision, reasonCode: 'guard.auth', message: 'Sign in through ZCode before editing.' });
+      const header = value.rows.window.find(entry => entry.kind === 'turnHeader' && entry.turnId === user.turnId);
+      delta(envelope.sessionId, [{ op: 'row.removed', fromRowId: header.rowId }]);
+      if (text === 'fail edit after cut') return respond(request, { commandId: envelope.commandId, status: 'failed', revisionAtDecision: value.revision, reasonCode: 'fault.command.executionFailed', message: 'Edit interrupted after branch change' });
+    }
     if (payload.text === 'reject this input') return respond(request, { commandId: envelope.commandId, status: 'rejected', revisionAtDecision: value.revision, reasonCode: 'guard.fixture', message: 'Fixture rejected input' });
-    ack(request, envelope, { type: 'inputAccepted', delivery: payload.text === 'queue this input' ? 'queue' : 'startNow', inputId: 'input-' + envelope.commandId });
+    ack(request, envelope, editing ? { type: 'editUserQuery', disposition: 'rewind', sessionId: envelope.sessionId } : { type: 'inputAccepted', delivery: text === 'queue this input' ? 'queue' : 'startNow', inputId: 'input-' + envelope.commandId });
+    if (editing && text === 'queue edited input') return delta(envelope.sessionId, [{ op: 'state.updated', patch: { queue: { items: [{ sourceCommandId: envelope.commandId, queueItemId: 'queue_' + envelope.commandId, text }], autoDrain: false } } }]);
     if (payload.text === 'queue this input') return;
-    const turnId = 'turn-' + envelope.commandId, first = Math.max(0, ...value.rows.window.map(entry => entry.rowId)) + 1;
+    const turnId = 'turn-' + envelope.commandId;
+    value.nextRowId = first + 2;
     const control = { ...value.control, phase: 'running', sessionEnded: false, canStop: true, stopState: 'stoppable', activeWorks: [{ kind: 'primaryTurn', foregroundExecutionId: turnId, sourceCommandId: envelope.commandId, startedAt: at }] };
-    setTimeout(() => {
+    const publish = () => {
       delta(envelope.sessionId, [
+        ...value.rows.window.filter(entry => entry.kind === 'userInput' && entry.actions?.canEdit).map(entry => ({ op: 'row.upserted', row: { ...entry, actions: {} } })),
         { op: 'row.appended', row: row(first, turnId, 'turnHeader', { origin: 'userInput', executionKind: 'agent', sourceCommandId: envelope.commandId, state: 'running', startedAt: at }) },
-        { op: 'row.appended', row: row(first + 1, turnId, 'userInput', { text: payload.text, origin: 'realUser', sourceCommandId: envelope.commandId, ...(payload.attachments ? { attachments: payload.attachments } : {}) }) },
+        { op: 'row.appended', row: row(first + 1, turnId, 'userInput', { text, origin: 'realUser', sourceCommandId: envelope.commandId, actions: { canEdit: true, editDisposition: 'rewind' }, ...(attachments ? { attachments } : {}) }) },
         { op: 'state.updated', patch: { control, inputRouting: { mode: 'enqueue' } } }
       ]);
-      if (payload.text === 'hold this input') return;
-      if (payload.text === 'fail after admission') {
+      if (text === 'hold this input') return;
+      if (text === 'fail after admission') {
         delta(envelope.sessionId, [
           { op: 'row.upserted', row: { ...value.rows.window.find(entry => entry.rowId === first), state: 'failed', endedAt: at + 10 } },
           { op: 'state.updated', patch: { control: { ...control, phase: 'error', sessionEnded: false, canStop: false, stopState: 'idle', activeWorks: [], lastError: { code: 'fixture.provider', message: 'Fixture provider request failed', recoverable: false, at: at + 10, source: 'provider' } }, inputRouting: { mode: 'startNow' } } }
@@ -105,7 +122,9 @@ function command(request) {
       delta(envelope.sessionId, [{ op: 'row.appended', row: assistant }]);
       delta(envelope.sessionId, [{ op: 'row.delta', rowId: assistant.rowId, path: 'text', append: ' 世界🙂' }]);
       delta(envelope.sessionId, [{ op: 'row.upserted', row: { ...assistant, state: 'complete' } }, { op: 'row.upserted', row: { ...value.rows.window.find(entry => entry.rowId === first), state: 'completedSuccess', endedAt: at + 10 } }, { op: 'state.updated', patch: { control: { ...control, phase: 'completedSuccess', sessionEnded: true, canStop: false, stopState: 'idle', activeWorks: [] }, inputRouting: { mode: 'startNow' } } }]);
-    }, 10);
+    };
+    if (editing && text === 'wait for edit projection') deferredEdits.set(envelope.sessionId, publish);
+    else setTimeout(publish, 10);
     return;
   }
   if (envelope.type === 'stop') {
@@ -128,6 +147,10 @@ function command(request) {
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const request = JSON.parse(line); process.send?.({ request });
   if (request.method === 'runtime/capabilities') return respond(request, { protocolVersion: 4, independentPlanState: true, historyFirst: true });
+  if (request.method === 'remote-codex/usage') return respond(request, {
+    rateLimits: { limitId: 'zcode', primary: { usedPercent: 35, windowDurationMins: 300, resetsAt: 1800000000 } },
+    plan: { name: 'GLM Coding Plan', expiresAt: 1800010000 }
+  });
   if (request.method === 'remote-codex/catalog') return respond(request, { models: [{ providerId: 'fixture', providerName: 'Fixture', modelId: 'model-a', modelName: 'Fixture Model', reasoningLevels: ['low', 'high'], defaultReasoningLevel: 'high' }], defaultModelSelection: { providerId: 'fixture', modelId: 'model-a', options: { reasoningLevel: 'high' } } });
   if (request.method === 'session/list') return respond(request, { sessions: [...sessions.values()].map(value => ({ sessionId: value.sessionId, title: value.meta.title, titleSource: value.meta.titleSource, createdAt: at, updatedAt: at + 100, status: value.control.phase === 'running' ? 'running' : 'idle', mode: value.config.mode, model: value.config.modelSelection, sessionKind: 'interactive', workspace: { workspacePath: process.cwd(), workspaceKey: process.cwd() } })) });
   if (request.method === 'v4/conversation/subscribe' || request.method === 'v4/conversation/resync') {
@@ -166,6 +189,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
 });
 process.on('message', control => {
   const value = sessions.get(control.sessionId || 'history-session');
+  if (control.action === 'publish-edit') { const publish = deferredEdits.get(value.sessionId); deferredEdits.delete(value.sessionId); return publish?.(); }
   if (control.action === 'close') return process.exit(0);
   if (control.action === 'gap') {
     value.seq += 3;

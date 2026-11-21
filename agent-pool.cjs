@@ -43,6 +43,7 @@ class AgentPool extends EventEmitter {
     this.launchOptions = []; this.recovering = null; this.attempts = new Map(); this.configuration = null;
     this.session = null; this.generation = 0; this.machine = null;
     this.threadAliases = new Map(); this.threadOrigins = new Map();
+    this.projects = new Map();
   }
   setThreadAliases(records) {
     const previous = JSON.stringify([...this.threadAliases]);
@@ -98,10 +99,21 @@ class AgentPool extends EventEmitter {
   turn(provider, turn) { return turn ? { ...turn, id: agentId(provider, 'turn', turn.id), ...(turn.items ? { items: turn.items.map(item => this.item(provider, item)) } : {}) } : turn; }
   thread(provider, thread) {
     if (!thread) return thread;
-    return { ...thread, provider, id: this.threadIdentity(provider, thread.id), projectId: agentId(provider, 'project', thread.projectId), ...(thread.model ? { model: agentId(provider, 'model', thread.model) } : {}), ...(thread.turns ? { turns: thread.turns.map(turn => this.turn(provider, turn)) } : {}) };
+    let projectId = agentId(provider, 'project', thread.projectId);
+    if (!projectId && !this.supports('project/list', provider) && thread.cwd) {
+      const normalize = value => value.replace(/\\/g, '/').replace(/\/+$/, '').replace(/^([A-Z]):/, (_, drive) => drive.toLowerCase() + ':');
+      const cwd = normalize(thread.cwd), matches = [...this.projects.values()].filter(project => typeof project.roots?.[0]?.path === 'string' && normalize(project.roots[0].path) === cwd);
+      if (matches.length === 1) projectId = matches[0].id;
+    }
+    return { ...thread, provider, id: this.threadIdentity(provider, thread.id), projectId, ...(thread.model ? { model: agentId(provider, 'model', thread.model) } : {}), ...(thread.turns ? { turns: thread.turns.map(turn => this.turn(provider, turn)) } : {}) };
   }
-  project(provider, project) { return project ? { ...project, provider, id: agentId(provider, 'project', project.id) } : project; }
-  result(provider, method, result) {
+  project(provider, project, remember = true) {
+    if (!project) return project;
+    const mapped = { ...project, provider, id: agentId(provider, 'project', project.id) };
+    if (remember) this.projects.set(mapped.id, mapped);
+    return mapped;
+  }
+  result(provider, method, result, rememberProjects = true) {
     if (!result) return result;
     const mapped = { ...result };
     if (result.thread) mapped.thread = this.thread(provider, result.thread);
@@ -110,7 +122,7 @@ class AgentPool extends EventEmitter {
     if (result.reviewThreadId) mapped.reviewThreadId = agentId(provider, 'thread', result.reviewThreadId);
     if (Array.isArray(result.data)) mapped.data = result.data.filter(value => method !== 'thread/list' || provider !== 'codex' || !this.threadAliases.has(this.threadIdentity(provider, value.id)) || this.threadAliases.get(this.threadIdentity(provider, value.id)) === value.id).map(value => {
       if (method === 'thread/list') return this.thread(provider, value);
-      if (method === 'project/list') return this.project(provider, value);
+      if (method === 'project/list') return this.project(provider, value, rememberProjects);
       if (method === 'thread/turns/list') return this.turn(provider, value);
       if (method === 'thread/items/list') return this.item(provider, value);
       if (method === 'thread/items/read') return { ...value, turnId: agentId(provider, 'turn', value.turnId), item: this.item(provider, value.item) };
@@ -238,6 +250,7 @@ class AgentPool extends EventEmitter {
   }
   async call(method, params = {}, timeout, context = {}) {
     const session = this.session;
+    if (method === 'thread/list' && params.projectId && !params.provider && this.projects.has(params.projectId) && (!context.provider || context.provider === agentTarget(params.projectId, 'project').provider)) return this.list(method, params, timeout);
     if (['thread/list', 'project/list'].includes(method) && !params.provider && !context.provider && (params.projectId === undefined || params.projectId === null)) return this.list(method, params, timeout);
     if (['model/list', 'collaborationMode/list'].includes(method) && !params.provider && !context.provider) {
       const entries = [...this.connections].filter(([, connection]) => connection.ready && connection.supports(method));
@@ -253,35 +266,67 @@ class AgentPool extends EventEmitter {
     return this.result(provider, method, await connection.call(method, native, timeout));
   }
   async list(method, params, timeout) {
-    const entries = [...this.connections].filter(([, connection]) => connection.ready && connection.supports(method));
+    const projectProvider = method === 'thread/list' && params.projectId ? agentTarget(params.projectId, 'project').provider : null;
+    const entries = [...this.connections].filter(([id, connection]) => connection.ready && connection.supports(method) && (!projectProvider || id === projectProvider || !connection.supports('project/list')));
     if (!this.ready) throw new Error('Connect to a coding agent first.');
-    if (entries.length === 1 && !String(params.cursor || '').startsWith('agents:')) {
+    const filterFolders = method === 'thread/list' && Object.hasOwn(params, 'projectId') && entries.some(([, connection]) => !connection.supports('project/list'));
+    const historySource = 'codex:history';
+    const codex = method === 'thread/list' && params.searchTerm && !Object.hasOwn(params, 'projectId') && entries.find(([id, connection]) => id === 'codex' && connection.supports('thread/search'))?.[1];
+    if (codex) entries.push([historySource, codex]);
+    if (entries.length === 1 && method !== 'project/list' && !projectProvider && !filterFolders && !String(params.cursor || '').startsWith('agents:')) {
       const [id, connection] = entries[0];
       return this.result(id, method, await connection.call(method, params, timeout));
     }
     const signature = JSON.stringify([method, { ...params, cursor: undefined }, entries.map(([id]) => id)]);
     let previous = params.cursor ? this.pages.get(params.cursor) : null;
     if (params.cursor && (!previous || previous.signature !== signature)) throw new Error('Conversation list expired. Refresh the list.');
-    const state = previous ? { ...previous, buffers: new Map([...previous.buffers].map(([id, values]) => [id, [...values]])), cursors: new Map(previous.cursors), ended: new Set(previous.ended), failures: new Map(previous.failures) } : { signature, buffers: new Map(), cursors: new Map(), ended: new Set(), failures: new Map(), session: this.session };
+    const state = previous ? { ...previous, buffers: new Map([...previous.buffers].map(([id, values]) => [id, [...values]])), cursors: new Map(previous.cursors), ended: new Set(previous.ended), failures: new Map(previous.failures), projectIds: new Map([...previous.projectIds].map(([id, ids]) => [id, new Set(ids)])) } : { signature, buffers: new Map(), cursors: new Map(), ended: new Set(), failures: new Map(), session: this.session, projectIds: new Map(), projectBaseline: new Map(this.projects), projectScan: {} };
+    if (method === 'project/list' && !previous) this.projectScan = state.projectScan;
+    const seenThreads = codex ? new Set(previous?.seenThreads) : null;
     const limit = params.limit || 50, data = [];
     while (data.length < limit) {
-      const results = await Promise.allSettled(entries.map(async ([id, connection]) => {
-        if (state.buffers.get(id)?.length || state.ended.has(id)) return;
+      const results = await Promise.allSettled(entries.map(async ([source, connection]) => {
+        if (state.buffers.get(source)?.length || state.ended.has(source)) return;
+        const searchHistory = source === historySource;
+        const id = searchHistory ? 'codex' : source;
         const seen = new Set();
         do {
-          const cursor = state.cursors.get(id) || null;
+          const cursor = state.cursors.get(source) || null;
           if (seen.has(cursor)) throw new Error('The agent repeated a list cursor.');
           seen.add(cursor);
-          const result = this.result(id, method, await connection.call(method, { ...params, cursor }, timeout));
-          state.buffers.set(id, result.data || []); state.cursors.set(id, result.nextCursor);
-          if (!result.nextCursor) state.ended.add(id);
-        } while (!state.buffers.get(id).length && !state.ended.has(id));
+          let response;
+          if (searchHistory) {
+            const { searchTerm, limit, sortKey, sortDirection } = params;
+            try { response = await connection.call('thread/search', { searchTerm, limit, sortKey, sortDirection, cursor }, timeout); }
+            catch (error) {
+              if (error.code !== -32601 && !/^(?:method not found\b|invalid request: unknown variant `thread\/search`)/i.test(error.message)) throw error;
+              state.ended.add(source); return;
+            }
+            response = { ...response, data: response.data.map(match => match.thread) };
+          } else {
+            const native = this.nativeParams(id, { ...params, cursor, ...(projectProvider ? { projectId: id === projectProvider ? params.projectId : null } : {}) });
+            response = await connection.call(method, native, timeout);
+          }
+          const currentCatalog = this.session === state.session && this.projectScan === state.projectScan;
+          const result = this.result(id, method, response, currentCatalog);
+          if (method === 'project/list') {
+            const seen = state.projectIds.get(id) || new Set();
+            for (const project of result.data || []) seen.add(project.id);
+            state.projectIds.set(id, seen);
+            if (!result.nextCursor && currentCatalog) for (const [key, project] of state.projectBaseline) if (project.provider === id && !seen.has(key) && this.projects.get(key) === project) this.projects.delete(key);
+          }
+          const rows = method === 'thread/list' && Object.hasOwn(params, 'projectId') ? result.data.filter(thread => (thread.projectId || null) === (params.projectId || null)) : result.data || [];
+          state.buffers.set(source, rows); state.cursors.set(source, result.nextCursor);
+          if (!result.nextCursor) state.ended.add(source);
+        } while (!state.buffers.get(source).length && !state.ended.has(source));
       }));
       if (this.session !== state.session) throw new Error('The agent connections changed.');
       results.forEach((result, index) => {
         if (result.status !== 'rejected') return;
-        const id = entries[index][0];
-        state.failures.set(id, this.failure(id, method, result.reason)); state.ended.add(id);
+        const source = entries[index][0];
+        const searchHistory = source === historySource;
+        state.failures.set(source, this.failure(searchHistory ? 'codex' : source, searchHistory ? 'thread/search' : method, result.reason));
+        state.ended.add(source);
       });
       if (entries.length && state.failures.size === entries.length && !data.length) throw results.find(result => result.status === 'rejected').reason;
       const available = entries.filter(([id]) => state.buffers.get(id)?.length);
@@ -289,10 +334,15 @@ class AgentPool extends EventEmitter {
       const sortKey = ({ updated_at: 'updatedAt', created_at: 'createdAt' })[params.sortKey] || params.sortKey || (method === 'project/list' ? 'position' : 'updatedAt');
       const direction = params.sortDirection === 'asc' || !params.sortDirection && sortKey === 'position' ? 1 : -1;
       available.sort(([a], [b]) => direction * ((state.buffers.get(a)[0][sortKey] || 0) - (state.buffers.get(b)[0][sortKey] || 0)));
-      data.push(state.buffers.get(available[0][0]).shift());
+      const row = state.buffers.get(available[0][0]).shift();
+      if (!seenThreads?.has(row.id)) {
+        data.push(row);
+        seenThreads?.add(row.id);
+      }
     }
     let nextCursor = null;
     if (entries.some(([id]) => state.buffers.get(id)?.length || !state.ended.has(id))) {
+      state.seenThreads = seenThreads;
       nextCursor = 'agents:' + randomUUID(); this.pages.set(nextCursor, state);
       while (this.pages.size > 256) this.pages.delete(this.pages.keys().next().value);
     }
@@ -303,6 +353,8 @@ class AgentPool extends EventEmitter {
   disconnect() {
     this.session = null; this.pages.clear(); this.connecting.clear(); this.attempts.clear(); this.launchOptions = []; this.recovering = null; this.configuration = null;
     this.threadAliases.clear(); this.threadOrigins.clear();
+    this.projects.clear();
+    this.projectScan = null;
     for (const connection of this.connections.values()) connection.disconnect();
     this.emit('disconnected');
   }

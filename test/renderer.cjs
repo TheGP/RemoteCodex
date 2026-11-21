@@ -41,6 +41,14 @@ async function checks() {
       savedPreferences.messagePins[machine][threadId] = pins;
     }
     if (patch.shortcuts) savedPreferences.shortcuts = structuredClone(patch.shortcuts);
+    if (patch.shortcutMove) {
+      check(Object.keys(patch).length === 1, 'Reordering submitted a stale shortcut snapshot');
+      const { id, targetId, after } = patch.shortcutMove;
+      const shortcut = savedPreferences.shortcuts.find(item => item.id === id);
+      const next = savedPreferences.shortcuts.filter(item => item !== shortcut);
+      const target = next.findIndex(item => item.id === targetId);
+      if (shortcut && target >= 0) { next.splice(target + Number(after), 0, shortcut); savedPreferences.shortcuts = next; }
+    }
     if (patch.startupProject) {
       const { machine, projectId } = patch.startupProject;
       if (projectId === null) delete savedPreferences.startupProjects[machine]; else savedPreferences.startupProjects[machine] = projectId;
@@ -261,6 +269,38 @@ async function checks() {
   $('error').hidden = true;
   results.push('retryable reconnecting warnings clear when the same turn resumes, while other chats, local output, newer errors, and permanent failures stay untouched');
 
+  {
+    const previousRpc = api.rpc, calls = [];
+    const oldChat = { id: 'cursor-old-chat', cwd: '/tmp' }, newChat = { id: 'cursor-new-chat', cwd: '/tmp' };
+    state.connected = true;
+    let failedMethod = null;
+    api.rpc = async (method, params) => {
+      calls.push({ method, params: structuredClone(params) });
+      if (method === failedMethod) throw new Error('Conversation changed while loading cached history.');
+      if (method === 'thread/read') return { thread: params.threadId === oldChat.id ? oldChat : newChat };
+      return { data: [{ id: params.threadId + (params.cursor ? '-older' : '-latest'), status: 'completed', items: [{ id: params.threadId + (params.cursor ? '-older-reply' : '-latest-reply'), type: 'agentMessage', text: 'Loaded conversation' }] }], nextCursor: params.cursor ? null : params.threadId + '-cursor' };
+    };
+    try {
+      for (const method of ['thread/read', 'thread/turns/list']) {
+        await openThread(oldChat);
+        check(state.turnCursor === oldChat.id + '-cursor' && !$('older-turns').hidden, 'Cursor regression did not load its first history page');
+        failedMethod = method;
+        const failure = await openThread(newChat).catch(error => error);
+        check(failure.message.includes('Conversation changed') && state.historyLoadFailed && state.turnCursor === null && $('older-turns').hidden, 'A failed conversation load kept another chat’s history cursor or pagination button');
+        const before = calls.length; await loadOlderTurns();
+        check(calls.length === before, 'Failed history loading sent the old cursor to another conversation');
+        failedMethod = null; await openThread(newChat);
+        await loadOlderTurns();
+        check(calls.at(-1).params.threadId === newChat.id && calls.at(-1).params.cursor === newChat.id + '-cursor' && state.items.has(newChat.id + '-older-reply'), 'Retrying failed history did not use its newly loaded cursor');
+      }
+      await openThread(newChat); failedMethod = 'thread/read';
+      await openThread(newChat, true, true).catch(() => {});
+      const before = calls.length; await loadOlderTurns();
+      check(state.turnCursor === null && $('older-turns').hidden && calls.length === before, 'A failed same-conversation refresh kept its obsolete rollout cursor');
+    } finally { api.rpc = previousRpc; resetThread(); }
+  }
+  results.push('failed history loads and same-chat refreshes clear obsolete pagination cursors; retries load and page only the correct conversation');
+
   state.connected = true;
   const thread = { id: 'renderer-review', cwd: '/tmp', preview: 'Renderer test', updatedAt: 1 };
   let resolveHistory;
@@ -285,6 +325,7 @@ async function checks() {
   check(state.items.get('command').item.aggregatedOutput === '/tmp\n', 'History duplicated or dropped tool output');
   check(!state.active.has(thread.id), 'History resurrected a completed turn');
   results.push('history merges old and new stream events once');
+
 
   handleNotification({ id: 'question', method: 'item/tool/requestUserInput', params: { threadId: thread.id, questions: [{ id: 'choice', question: 'Which option?', options: [{ label: 'A', description: 'First option' }] }] } });
   const input = $('requests').querySelector('input');
@@ -659,8 +700,8 @@ async function checks() {
   await addImages([imageFile]);
   await waitImages();
   const sent = [];
-  api.rpc = async (method, params) => {
-    sent.push({ method, params });
+  api.rpc = async (method, params, context) => {
+    sent.push({ method, params, context });
     if (method === 'thread/start') return { thread };
     if (method === 'turn/start') return { turn: { id: 'image-turn', status: 'completed' } };
     return { data: [], nextCursor: null };
@@ -669,6 +710,7 @@ async function checks() {
   check(sent[0].params.approvalPolicy === 'never' && sent[0].params.sandbox === 'danger-full-access', 'New thread did not get full access');
   check(sent[1].params.approvalPolicy === 'never' && sent[1].params.sandboxPolicy.type === 'dangerFullAccess', 'Turn did not get full access');
   check(sent[1].params.input.length === 1 && sent[1].params.input[0].url === png, 'Image-only message was not sent as an image');
+  check(sent[1].context.repairReasoning === true && !Object.hasOwn(sent[1].params, 'repairReasoning'), 'Explicit Send did not permit repair separately from the native turn payload');
   check(!state.images.length && $('messages').querySelector('.message-image'), 'Sent image is missing or draft was not cleared');
   const before = sent.length;
   await send(); check(sent.length === before, 'Empty message was sent');
@@ -696,8 +738,8 @@ async function checks() {
   const queueCalls = [];
   let sequence = 0;
   const settle = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
-  api.rpc = async (method, params) => {
-    queueCalls.push({ method, params });
+  api.rpc = async (method, params, context) => {
+    queueCalls.push({ method, params, context });
     if (method === 'turn/start') return { turn: { id: `queued-${++sequence}`, status: 'inProgress' } };
     if (method === 'turn/steer') return { turnId: params.expectedTurnId };
     return { data: [], nextCursor: null };
@@ -712,6 +754,7 @@ async function checks() {
   await settle();
   let starts = queueCalls.filter(call => call.method === 'turn/start');
   check(starts.length === 1 && starts[0].params.threadId === threadA.id && starts[0].params.input[0].text === 'First follow-up', 'Queue crossed threads or changed order');
+  check(starts[0].context.repairReasoning !== true, 'Background queue draining permitted automatic history repair');
   check(!$('messages').textContent.includes('First follow-up'), 'Background queued message appeared in another chat');
   handleNotification({ method: 'turn/completed', params: { threadId: threadA.id, turn: { id: 'original-a', status: 'completed' } } });
   await settle();
@@ -799,6 +842,80 @@ async function checks() {
   resolveStart({ turn: { id: 'fast-turn', status: 'inProgress' } }); await fast;
   check(!state.active.has(threadA.id), 'Late turn/start response resurrected a finished turn');
   results.push('failed queued sends pause with their drafts intact and early completion cannot resurrect a turn');
+
+  {
+    const previousRpc = api.rpc, options = state.options;
+    const calls = []; let latest, hold, release;
+    const queueFor = (id, paused = true) => {
+      state.finished.delete(id); state.active.set(threadA.id, id); state.owned.add(threadA.id);
+      threadA.status = { type: 'active' };
+      const message = { draftId: crypto.randomUUID(), text: 'Recovery follow-up', images: [], input: [{ type: 'text', text: 'Recovery follow-up' }], access: policy(), mode: 'default', model: $('model').value, effort: $('effort').value, machine: accessKey(), thread: threadA };
+      const queue = { key: queueKey(threadA.id), machine: accessKey(), thread: threadA, messages: [message], paused };
+      state.queues.clear(); state.queues.set(queue.key, queue); renderQueue(); return queue;
+    };
+    api.rpc = async (method, params, context) => {
+      calls.push({ method, params: structuredClone(params), context });
+      if (method === 'thread/turns/list') {
+        check(params.limit === 1 && params.itemsView === 'notLoaded', 'Queue recovery requested full message history');
+        if (hold) return new Promise(resolve => { release = () => resolve({ data: [latest], nextCursor: null }); });
+        return { data: [latest], nextCursor: null };
+      }
+      if (method === 'turn/start') return { turn: { id: 'recovered-follow-up-' + calls.length, status: 'inProgress' } };
+      return { data: [], nextCursor: null };
+    };
+    setThread(threadA); $('prompt').value = 'Keep my typed recovery draft'; $('prompt').focus(); $('prompt').setSelectionRange(5, 5);
+    let queue = queueFor('missing-terminal-failure', false);
+    latest = { id: 'missing-terminal-failure', status: 'failed', items: [] };
+    handleNotification({ method: 'error', params: { threadId: threadA.id, turnId: latest.id, willRetry: false, error: { message: 'Native task failed' } } });
+    handleNotification({ method: 'thread/status/changed', params: { threadId: threadA.id, status: { type: 'idle' } } }); await settle();
+    check(!state.active.has(threadA.id) && queue.paused && queue.messages.length === 1 && !calls.some(call => call.method === 'turn/start'), 'Idle recovery lost or automatically retried an uncertain queued send');
+    check([...$('queued-messages').querySelectorAll('button')].some(button => button.textContent === 'Retry') && ![...$('queued-messages').querySelectorAll('button')].some(button => button.textContent === 'Steer'), 'A recovered idle task still offered Steer instead of Retry');
+    check($('prompt').value === 'Keep my typed recovery draft' && document.activeElement === $('prompt') && $('prompt').selectionStart === 5, 'Queue reconciliation changed the draft or keyboard focus');
+    await retryQueue(queue); await settle();
+    check(!queue.messages.length && calls.filter(call => call.method === 'turn/start').length === 1, 'Explicit Retry did not submit the preserved queued message exactly once');
+    check(calls.find(call => call.method === 'turn/start').context.repairReasoning === true, 'Explicit Retry did not permit history repair');
+    queue = queueFor('missing-terminal-success', false); latest = { id: 'missing-terminal-success', status: 'completed', items: [] };
+    handleNotification({ method: 'thread/status/changed', params: { threadId: threadA.id, status: { type: 'idle' } } }); await settle();
+    check(!queue.messages.length && calls.filter(call => call.method === 'turn/start').length === 2, 'A positively verified missed completion left a normal unsent follow-up stuck');
+    check(calls.filter(call => call.method === 'turn/start')[1].context.repairReasoning !== true, 'Idle recovery permitted automatic history repair');
+    queue = queueFor('old-idle-check'); latest = { id: 'old-idle-check', status: 'completed', items: [] }; hold = true;
+    handleNotification({ method: 'thread/status/changed', params: { threadId: threadA.id, status: { type: 'idle' } } }); await settle();
+    handleNotification({ method: 'turn/started', params: { threadId: threadA.id, turn: { id: 'newer-running-turn' } } });
+    release(); await settle();
+    check(state.active.get(threadA.id) === 'newer-running-turn' && queue.paused && queue.messages.length === 1 && calls.filter(call => call.method === 'turn/start').length === 2, 'An older idle response cleared or submitted over a newer native turn');
+    queue = queueFor('check-before-question'); latest = { id: 'check-before-question', status: 'completed', items: [] };
+    handleNotification({ method: 'thread/status/changed', params: { threadId: threadA.id, status: { type: 'idle' } } }); await settle();
+    handleNotification({ id: 'recovery-question', method: 'item/tool/requestUserInput', params: { threadId: threadA.id, turnId: 'question-turn', questions: [{ id: 'answer', question: 'Still waiting for an answer?' }] } });
+    release(); await settle();
+    check(state.requests.has('recovery-question') && state.active.has(threadA.id) && queue.paused, 'An older idle check hid a newly received unanswered question');
+    hold = false; latest = { id: 'question-turn', status: 'inProgress', items: [] };
+    await retryQueue(queue); await settle();
+    check(state.active.get(threadA.id) === 'question-turn' && state.requests.has('recovery-question') && queue.messages.length === 1 && calls.filter(call => call.method === 'turn/start').length === 2, 'Retry bypassed a real running question or duplicated its queued message');
+    state.requests.clear(); renderRequests();
+    queue = queueFor('old-machine-check'); latest = { id: 'old-machine-check', status: 'completed', items: [] }; hold = true;
+    handleNotification({ method: 'thread/status/changed', params: { threadId: threadA.id, status: { type: 'idle' } } }); await settle();
+    state.options = { ...options, host: 'different-machine' }; release(); await settle();
+    check(state.active.get(threadA.id) === 'old-machine-check' && queue.paused && calls.filter(call => call.method === 'turn/start').length === 2, 'A stale machine response changed the current active turn or sent a queued draft');
+    state.options = options; hold = false;
+    for (const terminal of ['failed', 'interrupted']) {
+      queue = queueFor('retry-reconcile-' + terminal);
+      latest = { id: 'retry-reconcile-' + terminal, status: terminal, items: [] };
+      const before = calls.filter(call => call.method === 'turn/start').length;
+      await retryQueue(queue); await settle();
+      check(!queue.messages.length && calls.filter(call => call.method === 'turn/start').length === before + 1, 'Retry required a second click after reconciling ' + terminal);
+    }
+    for (const cancel of [false, true]) {
+      queue = queueFor('joined-retry-' + cancel); latest = { id: 'joined-retry-' + cancel, status: 'failed', items: [] }; hold = true;
+      const before = calls.filter(call => call.method === 'turn/start').length;
+      const checking = reconcileActiveTurn(threadA.id); await settle();
+      const retrying = retryQueue(queue); await settle();
+      if (cancel) await pauseQueue(queue, 'requested');
+      release(); await checking; await retrying; await settle();
+      check(calls.filter(call => call.method === 'turn/start').length === before + (cancel ? 0 : 1) && queue.messages.length === (cancel ? 1 : 0), 'Retry joining an existing reconciliation lost its authorization or ignored cancellation');
+    }
+    state.options = options; state.queues.clear(); state.active.clear(); state.requests.clear(); activeChecks.clear(); $('prompt').value = ''; $('error').hidden = true; api.rpc = previousRpc;
+  }
+  results.push('idle notifications reconcile only the latest native turn, recover Retry and normal unsent queues, preserve uncertain drafts and focus, and fence newer turns, questions and machine switches');
 
   state.threads = [{ id: 'title-test', cwd: '/private/project', preview: 'PRIVATE PROMPT CONTENT', updatedAt: 1 }];
   state.pinnedIds.clear(); state.names.clear(); state.titling.clear(); state.titleRetries.clear();
@@ -1249,9 +1366,27 @@ async function checks() {
   check(resumeCount === 1, 'Concurrent sends attempted two writer acquisitions');
   resolveResume(); await Promise.all([firstResume, secondResume]);
   check(!state.resuming.size && state.owned.has('coalesced-writer'), 'Writer acquisition did not clear its pending request');
-  showError(new Error("Error invoking remote method 'rpc': Error: " + 'Long diagnostic '.repeat(60)));
-  check($('error-text').textContent.startsWith('Long diagnostic') && !$('error-text').textContent.includes('Error invoking') && $('error').getBoundingClientRect().height <= 32, 'Generic RPC error retained its wrapper or oversized layout');
-  $('error').hidden = true;
+  showError(new Error("Error invoking remote method 'rpc': Error: Short diagnostic"));
+  check($('error-text').textContent === 'Short diagnostic' && $('error').getBoundingClientRect().height <= 32, 'Short RPC error retained its wrapper or oversized layout');
+  const diagnosticMessage = 'Request failed. ' + 'Long diagnostic '.repeat(160) + '\nLast diagnostic line <img src=x onerror=alert(1)>';
+  const diagnosticRaw = "Error invoking remote method 'rpc': Error: " + JSON.stringify({ message: JSON.stringify({ error: { message: diagnosticMessage, code: 'context_length_exceeded' } }) });
+  showError(new Error(diagnosticRaw));
+  const errorText = $('error-text'), dismiss = $('dismiss-error');
+  check(errorText.textContent === diagnosticMessage + ' (context_length_exceeded)' && errorText.title === diagnosticRaw && !errorText.querySelector('img'), 'Structured error lost its readable message, code, raw diagnostics, or HTML safety');
+  check(errorText.scrollHeight > errorText.clientHeight && errorText.clientHeight <= 240 && $('error').getBoundingClientRect().height > 32, 'Long error was clipped without a bounded scroll area');
+  const dismissTop = dismiss.getBoundingClientRect().top;
+  errorText.scrollTop = errorText.scrollHeight;
+  check(errorText.scrollTop > 0 && dismiss.getBoundingClientRect().top === dismissTop, 'Error cannot scroll or its dismiss button moves with the text');
+  const previousErrorWidth = $('error').style.width;
+  $('error').style.width = '180px';
+  showError('x'.repeat(300) + '\nLast line');
+  check(errorText.scrollWidth <= errorText.clientWidth + 1 && errorText.textContent.endsWith('\nLast line') && dismiss.getBoundingClientRect().right <= $('error').getBoundingClientRect().right, 'Narrow errors overflowed, lost newlines, or hid the dismiss button');
+  check(errorText.scrollTop === 0, 'New error inherited the previous error scroll position');
+  $('error').style.width = previousErrorWidth;
+  showError('{malformed JSON');
+  check(errorText.textContent === '{malformed JSON', 'Malformed structured error lost its diagnostics');
+  dismiss.click(); check($('error').hidden, 'Error could not be dismissed');
+  results.push('errors unwrap nested JSON into safe message/code text, preserve raw diagnostics and newlines, wrap at narrow widths, scroll within a bounded height, reset scroll and keep dismiss visible');
   results.push('history browsing never claims writers; conflicts stay compact, preserve drafts, retry safely, and coalesce resume calls');
 
   resetThread(); state.active.clear(); state.owned.clear(); state.queues.clear(); modes.catalog = [];
@@ -1435,8 +1570,8 @@ async function checks() {
   let sourceTurns = structuredClone(initialSourceTurns);
   const branchCalls = []; let branchNumber = 0; let editedSubmission;
   const forks = new Map();
-  api.rpc = async (method, params) => {
-    branchCalls.push({ method, params });
+  api.rpc = async (method, params, context) => {
+    branchCalls.push({ method, params, context });
     if (method === 'thread/fork') {
       const thread = { ...branchSource, id: 'branch-' + ++branchNumber, projectId: null, forkedFromId: branchSource.id };
       forks.set(thread.id, { thread, turns: params.beforeTurnId === 'first-source-turn' ? [] : params.beforeTurnId ? sourceTurns.slice(0, 1) : sourceTurns });
@@ -1482,6 +1617,7 @@ async function checks() {
   await resendKeyboardSave; $('edit-message-form').onsubmit = resendSubmitHandler;
   check(!$('edit-message-dialog').open, 'Earlier-message editor stayed open after a successful Enter submission');
   check(branchCalls.filter(call => call.method === 'thread/revert').at(-1).params.beforeTurnId === 'second-source-turn' && branchNumber === 1, 'Edit forked a conversation instead of reverting the selected turn');
+  check(branchCalls.findLast(call => call.method === 'thread/revert').context?.repairReasoning === true && branchCalls.findLast(call => call.method === 'turn/start').context?.repairReasoning === true, 'Edit/resend did not request repair before reverting and sending');
   check(editedSubmission.threadId === branchSource.id && state.thread.id === branchSource.id && editedSubmission.input[0].text === 'Changed question $kept-skill', 'Edited prompt did not stay in the current conversation');
   check(editedSubmission.input.some(part => part.type === 'image' && part.url === png) && editedSubmission.input.some(part => part.type === 'skill' && part.path === '/source/kept-skill/SKILL.md'), 'Editing dropped original image or skill attachments');
   check($('messages').textContent.includes('First question') && !$('messages').textContent.includes('Original question'), 'Later history remained in the edited conversation');
@@ -1602,6 +1738,101 @@ async function checks() {
   check(!state.threads.some(thread => thread.id === 'stale-fork') && state.commandBusy, 'Delayed clone crossed connections or cleared a newer operation');
   state.commandBusy = false; state.options = { mode: 'local' };
   results.push('older prompts retain edit boundaries; steered messages stay grouped; failed reverts preserve drafts and stale clones cannot cross connections');
+
+  {
+    const provider = { id: 'zcode', name: 'ZCode', connected: true, methods: ['thread/read', 'thread/turns/list', 'thread/edit'] };
+    const thread = { id: 'agent:zcode:thread:editable-chat', provider: 'zcode', cwd: '/tmp' };
+    const turnId = 'agent:zcode:turn:latest', itemId = 'agent:zcode:item:query';
+    const prompt = { id: itemId, type: 'userMessage', canEdit: true, attachmentCount: 1, content: [{ type: 'text', text: 'Original query' }] };
+    const earlierPrompt = { ...prompt, id: 'earlier-zcode-query', canEdit: false };
+    let failure = 'Sign in through ZCode to continue.', calls = [];
+    let sent = false, savedEdit, history = 'both', copied;
+    const oldRpc = api.rpc, oldModels = state.models, oldCatalog = modes.catalog;
+    const oldOptions = state.options, oldModel = $('model').value, oldPermission = $('permissions').value;
+    const draftMethods = Object.fromEntries(['draft', 'lastDraft', 'saveDraft', 'clearDraft', 'editDrafts', 'copyText', 'moveDraft'].map(method => [method, api[method]]));
+    resetThread();
+    state.options = { mode: 'local', agents: [provider] };
+    state.models = []; modes.catalog = [];
+    renderModels();
+    setThread(thread); state.owned.add(thread.id);
+    api.draft = target => savedEdit?.target.itemId === target.itemId && target.kind === 'edit-message' ? savedEdit.draft : null;
+    api.lastDraft = () => savedEdit;
+    api.saveDraft = (target, draft) => { if (target.kind === 'edit-message') savedEdit = { target, draft }; };
+    api.clearDraft = target => { if (target.kind === 'edit-message') savedEdit = undefined; };
+    api.editDrafts = async id => id === thread.id && savedEdit ? [{ text: savedEdit.draft.text, updatedAt: Date.now() }] : [];
+    api.copyText = async text => { copied = text; };
+    activateComposerDraft();
+    api.rpc = async (method, params) => {
+      calls.push({ method, params });
+      if (method === 'thread/edit') {
+        if (failure) throw new Error(failure);
+        prompt.content = params.input;
+        sent = true;
+        return { thread, turn: { id: turnId, status: 'inProgress' } };
+      }
+      if (method === 'thread/read') return { thread };
+      if (method === 'thread/turns/list') {
+        const items = history === 'missing' ? [] : history === 'split' ? params.cursor ? [earlierPrompt] : [prompt] : [earlierPrompt, prompt];
+        return { data: [{ id: turnId, status: sent ? 'inProgress' : 'failed', items }], nextCursor: history === 'split' && !params.cursor ? 'earlier-page' : null };
+      }
+      throw new Error('Unexpected edit request ' + method);
+    };
+    const earlier = renderItem(earlierPrompt, false, turnId);
+    const latest = renderItem(prompt, false, turnId);
+    provider.connected = false; updateBusy();
+    check(earlier.label.querySelector('.edit-message').hidden && !latest.label.querySelector('.edit-message').disabled, 'ZCode hid its editable query after logout or exposed an unsupported earlier edit');
+    latest.label.querySelector('.edit-message').click();
+    $('edited-message').value = 'Retry the edited query';
+    await $('edit-message-form').onsubmit({ preventDefault() {} });
+    check($('edit-message-dialog').open && calls.length === 0, 'Unavailable ZCode attempted an edit or closed the editor');
+    provider.connected = true; renderModels();
+    await $('edit-message-form').onsubmit({ preventDefault() {} });
+    check($('edit-message-dialog').open && $('edited-message').value === 'Retry the edited query' && $('edit-message-error').textContent.includes('Sign in through ZCode'), 'A rejected ZCode edit lost the draft or hid the authentication error');
+    failure = "Error invoking remote method 'rpc': Error: Edit may have been submitted; check conversation history before retrying. Timeout.";
+    await $('edit-message-form').onsubmit({ preventDefault() {} });
+    check($('resend-message').disabled && $('cancel-message-edit').textContent === 'Check history', 'Unconfirmed ZCode edit could be resent before checking history');
+    history = 'missing';
+    $('prompt').value = 'Keep separate composer draft';
+    calls = [];
+    await $('edit-message-form').onsubmit({ preventDefault() {} });
+    await $('cancel-message-edit').onclick(); await settle();
+    check(calls.map(call => call.method).join(',') === 'thread/read,thread/turns/list' &&
+      !$('edit-message-dialog').open && savedEdit?.draft.text === 'Retry the edited query' && savedEdit.target.itemId === itemId,
+      'Checking history resent an uncertain edit or discarded its saved draft');
+    showThreadMenu(thread, 100, 100);
+    check(!$('recover-edit-drafts').hidden, 'The conversation menu did not expose saved edit recovery');
+    await $('recover-edit-drafts').onclick();
+    await $('copy-edit-draft').onclick();
+    check($('edit-drafts-dialog').open && $('edit-drafts-text').value === savedEdit.draft.text &&
+      copied === savedEdit.draft.text && $('prompt').value === 'Keep separate composer draft',
+      'Recovery did not expose the removed message draft independently of the composer');
+    $('close-edit-drafts').click();
+    const exactDraft = savedEdit;
+    savedEdit = { ...exactDraft, target: { ...exactDraft.target, itemId: turnId } };
+    api.moveDraft = () => { throw new Error('Partial turns must not migrate legacy edit drafts'); };
+    history = 'split';
+    await restoreLastDraft();
+    check(!$('edit-message-dialog').open && savedEdit.target.itemId === turnId && $('prompt').value === 'Keep separate composer draft',
+      'A draft was rebound before the full legacy turn was known');
+    history = 'both';
+    savedEdit = exactDraft;
+    await restoreLastDraft();
+    check($('edit-message-dialog').open && state.messageEdit.itemId === itemId && $('edited-message').value === 'Retry the edited query',
+      'Draft recovery picked the first message instead of the saved ZCode message');
+    check($('edited-message-attachments').textContent.includes('1 attachment'), 'The editor did not show the retained ZCode attachment');
+    $('edited-message').value = '';
+    failure = ''; calls = [];
+    await $('edit-message-form').onsubmit({ preventDefault() {} });
+    check(calls.map(call => call.method).join(',') === 'thread/edit,thread/read,thread/turns/list' &&
+      calls[0].params.beforeTurnId === turnId && calls[0].params.itemId === itemId &&
+      !$('edit-message-dialog').open && state.thread.id === thread.id && state.active.get(thread.id) === turnId &&
+      calls[0].params.input.length === 0 && !savedEdit, 'ZCode failed to submit an attachment-only edit exactly once or reload its replacement turn');
+    await settle();
+    Object.assign(api, draftMethods);
+    api.rpc = oldRpc; state.models = oldModels; modes.catalog = oldCatalog; state.options = oldOptions;
+    resetThread(); renderModels(); $('model').value = oldModel; $('permissions').value = oldPermission;
+  }
+  results.push('ZCode recovers removed edit drafts alongside composer drafts, leaves partial legacy turns unbound, restores exact edits, and resends attachment-only edits once');
 
   resetThread(); state.active.clear(); state.queues.clear(); state.names.clear(); state.titling.clear(); state.titleRetries.clear();
   const initialPromptText = 'Fix the project setup\nThen check the build and explain the changes. '.repeat(3).trim();
@@ -1927,6 +2158,7 @@ async function checks() {
   unreadRow(unreadB.id).focus();
   const composedUnread = new KeyboardEvent('keydown', { key: 'u', isComposing: true, bubbles: true, cancelable: true }); document.activeElement.dispatchEvent(composedUnread);
   check(!composedUnread.defaultPrevented && !state.unread.has(queueKey(unreadB.id)), 'U intercepted an input method composition');
+  resetThread();
   const sidebarRpc = api.rpc; let finishSidebarRead;
   api.rpc = (method, params) => method === 'thread/read' ? new Promise(resolve => { finishSidebarRead = () => resolve({ thread: unreadB }); }) : sidebarRpc(method, params);
   const sidebarRead = unreadRow(unreadB.id).onclick(); $('search').focus(); finishSidebarRead(); await sidebarRead;
@@ -2160,37 +2392,90 @@ async function checks() {
   const refreshProject = { id: 'rename-refresh-project', name: 'Refresh project', roots: [{ path: '/refresh' }] };
   projects.data = [refreshProject]; projects.expanded.add(refreshProject.id);
   const refreshChats = Array.from({ length: 120 }, (_, index) => ({ id: `refresh-${index}`, name: `Chat ${index}`, projectId: refreshProject.id, cwd: '/refresh', createdAt: 200 - index }));
+  const tableSearch = '| Error Type | Occurrences | Can Fix? | Notes';
+  let resolveSupersededSearch, resolveTableSearch, resolveSearchPin, resolveBeforeMove;
   let serverChats = [...refreshChats]; const refreshCalls = [];
   api.rpc = async (method, params) => {
     refreshCalls.push({ method, params });
     if (method === 'thread/name/set') { serverChats.find(thread => thread.id === params.threadId).name = params.name; return {}; }
     if (method === 'thread/list') {
+      if (params.searchTerm === 'slow-search') return new Promise(resolve => { resolveSupersededSearch = resolve; });
+      if (params.searchTerm === 'failed-search') throw new Error('Search unavailable');
+      if (params.searchTerm === tableSearch && !Object.hasOwn(params, 'projectId')) {
+        if (params.cursor) return { data: [structuredClone(refreshChats[81])], nextCursor: null };
+        return new Promise(resolve => { resolveTableSearch = resolve; });
+      }
+      if (params.searchTerm === 'moved-search') {
+        if (!resolveBeforeMove) return new Promise(resolve => { resolveBeforeMove = resolve; });
+        return { data: [{ ...refreshChats[80], projectId: 'search-destination' }], nextCursor: null };
+      }
       if (params.projectId !== refreshProject.id) return { data: [], nextCursor: null };
       const matches = serverChats.filter(thread => !params.searchTerm || thread.name.includes(params.searchTerm));
       const start = Number(params.cursor || 0); const end = start + params.limit;
       return { data: structuredClone(matches.slice(start, end)), nextCursor: end < matches.length ? String(end) : null };
     }
+    if (method === 'thread/read' && params.threadId === 'delayed-search-pin') return new Promise(resolve => { resolveSearchPin = resolve; });
     return {};
   };
   await loadThreads(); await loadThreads(true, refreshProject.id);
-  state.thread = state.threads.find(thread => thread.id === 'refresh-70'); state.contextThread = state.thread;
+  state.thread = state.threads.find(thread => thread.id === 'refresh-40'); state.contextThread = state.thread;
   openRename(); $('conversation-name').value = 'Mac-runners health'; await $('rename-form').onsubmit({ preventDefault() {} });
   await loadThreads();
   const refreshRow = id => $('threads').querySelector(`[data-thread-id="${id}"]`);
-  check(state.threads.length === 100 && refreshRow('refresh-70')?.textContent.includes('Mac-runners health') && refreshRow('refresh-99'), 'Renaming or refreshing discarded a previously loaded conversation page');
-  check(projects.cursors.get(refreshProject.id) === '100', 'Refresh left the next-page cursor at the first page');
+  check(state.threads.length === 60 && refreshRow('refresh-40')?.textContent.includes('Mac-runners health') && refreshRow('refresh-59'), 'Renaming or refreshing discarded a previously loaded conversation page');
+  check(projects.cursors.get(refreshProject.id) === '60', 'Refresh left the next-page cursor at the first page');
   state.active.set('refresh-25', 'keep-running');
-  serverChats = serverChats.filter(thread => !['refresh-70', 'refresh-25', 'refresh-90'].includes(thread.id));
+  serverChats = serverChats.filter(thread => !['refresh-40', 'refresh-25', 'refresh-50'].includes(thread.id));
   await loadThreads();
-  check(refreshRow('refresh-70') && refreshRow('refresh-25')?.querySelector('.thread-state.working') && !refreshRow('refresh-90'), 'A partial server list hid an open/running chat or retained an ordinary removed chat');
-  check(state.threads.findIndex(thread => thread.id === 'refresh-70') === 70, 'An omitted conversation jumped down the list instead of keeping its position');
-  check(diagnostics.some(entry => entry.event === 'threads.refresh-retained' && entry.details.threadId === 'refresh-70'), 'Retaining an omitted conversation was not logged');
+  check(refreshRow('refresh-40') && refreshRow('refresh-25')?.querySelector('.thread-state.working') && !refreshRow('refresh-50'), 'A partial server list hid an open/running chat or retained an ordinary removed chat');
+  check(state.threads.findIndex(thread => thread.id === 'refresh-40') === 40, 'An omitted conversation jumped down the list instead of keeping its position');
+  check(diagnostics.some(entry => entry.event === 'threads.refresh-retained' && entry.details.threadId === 'refresh-40'), 'Retaining an omitted conversation was not logged');
   const repeatedRefreshStart = refreshCalls.length; await loadThreads();
   check(refreshCalls.slice(repeatedRefreshStart).filter(call => call.params.projectId === refreshProject.id).length === 2, 'Retaining omitted chats caused refreshes to keep loading extra pages');
+  const typeSearch = value => { $('search').value = value; $('search').dispatchEvent(new Event('input')); };
+  const searchProgress = $('search-progress');
+  const beforeSearch = refreshCalls.length;
+  typeSearch('slow-search');
+  check(!searchProgress.hidden && searchProgress.position === -1 && getComputedStyle($('threads')).display === 'none' && getComputedStyle($('more-threads')).display === 'none' && refreshCalls.length === beforeSearch, 'Search did not immediately replace the list with indeterminate progress before the debounce');
+  const supersededSearch = loadThreads();
+  typeSearch(tableSearch);
+  resolveSupersededSearch({ data: [refreshChats[0]], nextCursor: null }); await supersededSearch;
+  check(!searchProgress.hidden && getComputedStyle($('threads')).display === 'none', 'An outdated search exposed the sidebar during the next search');
+  state.pinnedIds.add('delayed-search-pin');
+  const tableLoading = loadThreads();
+  handleNotification({ method: 'turn/completed', params: { threadId: 'search-background-chat', turn: { id: 'search-background-turn', status: 'interrupted' } } });
+  check(refreshCalls.filter(call => call.params.searchTerm === tableSearch).length === 1, 'A background completion restarted the active search');
+  resolveTableSearch({ data: [structuredClone(refreshChats[80])], nextCursor: 'next-page' });
+  await tableLoading;
+  check(typeof resolveSearchPin === 'function' && searchProgress.hidden, 'Search waited for a pinned chat before showing results');
+  check(searchProgress.hidden && getComputedStyle($('threads')).display !== 'none' && refreshRow('refresh-80')?.closest('.project-group')?.dataset.projectId === refreshProject.id && !refreshRow('refresh-40'), 'The search progress did not give way to the Markdown match in its project');
+  await $('more-threads').onclick();
+  check(refreshRow('refresh-81') && refreshCalls.filter(call => call.method === 'thread/read' && call.params.threadId === 'delayed-search-pin').length === 1, 'Search pagination duplicated a pending pin lookup or lost the next page');
+  resolveSearchPin({ thread: { id: 'delayed-search-pin', name: tableSearch } }); await settle();
+  check(refreshRow('delayed-search-pin'), 'Pinned chat was not rendered when its background lookup completed');
+  state.pinnedIds.delete('delayed-search-pin'); state.pinnedThreads.delete('delayed-search-pin');
+  projects.data.push({ id: 'search-destination', name: 'Destination', roots: [{ path: '/destination' }] });
+  typeSearch('moved-search');
+  const beforeMove = loadThreads();
+  handleNotification({ method: 'thread/project/updated', params: { threadId: 'refresh-80', projectId: 'search-destination' } });
+  check(refreshCalls.filter(call => call.params.searchTerm === 'moved-search').length === 1, 'Moving a chat restarted an active search before its first request settled');
+  resolveBeforeMove({ data: [structuredClone(refreshChats[80])], nextCursor: null }); await beforeMove;
+  check(refreshRow('refresh-80')?.closest('.project-group')?.dataset.projectId === 'search-destination' && refreshCalls.filter(call => call.params.searchTerm === 'moved-search').length === 2, 'A stale search page put the moved conversation back in its old project');
+  projects.data.pop();
+  typeSearch('slow-search');
+  const disconnectingSearch = loadThreads();
+  handleNotification({ method: 'connection/closed', params: { message: 'Disconnected during search' } });
+  check(searchProgress.hidden && $('search').value === 'slow-search' && $('threads').textContent.includes('Connect to search conversations.') && !$('threads').querySelector('.thread'), 'Disconnecting during a search exposed the previous results');
+  resolveSupersededSearch({ data: [refreshChats[0]], nextCursor: null }); await disconnectingSearch;
+  check(!$('threads').querySelector('.thread'), 'A disconnected search response replaced the offline state');
+  state.connected = true; $('error').hidden = true;
+  typeSearch('failed-search');
+  const failedSearch = await loadThreads().catch(error => error.message);
+  check(failedSearch === 'Search unavailable' && searchProgress.hidden && !$('threads').querySelector('.thread'), 'Search failure left the progress indicator or stale results visible');
   $('search').value = 'no-match'; await loadThreads();
-  check(!refreshRow('refresh-70') && !refreshRow('refresh-25') && !state.threads.length, 'Protected conversations leaked into unrelated search results');
+  check(!refreshRow('refresh-40') && !refreshRow('refresh-25') && !state.threads.length, 'Protected conversations leaked into unrelated search results');
   $('search').value = ''; await loadThreads();
-  check(refreshRow('refresh-70'), 'Clearing search did not restore the open conversation');
+  check(refreshRow('refresh-40'), 'Clearing search did not restore the open conversation');
   projects.expanded.delete(refreshProject.id); await loadThreads();
   check(refreshCalls.at(-1).params.limit === 5 && state.threads.filter(thread => thread.id !== state.thread.id).length === 5, 'Protecting loaded pages prevented showing fewer conversations');
   state.active.clear(); resetThread(); state.threadQuery = null;
@@ -2227,8 +2512,8 @@ async function checks() {
     let reversed = false;
     api.rpc = async (method, params) => {
       if (method !== 'thread/list') throw new Error('Unexpected sorting operation: ' + method);
-      if (params.projectId !== project.id) return { data: [], nextCursor: null };
       if (params.searchTerm) return { data: [{ ...fresh }], nextCursor: null };
+      if (params.projectId !== project.id) return { data: [], nextCursor: null };
       if (params.cursor) return { data: old.slice(48).map(thread => ({ ...thread })), nextCursor: null };
       const first = [...old.slice(0, 48).map(thread => ({ ...thread })), { ...fresh }];
       return { data: reversed ? first.reverse() : first, nextCursor: 'stable-older' };
@@ -2433,6 +2718,39 @@ async function checks() {
   state.options = { mode: 'local' }; state.connected = true; state.active.clear(); usage.error = null;
   results.push('usage bars show remaining context and real quota windows, preserve sparse updates, reflect compaction, coalesce reads, and reject stale or failed responses without interrupting chats');
 
+  {
+    const previous = { thread: state.thread, options: state.options, agent: agents.current, usage: { ...usage }, rpc: api.rpc, modelOptions: [...$('model').options], model: $('model').value };
+    const first = 'agent:zcode:model:first-plan', second = 'agent:zcode:model:second-plan';
+    $('model').replaceChildren(new Option('First model', first), new Option('Second model', second));
+    state.options = { mode: 'local', agents: [{ id: 'zcode', name: 'ZCode', methods: ['account/rateLimits/read'] }] };
+    state.thread = { id: 'agent:zcode:thread:usage-chat', provider: 'zcode', cwd: '/tmp' };
+    let finishFirst;
+    const requests = [];
+    const expiresAt = quotaReset + 86400;
+    api.rpc = (method, params, context) => {
+      requests.push({ method, params, context });
+      if (params.model === first) return new Promise(resolve => { finishFirst = resolve; });
+      return Promise.resolve({ rateLimits: { limitId: 'zcode', primary: { usedPercent: 37, windowDurationMins: 300, resetsAt: quotaReset } },
+        plan: { name: 'GLM Coding Plan', expiresAt, renewsAt: null } });
+    };
+    syncComposerAgent();
+    check(typeof finishFirst === 'function', 'ZCode did not request usage for its selected model');
+    $('model').value = second; syncComposerAgent();
+    await settle();
+    check(requests.length === 2 && requests[1].method === 'account/rateLimits/read' && requests[1].params.model === second && requests[1].context.provider === 'zcode', 'ZCode model changes did not refresh the selected plan');
+    const planRows = [...$('usage-details').querySelectorAll('.usage-reset')];
+    check(usagePercent(1) === '63%' && planRows[1]?.textContent.includes('Plan ends') && planRows[1].querySelector('time')?.dateTime === new Date(expiresAt * 1000).toISOString(), 'ZCode quota or plan end was missing from the shared usage panel');
+    finishFirst({ rateLimits: { primary: { usedPercent: 99 } } }); await settle();
+    check(usagePercent(1) === '63%', 'A previous ZCode model overwrote usage for the current model');
+    api.rpc = async () => { throw new Error('ZCode could not verify the account'); };
+    await refreshUsage();
+    check(usagePercent(1) === '—' && !$('usage-details').textContent.includes('Plan ends') && $('usage-details').textContent.includes('could not verify the account'), 'An unverified ZCode account retained another session’s quota or plan');
+    state.thread = previous.thread; state.options = previous.options; agents.current = previous.agent;
+    Object.assign(usage, previous.usage); api.rpc = previous.rpc;
+    $('model').replaceChildren(...previous.modelOptions); $('model').value = previous.model; renderUsage();
+    results.push('ZCode uses the shared usage panel for its selected model quota, reset, plan end, and stale-read protection');
+  }
+
   const themeColors = new Set();
   for (const theme of ['light', 'dark', 'purple', 'claude-code', 'nord', 'midnight']) {
     $('theme-select').value = theme; await $('theme-select').onchange();
@@ -2590,12 +2908,19 @@ async function checks() {
     const codex = { id: 'codex', name: 'Codex', enabled: true, available: true, connected: true };
     state.options = { ...options, agents: [codex], providerOptions: { codex: { enabled: true, executablePath: '' } } };
     $('prompt').value = 'Keep this draft with every agent disabled'; const session = state.options;
-    let rpcCalls = 0;
-    api.rpc = async () => { rpcCalls++; return { data: [] }; };
-    api.connect = async next => ({ connected: false, options: { ...next, agents: [{ ...codex, enabled: false, connected: false }] } });
+    let rpcCalls = 0, rejectSearch;
+    api.rpc = async () => { rpcCalls++; return new Promise((_resolve, reject) => { rejectSearch = reject; }); };
+    api.connect = async next => {
+      handleNotification({ method: 'provider/closed', provider: 'codex', params: { provider: 'codex', reconfigured: true, disabled: true } });
+      return { connected: false, options: { ...next, agents: [{ ...codex, enabled: false, connected: false }] } };
+    };
+    typeSearch('disable during search'); const searching = loadThreads();
     openSettings(); $('provider-settings').querySelector('input[data-provider="codex"]').checked = false;
     await $('settings-form').onsubmit({ preventDefault() {} });
-    check(!state.connected && state.options === session && !rpcCalls && $('prompt').value === 'Keep this draft with every agent disabled' && state.options.providerOptions.codex.enabled === false && !$('settings-dialog').open, 'Disabling the last idle provider made catalog calls, discarded the draft, or failed to save an offline configuration');
+    rejectSearch(new Error('Provider disabled')); await searching;
+    check(!state.connected && state.options === session && rpcCalls === 1 && $('prompt').value === 'Keep this draft with every agent disabled' && state.options.providerOptions.codex.enabled === false && !$('settings-dialog').open, 'Disabling the last idle provider made catalog calls, discarded the draft, or failed to save an offline configuration');
+    check(searchProgress.hidden && $('search').value === 'disable during search' && $('threads').textContent.includes('Connect to search conversations.'), 'Disabling the last provider left a search loading');
+    $('search').value = '';
     api.connect = connectBefore; api.rpc = rpcBefore; state.options = options; state.connected = true; fillSettings(options);
   }
   results.push('all agents can be disabled without catalog requests or losing the current typed draft');
@@ -2611,7 +2936,12 @@ async function checks() {
   api.rpc = async (method, params) => {
     expansionCalls.push({ method, params });
     if (method === 'project/list') return { data: [expandedRapidcode, expandedOther], nextCursor: null };
-    if (method === 'thread/list') return { data: params.projectId === expandedRapidcode.id ? rapidThreads.slice(params.cursor ? 50 : 0, params.cursor ? 60 : params.limit) : params.projectId === expandedOther.id ? [otherThread] : [looseThread], nextCursor: params.projectId === expandedRapidcode.id && !params.cursor ? 'expanded-next' : null };
+    if (method === 'thread/list' && params.projectId === expandedRapidcode.id) {
+      const offset = Number(params.cursor || 0);
+      const end = offset + params.limit;
+      return { data: rapidThreads.slice(offset, end), nextCursor: end < rapidThreads.length ? String(end) : null };
+    }
+    if (method === 'thread/list') return { data: params.projectId === expandedOther.id ? [otherThread] : [looseThread], nextCursor: null };
     if (method === 'thread/read') return { thread: otherThread };
     return { data: [], nextCursor: null };
   };
@@ -2619,7 +2949,7 @@ async function checks() {
   await loadThreads(); await openThread(otherThread); $('prompt').value = 'Keep my current draft';
   await expandProject(expandedRapidcode);
   const expandedGroup = () => $('threads').querySelector('[data-project-id="expanded-rapidcode"]');
-  check(projects.expanded.has(expandedRapidcode.id) && expandedGroup().querySelectorAll('.thread').length === 50, 'Project did not expand inline to a full page of conversations');
+  check(projects.expanded.has(expandedRapidcode.id) && expandedGroup().querySelectorAll('.thread').length === 30, 'Project did not expand inline to 30 conversations');
   check($('threads').querySelectorAll('.project-group').length === 2 && $('threads').textContent.includes('Other project chat') && $('threads').textContent.includes('Unassigned chat') && !document.getElementById('project-focus-bar'), 'Expanding a project hid other projects or opened a separate view');
   check(state.thread.id === otherThread.id && $('prompt').value === 'Keep my current draft', 'Expanding conversations changed the current chat or draft');
   check(expandedGroup().getBoundingClientRect().bottom > $('conversation-list').getBoundingClientRect().bottom, 'Expanded conversations did not fill the available sidebar height');
@@ -2633,7 +2963,7 @@ async function checks() {
   check(preferences.startupProjects[accessKey()] === expandedRapidcode.id, 'Startup expansion was not saved for this machine');
   projects.expanded.clear(); projects.selected = null; resetThread(); await loadProjects();
   Object.assign(preferences, await api.preferences()); await restoreStartupProject(); await loadThreads();
-  check(projects.expanded.has(expandedRapidcode.id) && projects.selected === expandedRapidcode.id && expandedGroup().querySelectorAll('.thread').length === 50 && $('threads').querySelectorAll('.project-group').length === 2, 'Startup did not expand Rapidcode inline while keeping other projects available');
+  check(projects.expanded.has(expandedRapidcode.id) && projects.selected === expandedRapidcode.id && expandedGroup().querySelectorAll('.thread').length === 30 && $('threads').querySelectorAll('.project-group').length === 2, 'Startup did not expand Rapidcode inline while keeping other projects available');
   state.options = { mode: 'ssh', host: 'expanded-remote', port: 22 }; projects.expanded.clear(); projects.selected = null;
   await restoreStartupProject(); check(!projects.expanded.size, 'Local startup expansion crossed machines');
   state.options = { mode: 'local' }; await restoreStartupProject();
@@ -2758,6 +3088,10 @@ async function checks() {
   showThreadMenu(archiveC, 100, 100); await archiveConversation(archiveC);
   check($('archive-conversation').disabled && archiveCalls.length === beforeArchiveGuard, 'Archive discarded queued messages');
   state.queues.delete(queueKey(archiveC.id));
+  state.nativeQueues.set(archiveC.id, { autoDrain: false, items: [{ queueItemId: 'paused-native-message', text: 'Keep native queued message' }] });
+  showThreadMenu(archiveC, 100, 100); await archiveConversation(archiveC);
+  check($('archive-conversation').disabled && $('archive-conversation').title.includes('queued messages') && archiveCalls.length === beforeArchiveGuard, 'Archive hid paused messages accepted by the provider');
+  state.nativeQueues.delete(archiveC.id);
   let finishArchive;
   api.rpc = (method, params) => method === 'thread/archive' ? new Promise(resolve => { finishArchive = resolve; }) : archiveRpc(method, params);
   const pendingArchive = archiveConversation(archiveC);
@@ -2768,6 +3102,18 @@ async function checks() {
   check(state.thread?.name === 'Same ID on another machine' && state.threads.length === 1, 'A late archive response changed another machine');
   localStorage.removeItem(archiveUnreadStorage); $('error').hidden = true;
   results.push('right-click archive uses native history archiving, clears pins and read markers, preserves background drafts and failures, protects active/queued work, and ignores stale machine responses');
+
+  {
+    const priorOptions = state.options;
+    const chat = { id: 'agent:sample:thread:app-only-archive', provider: 'sample', name: 'Archive in this app', cwd: '/tmp' }, calls = [];
+    state.options = { mode: 'local', agents: [{ id: 'sample', name: 'Sample', connected: true, methods: ['thread/list'] }] };
+    resetThread(); state.threads = [chat]; setThread(chat);
+    api.rpc = async (method, params) => { calls.push({ method, params }); return method === 'thread/list' ? { data: [], nextCursor: null } : {}; };
+    await archiveConversation(chat);
+    check(calls.some(call => call.method === 'thread/archive' && call.params.threadId === chat.id) && !state.thread && !state.threads.some(thread => thread.id === chat.id), 'Provider capability checks blocked archiving in the app');
+    state.options = priorOptions;
+  }
+  results.push('app-owned archiving works when the selected provider has no native archive method');
 
   state.options = { mode: 'local' }; state.connected = true; resetThread();
   const scheduleThread = { id: 'scheduled-ui', cwd: '/tmp', name: 'Scheduled UI' }; setThread(scheduleThread);
@@ -2943,7 +3289,13 @@ async function checks() {
   const draftId = target => JSON.stringify([target.machine, target.kind, target.threadId || [target.cwd, target.projectId || null], target.itemId || null]);
   api.draft = target => { if (target.kind === 'composer') draftLast.set(target.machine, structuredClone(target)); return structuredClone(draftData.get(draftId(target)) || null); };
   let draftChecks = 0;
-  api.hasDraft = target => { draftChecks++; const value = draftData.get(draftId(target)); return Boolean(value && (value.text.trim() || value.images.length)); };
+  api.draftIndicators = async (machine, ids) => {
+    draftChecks++;
+    return ids.filter(threadId => {
+      const value = draftData.get(draftId({ machine, kind: 'composer', threadId }));
+      return Boolean(value && (value.text.trim() || value.images.length));
+    });
+  };
   api.saveDraft = (target, patch) => {
     draftWrites.push(structuredClone({ target, patch }));
     const value = { text: '', images: [], ...draftData.get(draftId(target)), ...structuredClone(patch) };
@@ -2994,7 +3346,7 @@ async function checks() {
   check(draftWrites.length === writesBeforeTyping, 'Unchanged input rewrote the saved draft');
   $('prompt').value = rawDraft + 'last character'; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
   check(!draftData.get(draftId(drafts.target)).text.endsWith('last character'), 'Typing synchronously saved a draft');
-  await new Promise(resolve => setTimeout(resolve, 250));
+  saveComposerDraft(true);
   check(draftData.get(draftId(drafts.target)).text.endsWith('last character') && !('images' in draftWrites.at(-1).patch), 'Idle saving lost the last keystroke or resent image data');
   $('prompt').value = rawDraft; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
   await openThread(draftB); check(!$('prompt').value && !state.images.length, 'A draft leaked into another conversation');
@@ -3007,7 +3359,7 @@ async function checks() {
   await restoreLastDraft();
   check(state.thread.id === draftA.id && $('prompt').value === rawDraft && state.images[0]?.url === imagePng && $('model').value === 'draft-model', 'Restart did not reopen the last unsent conversation draft or native metadata overwrote its model');
   check(!draftNativeCalls.slice(beforeDraftRestart).some(call => ['turn/start', 'thread/resume'].includes(call.method)), 'Restoring a typed draft sent it or claimed its writer');
-  drafts.pending.clear(); renderThreadIndicators();
+  drafts.pending.clear(); refreshDraftIndicators(); await settle();
   const checksAfterReload = draftChecks; renderThreadIndicators(); renderThreadIndicators();
   check(draftRow(draftA.id).querySelector('.thread-state.draft') && draftRow(draftB.id).querySelector('.thread-state.draft') && draftChecks === checksAfterReload, 'Reloading lost saved draft markers or repeatedly reread draft files');
   const localOptions = state.options; state.options = { mode: 'ssh', host: 'draft-indicator-other-host', port: 22 }; renderThreadIndicators();
@@ -3048,7 +3400,7 @@ async function checks() {
   $('cancel-message-edit').click(); await new Promise(resolve => setTimeout(resolve, 0));
   results.push('unsent composer and editor drafts save every change, survive restart and chat/project/machine switches, retain images and settings, migrate first-send drafts, clear only after success, and never auto-send');
   results.push('unsent prompts have a yellow idle indicator immediately and across chat switches/restarts; working spinners and unread state survive, whitespace clears it, and cached markers stay scoped to their machine');
-  for (const method of ['draft', 'hasDraft', 'saveDraft', 'clearDraft', 'moveDraft', 'lastDraft']) delete api[method];
+  for (const method of ['draft', 'draftIndicators', 'saveDraft', 'clearDraft', 'moveDraft', 'lastDraft']) delete api[method];
   drafts.target = null; drafts.snapshot = null; drafts.images = []; state.queues.clear(); $('error').hidden = true;
   state.options = { mode: 'local' };
   resetThread(); state.options = { mode: 'local' }; state.connected = true; state.active.clear(); state.queues.clear();
@@ -3064,7 +3416,7 @@ async function checks() {
   const shortcutImage = { name: 'keep.png', url: png };
   $('prompt').value = 'Keep my typed message'; state.images = [shortcutImage]; renderImages(); $('send-time').value = '24';
   renderShortcuts(); updateBusy();
-  await $('shortcut-buttons').firstElementChild.onclick();
+  await $('shortcut-buttons').firstElementChild.onclick(); await settle();
   const shortcutSent = shortcutCalls.find(call => call.method === 'turn/start')?.params;
   check(shortcutSent?.input[0].text === '$cr ur changes' && shortcutSent.input.some(input => input.type === 'skill' && input.name === 'cr' && input.path === '/skills/cr/SKILL.md') && !shortcutSent.input.some(input => input.type === 'image'), 'Review shortcut did not attach the real skill or sent the composer image draft');
   check($('prompt').value === 'Keep my typed message' && state.images[0] === shortcutImage && $('send-time').value === '24', 'A shortcut cleared the typed draft, attachments, or scheduling selector');
@@ -3077,14 +3429,15 @@ async function checks() {
   check(shortcutQueue.messages.length === shortcutBeforeFailure && $('error-text').textContent.includes('Skill $cr is unavailable') && $('prompt').value === 'Keep my typed message', 'A missing skill was sent as plain text or damaged the existing draft');
   state.active.clear(); state.queues.clear();
   api.rpc = async method => { if (method === 'skills/list') return { data: [{ skills: [{ name: 'cr', path: '/skills/cr/SKILL.md' }] }] }; throw new Error('Shortcut send failed'); };
-  await runShortcut(defaultShortcuts[0]);
-  check($('error-text').textContent === 'Shortcut send failed' && $('prompt').value === 'Keep my typed message' && state.images[0] === shortcutImage, 'A failed shortcut send overwrote the typed or image draft');
+  await runShortcut(defaultShortcuts[0]); await settle();
+  check($('error-text').textContent.includes('Shortcut send failed') && state.queues.get(queueKey(shortcutThread.id))?.paused && $('prompt').value === 'Keep my typed message' && state.images[0] === shortcutImage, 'A failed shortcut send lost its queued message or overwrote the typed or image draft');
+  state.queues.clear();
   let finishShortcutSkills; let pendingShortcutReads = 0;
   api.rpc = () => { pendingShortcutReads++; return new Promise(resolve => { finishShortcutSkills = resolve; }); };
-  const pendingShortcut = runShortcut(defaultShortcuts[0]); await runShortcut(defaultShortcuts[0]);
-  check(pendingShortcutReads === 1 && state.sending, 'Repeated shortcut clicks duplicated a pending skill lookup');
+  const pendingShortcut = runShortcut(defaultShortcuts[0]), secondShortcut = runShortcut(defaultShortcuts[0]); await settle();
+  check(pendingShortcutReads === 1 && !state.sending && !$('shortcut-buttons').firstElementChild.disabled, 'Shortcut resolution blocked the composer/buttons or changed click order');
   const shortcutOptions = state.options; state.options = { ...state.options };
-  finishShortcutSkills({ data: [{ skills: [{ name: 'cr', path: '/skills/cr/SKILL.md' }] }] }); await pendingShortcut;
+  finishShortcutSkills({ data: [{ skills: [{ name: 'cr', path: '/skills/cr/SKILL.md' }] }] }); await pendingShortcut; await secondShortcut;
   check(!state.sending && pendingShortcutReads === 1, 'A delayed skill lookup sent its shortcut after the connection changed');
   state.options = shortcutOptions;
   $('add-shortcut').click(); $('shortcut-label').value = 'Fix'; $('shortcut-prompt').value = 'Fix the review findings';
@@ -3093,6 +3446,29 @@ async function checks() {
   check(!$('shortcut-dialog').open && promptShortcuts().length === 2 && $('shortcut-buttons').lastElementChild.textContent === 'Fix', 'A new shortcut did not save and appear');
   Object.assign(preferences, await api.preferences()); renderShortcuts();
   check(promptShortcuts()[1].prompt === 'Fix the review findings' && promptShortcuts()[1].mode === 'fill', 'Prompt shortcuts or their click behavior were lost after preference reload');
+  const moveShortcut = async (source, destination, dropAfter) => {
+    const dataTransfer = new DataTransfer();
+    source.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer }));
+    const { left, width } = destination.getBoundingClientRect();
+    const position = { bubbles: true, cancelable: true, dataTransfer, clientX: left + width * (dropAfter ? .8 : .2) };
+    const dragOver = new DragEvent('dragover', position);
+    destination.dispatchEvent(dragOver);
+    check(dragOver.defaultPrevented && destination.classList.contains(dropAfter ? 'shortcut-drop-after' : 'shortcut-drop-before'), 'Dragging a shortcut did not show the insertion position');
+    destination.dispatchEvent(new DragEvent('drop', position));
+    source.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer }));
+    await settle();
+  };
+  const shortcutRow = $('shortcut-buttons');
+  const beforeSorting = $('prompt').value, callsBeforeSorting = pendingShortcutReads;
+  savedPreferences.shortcutMoveQueued = true;
+  await moveShortcut(shortcutRow.lastElementChild, shortcutRow.firstElementChild, false);
+  check(shortcutRow.firstElementChild.textContent === 'Fix' && (await api.preferences()).shortcuts[0].label === 'Fix', 'Dragging before another shortcut did not save the new order');
+  check(!$('shortcut-save-status').hidden && $('shortcut-save-status').textContent === 'Order queued', 'A durably queued move gave no pending save feedback');
+  delete savedPreferences.shortcutMoveQueued;
+  await moveShortcut(shortcutRow.firstElementChild, shortcutRow.lastElementChild, true);
+  check($('shortcut-save-status').hidden, 'Saving the order left its queued notice visible');
+  check(shortcutRow.lastElementChild.textContent === 'Fix' && (await api.preferences()).shortcuts[1].mode === 'fill', 'Dragging after another shortcut did not preserve its behavior and save its order');
+  check($('prompt').value === beforeSorting && pendingShortcutReads === callsBeforeSorting, 'Dragging a shortcut ran it or changed the prompt');
   const beforeFill = $('prompt').value; const beforeFillCalls = pendingShortcutReads;
   await $('shortcut-buttons').lastElementChild.onclick();
   check($('prompt').value === beforeFill + '\nFix the review findings' && state.images[0] === shortcutImage && document.activeElement === $('prompt') && pendingShortcutReads === beforeFillCalls, 'Fill-only shortcut sent a request, erased the draft/images, or did not focus the prompt');
@@ -3122,7 +3498,113 @@ async function checks() {
   check($('shortcut-dialog').open && !$('shortcut-error').hidden && $('shortcut-prompt').value === 'Keep this edit' && promptShortcuts().length === 1, 'A failed shortcut save silently replaced preferences or lost the editor text');
   $('cancel-shortcut').click(); api.savePreferences = shortcutPreferenceWriter; api.rpc = shortcutNative;
   state.active.clear(); state.queues.clear(); state.images = []; $('send-time').value = '0'; $('error').hidden = true;
-  results.push('compact shortcuts send or queue exact prompts with resolved skills, preserve typed and image drafts, reject missing skills, and support persistent adding, editing, deleting, and failed-save recovery');
+  results.push('compact shortcuts send or queue exact prompts with resolved skills, preserve typed and image drafts, reject missing skills, and support persistent adding, editing, reordering, deleting, and failed-save recovery');
+  {
+    const previousRpc = api.rpc;
+    for (const scenario of ['accepted', 'rejected', 'early-completion', 'new-chat', 'resuming', 'skills']) {
+      resetThread(); state.connected = true; state.active.clear(); state.queues.clear(); savedQueues.clear();
+      const thread = { id: 'sending-shortcut-' + scenario, cwd: '/shortcut-project', name: 'Shortcut sending regression' };
+      if (scenario !== 'new-chat') setThread(thread);
+      if (!['new-chat', 'resuming'].includes(scenario)) state.owned.add(thread.id);
+      const calls = []; let prepare, accept, reject, heldSkills = false;
+      const skills = { data: [{ skills: [{ name: 'cr', path: '/skills/cr/SKILL.md', enabled: true }] }] };
+      api.rpc = (method, params) => {
+        calls.push({ method, params });
+        if (method === 'skills/list') {
+          if (scenario === 'skills' && !heldSkills) { heldSkills = true; return new Promise(resolve => { prepare = () => resolve(skills); }); }
+          return Promise.resolve(skills);
+        }
+        if (method === 'thread/start' || method === 'thread/resume') return new Promise(resolve => { prepare = () => resolve({ thread }); });
+        if (method === 'turn/start') {
+          if (!accept) return new Promise((resolve, fail) => { accept = () => resolve({ turn: { id: 'original-' + scenario, status: 'inProgress' } }); reject = () => fail(new Error('Original send unconfirmed')); });
+          return Promise.resolve({ turn: { id: 'shortcut-followup-' + scenario, status: 'inProgress' } });
+        }
+        return Promise.resolve({ data: [], nextCursor: null });
+      };
+      $('send-time').value = '0'; $('prompt').value = scenario === 'skills' ? '$cr Original prompt' : 'Original prompt';
+      const sending = send(); await settle(); renderShortcuts(); updateBusy();
+      check(state.sending && !$('shortcut-buttons').firstElementChild.disabled, 'Send shortcut was disabled during ' + scenario);
+      const first = $('shortcut-buttons').firstElementChild.onclick();
+      const second = runShortcut({ prompt: 'Second follow-up', mode: 'send' });
+      if (prepare) { prepare(); await settle(); }
+      await first; await second;
+      const queue = state.queues.get(queueKey(thread.id));
+      check(state.sending && queue?.messages.length === 2 && queue.messages[0].text === '$cr ur changes' && queue.messages[1].text === 'Second follow-up', 'Shortcuts did not queue in click order while sending ' + scenario);
+      check(queue.messages[0].input.some(part => part.type === 'skill' && part.name === 'cr') && calls.filter(call => call.method === 'turn/start').length === 1 && calls.find(call => call.method === 'turn/start').params.input[0].text.includes('Original prompt'), 'A shortcut overtook or duplicated the original send, or lost its skill during ' + scenario);
+      check(savedQueues.get(queue.key)?.messages.length === 2 && calls.filter(call => call.method === 'thread/start').length === (scenario === 'new-chat' ? 1 : 0), 'Queued shortcuts were not saved or created another conversation');
+      const image = { name: 'still-uploading.png' };
+      $('prompt').value = 'Keep next draft'; state.images = [image]; updateBusy();
+      check(!$('shortcut-buttons').firstElementChild.disabled, 'An unrelated uploading composer image disabled send shortcuts');
+      if (scenario === 'early-completion') handleNotification({ method: 'turn/completed', params: { threadId: thread.id, turn: { id: 'original-' + scenario, status: 'completed' } } });
+      if (scenario === 'rejected') reject(); else accept();
+      await sending; await settle();
+      check(!state.sending && $('prompt').value === 'Keep next draft' && (scenario === 'rejected' ? !state.images.length : state.images[0] === image), 'Shortcut submission changed the composer or left sending stuck during ' + scenario);
+      if (scenario === 'rejected') {
+        check(queue.paused && queue.messages.length === 2 && calls.filter(call => call.method === 'turn/start').length === 1, 'An unconfirmed original send automatically sent its shortcuts');
+      } else {
+        if (scenario !== 'early-completion') {
+          check(queue.messages.length === 2, 'A shortcut ran before the original turn finished');
+          handleNotification({ method: 'turn/completed', params: { threadId: thread.id, turn: { id: 'original-' + scenario, status: 'completed' } } }); await settle();
+        }
+        check(queue.messages.length === 1 && calls.filter(call => call.method === 'turn/start').length === 2, 'A queued shortcut did not send exactly once after completion');
+      }
+      state.images = []; state.active.clear(); state.queues.clear(); state.owned.delete(thread.id);
+    }
+    resetThread(); state.queues.clear(); state.active.clear();
+    const thread = { id: 'shortcut-before-create', name: 'Creation race', cwd: '/shortcut-project' };
+    let releaseSkill, releaseCreate, finishedShortcut = false; const calls = [];
+    api.rpc = (method, params) => {
+      calls.push({ method, params });
+      if (method === 'skills/list') return new Promise(resolve => { releaseSkill = () => resolve({ data: [{ skills: [{ name: 'cr', path: '/skills/cr/SKILL.md' }] }] }); });
+      if (method === 'thread/start') return new Promise(resolve => { releaseCreate = () => resolve({ thread }); });
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'creation-race-original', status: 'inProgress' } });
+      return Promise.resolve({ data: [], nextCursor: null });
+    };
+    const queued = runShortcut(defaultShortcuts[0]).then(() => { finishedShortcut = true; }); await settle();
+    $('prompt').value = 'Original during skill lookup'; const sending = send(); await settle();
+    releaseSkill(); await settle();
+    check(!finishedShortcut && state.sending && !calls.some(call => call.method === 'turn/start'), 'A shortcut was dropped before concurrent conversation creation finished');
+    releaseCreate(); await sending; await queued; await settle();
+    check(state.queues.get(queueKey(thread.id))?.messages[0]?.text === '$cr ur changes' && calls.filter(call => call.method === 'thread/start').length === 1 && calls.filter(call => call.method === 'turn/start').length === 1, 'A shortcut resolving during thread creation disappeared or sent out of order');
+    state.active.clear(); state.queues.clear();
+    resetThread(); setThread(thread); state.owned.add(thread.id);
+    let resolveDeferredSkill; const failedCalls = [];
+    api.rpc = (method, params) => {
+      failedCalls.push({ method, params });
+      if (method === 'skills/list') return new Promise(resolve => { resolveDeferredSkill = () => resolve({ data: [{ skills: [{ name: 'cr', path: '/skills/cr/SKILL.md' }] }] }); });
+      if (method === 'turn/start') return Promise.reject(new Error('Unconfirmed original before skill resolution'));
+      return Promise.resolve({ data: [], nextCursor: null });
+    };
+    const deferred = runShortcut(defaultShortcuts[0]); await settle();
+    $('prompt').value = 'Fail before resolving the shortcut'; await send();
+    resolveDeferredSkill(); await deferred; await settle();
+    const paused = state.queues.get(queueKey(thread.id));
+    check(paused?.paused && paused.messages.length === 1 && failedCalls.filter(call => call.method === 'turn/start').length === 1, 'A shortcut missed an intervening send failure and sent without explicit retry');
+    state.queues.clear();
+    api.rpc = async (method, params) => { failedCalls.push({ method, params }); return method === 'turn/start' ? { turn: { id: 'explicit-after-failure', status: 'inProgress' } } : { data: [], nextCursor: null }; };
+    await runShortcut({ mode: 'send', prompt: 'Fresh explicit request' }); await settle();
+    check(failedCalls.filter(call => call.method === 'turn/start').length === 2, 'An earlier send failure blocked a fresh explicit shortcut');
+    state.active.clear(); state.queues.clear(); resetThread();
+    const chatA = { id: 'slow-shortcut-a', name: 'Slow skills', cwd: '/shortcut-a' }, chatB = { id: 'fast-shortcut-b', name: 'Independent shortcut', cwd: '/shortcut-b' };
+    setThread(chatA); state.owned.add(chatA.id); state.owned.add(chatB.id);
+    let releaseOldLookup; const independentCalls = [];
+    api.rpc = (method, params) => {
+      independentCalls.push({ method, params });
+      if (method === 'skills/list') return new Promise(resolve => { releaseOldLookup = () => resolve({ data: [{ skills: [{ name: 'cr', path: '/skills/cr/SKILL.md' }] }] }); });
+      if (method === 'thread/read') return Promise.resolve({ thread: chatB });
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'independent-shortcut-turn', status: 'inProgress' } });
+      return Promise.resolve({ data: [], nextCursor: null });
+    };
+    const oldLookup = runShortcut(defaultShortcuts[0]); await settle();
+    await openThread(chatB);
+    const independent = runShortcut({ mode: 'send', prompt: 'Run without waiting for the other conversation' }); await settle();
+    check(independentCalls.some(call => call.method === 'turn/start' && call.params.threadId === chatB.id), 'Another conversation’s slow shortcut blocked the selected conversation');
+    releaseOldLookup(); await oldLookup; await independent; await settle();
+    check(independentCalls.filter(call => call.method === 'turn/start').length === 1 && !state.queues.get(queueKey(chatA.id))?.messages.length, 'An obsolete shortcut ran on another conversation or duplicated the independent send');
+    state.active.clear(); state.queues.clear();
+    api.rpc = previousRpc; $('error').hidden = true; resetThread();
+  }
+  results.push('send shortcuts remain usable during slow sends, thread creation, resume and skill lookup; queue in order with real skills, preserve drafts, drain once after completion and pause after uncertainty');
   resetThread(); state.thread = { id: 'changed-files-chat', cwd: '/work/project' };
   for (const [patches, line] of [
     [['@@ -64,5 +64,5 @@\n context64\n context65\n context66\n-old\n+new\n tail'], 67],
@@ -3250,6 +3732,7 @@ async function checks() {
     const patch = file => ({ id: 'skip-test-' + file, type: 'fileChange', status: 'completed', changes: [{ path: file, kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-old\n+new' }] });
     for (const file of [...sourcePaths, ...testPaths]) renderItem(patch(file), false, turn);
     const card = $('messages').querySelector('.changed-files'), header = card.firstElementChild;
+    check(header.querySelector('.change-non-test-summary')?.textContent === 'Excluding tests: 2 files+2−2' && header.querySelector('.change-counts').textContent === '+9−9', 'File summary did not show independent file and line totals excluding tests');
     const entry = file => [...card.querySelectorAll('.changed-file-entry')].find(entry => entry.dataset.path === file);
     fillSettings(state.options);
     check($('skip-test-diffs').checked, 'Skipping test diffs is not enabled by default');
@@ -3257,6 +3740,7 @@ async function checks() {
     check(sourcePaths.every(file => entry(file).open) && testPaths.every(file => !entry(file).open), 'Bulk expansion opened test files or skipped ordinary source files');
     check(header.title === 'Collapse all file diffs', 'Skipped test files prevented bulk collapse');
     renderItem(patch('src/live.test.ts'), false, turn); renderItem(patch('src/live.ts'), false, turn);
+    check(header.querySelector('.change-non-test-summary')?.textContent === 'Excluding tests: 3 files+3−3', 'Incoming edits did not update the non-test file and line counts');
     check(!entry('src/live.test.ts').open && entry('src/live.ts').open, 'Streaming file changes ignored the test diff preference');
     await toggleFile(entry(testPaths[0]));
     check(entry(testPaths[0]).open, 'Skipped test files cannot be opened individually');
@@ -3274,6 +3758,9 @@ async function checks() {
     renderItem(patch('only.test.ts'), false, 'tests-only-turn');
     const testsOnly = $('messages').querySelector('.changed-files'); testsOnly.firstElementChild.click();
     check(!testsOnly.querySelector('.changed-file-entry[open]'), 'A tests-only summary ignored the skip preference');
+    check(testsOnly.querySelector('.change-non-test-summary')?.textContent === 'Excluding tests: 0 files+0−0', 'A tests-only summary did not show zero non-test changes');
+    renderItem({ id: 'renamed-test-summary', type: 'fileChange', status: 'completed', changes: [{ path: 'only.test.ts', kind: { type: 'update', move_path: 'only.ts' }, diff: '@@ -1 +1 @@\n-before\n+after' }] }, false, 'tests-only-turn');
+    check(!testsOnly.querySelector('.change-non-test-summary') && testsOnly.firstElementChild.textContent === '1 file changed+2−2', 'Renaming the only test into a regular file left stale or redundant non-test counts');
     resetThread();
   }
   results.push('test diffs stay collapsed by default during bulk expansion and streaming, remain manually accessible, and the setting persists without changing behavior on failed saves');
@@ -3647,7 +4134,9 @@ async function checks() {
     const read = async (method, params) => {
       calls.push({ method, params });
       if (method === 'thread/read') return { thread: all.find(thread => thread.id === params.threadId) };
-      return { data: [{ id: 'arrow-history-' + params.threadId, status: 'completed', items: [{ id: 'arrow-message-' + params.threadId, type: 'agentMessage', text: params.threadId }] }], nextCursor: null };
+      const history = [{ id: 'arrow-history-' + params.threadId, status: 'completed', items: [{ id: 'arrow-message-' + params.threadId, type: 'agentMessage', text: params.threadId }] }];
+      if (params.threadId === a.id) history.push({ id: 'older-visible-completion', status: 'completed', items: [{ id: 'older-completion-message', type: 'agentMessage', text: 'Earlier completion now read' }] });
+      return { data: params.threadId === tail[19].id ? [] : history, nextCursor: null };
     };
     api.rpc = read;
     const row = thread => $('threads').querySelector(`[data-thread-id="${thread.id}"]`);
@@ -3655,8 +4144,22 @@ async function checks() {
       const event = new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...modifiers });
       target.dispatchEvent(event); await settle(); return event;
     };
+    const markerWriter = api.saveConversationState, markerChanges = [];
+    api.saveConversationState = (value, change) => { if (change) markerChanges.push(change); return markerWriter(value, change); };
+    setCompletion(a.id, 'completed');
     renderThreads(); await row(a).onclick();
+    const acknowledgement = markerChanges.find(change => change.threadId === a.id && change.field === 'completion' && change.value === null);
+    check(acknowledgement?.turnId === 'arrow-history-' + a.id && acknowledgement.seenTurnIds.includes('older-visible-completion') && acknowledgement.seenTurnIds.includes(acknowledgement.turnId) && !acknowledgement.seenTurnIds.includes('unseen-turn'), 'Reading later history did not acknowledge its older visible completion accurately');
+    api.saveConversationState = markerWriter;
     const firstCalls = calls.length;
+    const selectedMessage = state.items.get('arrow-message-' + a.id), selectedGeneration = state.selection;
+    const previousPrompt = $('prompt').value;
+    $('prompt').value = 'Keep this draft while clicking the selected conversation';
+    setTimelineFollowing(false, selectedMessage.element); state.active.set(a.id, 'selected-still-running');
+    imageLoads.set('selected-click-image', Promise.resolve('cached image'));
+    await row(a).onclick();
+    check(calls.length === firstCalls && state.selection === selectedGeneration && state.items.get(selectedMessage.item.id) === selectedMessage && !timelineView.following && timelineView.reading === selectedMessage.element && state.active.get(a.id) === 'selected-still-running' && $('prompt').value === 'Keep this draft while clicking the selected conversation' && imageLoads.has('selected-click-image') && document.activeElement === row(a), 'Clicking the selected chat reloaded history, rebuilt messages, reset reading/draft state, cleared image cache, or changed the running task');
+    imageLoads.delete('selected-click-image'); state.active.delete(a.id); $('prompt').value = previousPrompt;
     check((await key('ArrowUp')).defaultPrevented && state.thread.id === a.id && calls.length === firstCalls, 'ArrowUp wrapped or reloaded the first conversation');
     check((await key('ArrowDown')).defaultPrevented && state.thread.id === b.id && document.activeElement === row(b), 'ArrowDown did not open and focus the next visible chat');
     await key('ArrowUp'); check(state.thread.id === a.id, 'ArrowUp did not navigate back through pinned conversations');
@@ -3681,6 +4184,9 @@ async function checks() {
     state.active.set('arrow-background-task', 'keep-running');
     await key('ArrowDown');
     check(state.loading && document.activeElement === row(other), 'Arrow navigation did not focus a loading chat');
+    const loadingGeneration = state.selection, loadingRead = finishOlderSelection;
+    await row(other).onclick();
+    check(state.loading && state.selection === loadingGeneration && finishOlderSelection === loadingRead, 'Clicking a loading selection duplicated its history request');
     await key('ArrowDown'); finishOlderSelection(); await settle();
     check(state.thread.id === tail[0].id && document.activeElement === row(tail[0]) && state.items.has('arrow-message-' + tail[0].id) && !state.items.has('arrow-message-' + other.id), 'A late history response overwrote a newer arrow selection');
     api.rpc = read;
@@ -3690,10 +4196,40 @@ async function checks() {
     check(state.thread.id === tail[19].id && lastRect.top >= listRect.top && lastRect.bottom <= listRect.bottom + 1, 'Arrow navigation did not scroll an offscreen selection into view');
     const lastCalls = calls.length; await key('ArrowDown');
     check(calls.length === lastCalls && state.thread.id === tail[19].id && state.active.get('arrow-background-task') === 'keep-running' && calls.every(call => ['thread/read', 'thread/turns/list'].includes(call.method)), 'Arrow navigation wrapped, reloaded the last row, or interrupted background work');
+    await row(tail[19]).onclick();
+    check(calls.length === lastCalls && !state.items.size, 'Clicking a loaded empty chat fetched its history again');
+    api.rpc = async method => { if (method === 'thread/read') throw new Error('Selected history load failed'); return { data: [], nextCursor: null }; };
+    await row(a).onclick();
+    check(state.historyLoadFailed && !state.loading && $('error-text').textContent.includes('Selected history load failed'), 'A failed load did not remain retryable');
+    api.rpc = read;
+    const beforeRetry = calls.length;
+    await row(a).onclick();
+    check(calls.length === beforeRetry + 2 && !state.historyLoadFailed && state.items.has('arrow-message-' + a.id), 'Clicking a failed selection did not retry and recover its history');
+    await row(a).onclick();
+    check(calls.length === beforeRetry + 2, 'A recovered selection continued reloading on clicks');
+    for (const method of ['provider/closed', 'connection/closed']) {
+      let rejectLoad;
+      api.rpc = (name, params) => name === 'thread/read' && params.threadId === b.id ? new Promise((_resolve, reject) => { rejectLoad = reject; }) : read(name, params);
+      const opening = row(b).onclick();
+      check(state.loading && typeof rejectLoad === 'function', 'Disconnect test did not start a history read');
+      handleNotification({ provider: 'codex', method, params: { message: 'Disconnected during history load' } });
+      rejectLoad(new Error('History read interrupted')); await opening;
+      check(state.historyLoadFailed && !state.loading, 'Interrupted history was not marked retryable');
+      state.connected = true;
+      const codex = agentMetadata('codex'); if (codex) codex.connected = true;
+      api.rpc = read; renderThreads();
+      const before = calls.length;
+      await row(b).onclick();
+      check(calls.length === before + 2 && !state.historyLoadFailed && state.items.has('arrow-message-' + b.id), 'Re-clicking the selected conversation after reconnect did not load history');
+      await row(b).onclick();
+      check(calls.length === before + 2, 'Recovered history reloaded again');
+      await row(a).onclick();
+    }
     state.active.delete('arrow-background-task'); state.pinnedIds.clear(); state.pinnedThreads.clear(); projects.data = []; projects.collapsed.clear();
     api.rpc = previousRpc; state.options = previousOptions; resetThread();
   }
   results.push('sidebar arrows open visible conversations in displayed order, skip collapsed projects, preserve U and typing keys, scroll into view, and ignore stale history without interrupting tasks');
+  results.push('clicking a selected or loading conversation preserves messages, drafts, reading state, cached images and active work; empty chats stay open and failed loads can retry');
   {
     const previousRpc = api.rpc, previousOptions = state.options;
     resetThread(); state.connected = true; state.options = { mode: 'local' };
@@ -3885,7 +4421,7 @@ async function checks() {
       activateComposerDraft(); updateBusy();
       check($('prompt').value === saved.text && $('model').value === saved.model && selectedProvider() === 'sample' && $('effort').value === 'high' && $('model').selectedOptions[0].disabled && $('send').disabled, 'Restarting without a provider changed the draft’s agent/model/reasoning or enabled sending');
       $('prompt').value += ' with more details'; $('prompt').oninput();
-      await new Promise(resolve => setTimeout(resolve, 250));
+      saveComposerDraft(true);
       check(writes.at(-1)?.model === saved.model && writes.at(-1)?.effort === saved.effort, 'Typing over an unavailable-provider draft overwrote its saved model settings');
       await send();
       check(sent.length === 0 && $('prompt').value.includes('more details') && $('error-text').textContent.includes('model is unavailable'), 'Enter sent an unavailable-provider draft to another agent or cleared it');
@@ -3952,7 +4488,7 @@ async function checks() {
   }
   results.push('native accepted queues display authoritative paused/running state, resume or cancel by ID without resending, retain failed operations, preserve unsent drafts, and clear per provider/machine');
   {
-    const methods = ['preferences', 'pins', 'conversationSync', 'draft', 'saveDraft', 'hasDraft', 'resolveSyncConflict', 'mapSyncProject', 'rpc', 'connect', 'disconnect'];
+    const methods = ['preferences', 'pins', 'conversationSync', 'draft', 'saveDraft', 'draftIndicators', 'resolveSyncConflict', 'mapSyncProject', 'rpc', 'connect', 'disconnect'];
     const previousApi = Object.fromEntries(methods.map(method => [method, api[method]]));
     const before = { options: state.options, connected: state.connected, threads: state.threads, active: new Map(state.active), owned: new Set(state.owned), unread: new Set(state.unread), completions: new Map(state.completions), pinnedIds: new Set(state.pinnedIds), pinnedThreads: new Map(state.pinnedThreads), drafts: { ...drafts, pending: new Map(drafts.pending) }, sync: { ...conversationSync, catalog: conversationSync.catalog }, projects: { ...projects, expanded: new Set(projects.expanded), cursors: new Map(projects.cursors), collapsed: new Set(projects.collapsed) }, preferences: { conversationStates: preferences.conversationStates, messagePins: preferences.messagePins, shortcuts: preferences.shortcuts }, agent: agents.current };
     resetThread(); state.active.clear(); state.owned.clear(); drafts.target = null; drafts.suspended = false;
@@ -3962,7 +4498,7 @@ async function checks() {
     const background = { id: 'metadata-background-chat', name: 'Synced background chat', cwd: '/local/work' };
     state.options = options; state.connected = true; state.threads = [thread, background]; projects.data = []; projects.selected = null; projects.collapsed.clear(); agents.current = 'codex';
     let storedDraft = { text: 'Keep this active draft', images: [], model: '', effort: '', mode: 'default', access: 'workspace-write', hours: 0 };
-    let sync = { error: null, conflicts: [], catalog: 'metadata-only' }, connects = 0, disconnects = 0;
+    let sync = { error: null, conflicts: [], catalog: 'metadata-only', draftRevision: 0 }, connects = 0, disconnects = 0, draftBatches = 0;
     conversationSync.catalog = sync.catalog;
     let projectCatalog = [], threadCatalog = [thread, background];
     const calls = [], resolutions = [], mappings = [];
@@ -3972,7 +4508,7 @@ async function checks() {
     api.conversationSync = async () => structuredClone(sync);
     api.draft = target => target.threadId === thread.id ? structuredClone(storedDraft) : null;
     api.saveDraft = (target, patch) => { if (target.threadId === thread.id) storedDraft = { ...storedDraft, ...structuredClone(patch) }; };
-    api.hasDraft = target => target.threadId === thread.id && Boolean(storedDraft.text);
+    api.draftIndicators = async (_machine, ids) => { draftBatches++; return ids.filter(id => id === thread.id && storedDraft.text); };
     api.resolveSyncConflict = async (key, choice) => { resolutions.push({ key, choice }); sync.conflicts = []; };
     api.connect = async () => { connects++; throw new Error('Metadata sync must not connect agents'); };
     api.disconnect = async () => { disconnects++; throw new Error('Metadata sync must not disconnect agents'); };
@@ -3990,14 +4526,38 @@ async function checks() {
     const running = () => state.options === options && JSON.stringify(options) === optionsSnapshot && state.thread === thread && state.active.get(thread.id) === 'metadata-running-turn' && state.active.get(background.id) === 'metadata-background-turn' && state.items.get('metadata-reply') === reply && !connects && !disconnects;
     await notify();
     check(running() && $('prompt').value === 'Keep this active draft' && document.activeElement === $('prompt') && $('prompt').selectionStart === 5 && state.pinnedIds.has(background.id) && state.unread.has(queueKey(background.id)) && $('pinned-messages').textContent.includes('Pin received from another computer') && $('shortcut-buttons').textContent.includes('Synced shortcut'), 'Receiving synced pins, unread state, message pins or shortcuts interrupted the running chat, focused draft, or metadata display');
-    storedDraft = { ...storedDraft, text: 'Clean draft received from the other computer' };
+    const originalRows = [...$('threads').querySelectorAll('.thread')], initialDraftBatches = draftBatches;
+    let mutations = 0;
+    const sidebarObserver = new MutationObserver(records => { mutations += records.length; });
+    sidebarObserver.observe($('threads'), { attributes: true, childList: true, subtree: true });
+    await notify();
+    check(draftBatches === initialDraftBatches && mutations === 0, 'Unchanged sync rebuilt the sidebar or checked draft files again');
+    sidebarObserver.disconnect();
+    const markerWriter = api.saveConversationState;
+    api.saveConversationState = (value, change) => {
+      markerWriter(value, change);
+      saved.conversationStates[value.machine] = { unread: [...value.unread], completions: { ...value.completions } };
+    };
+    let finishMarkerSync, markerReads = 0;
+    api.conversationSync = () => ++markerReads === 1 ? new Promise(resolve => { finishMarkerSync = resolve; }) : Promise.resolve(structuredClone(sync));
+    const markerRefresh = refreshConversationSync();
+    check(Boolean(finishMarkerSync), 'The marker race did not hold a stale metadata snapshot');
+    setCompletion(background.id); setUnread(background.id, false);
+    finishMarkerSync(structuredClone(sync)); await markerRefresh;
+    check(markerReads >= 2 && !state.completions.has(queueKey(background.id)) && !state.unread.has(queueKey(background.id)) && !saved.conversationStates[accessKey()].completions[background.id] && running(), 'A stale metadata response restored a read conversation marker or lost active work');
+    api.saveConversationState = markerWriter; api.conversationSync = async () => structuredClone(sync);
+    saved.conversationStates[accessKey()].completions[background.id] = 'completed';
+    await notify();
+    check(state.completions.get(queueKey(background.id)) === 'completed', 'Protecting read state suppressed a later new completion');
+    check([...$('threads').querySelectorAll('.thread')].every((row, index) => row === originalRows[index]), 'Synced completion replaced sidebar rows');
+    storedDraft = { ...storedDraft, text: 'Clean draft received from the other computer' }; sync.draftRevision++;
     await notify();
     check(running() && $('prompt').value === storedDraft.text && document.activeElement === $('prompt'), 'A clean remote draft failed to update the visible composer or interrupted active work');
     let finishSync;
     api.conversationSync = () => new Promise(resolve => { finishSync = resolve; });
     const refreshing = refreshConversationSync();
     $('prompt').value = 'Typed while the metadata refresh was waiting'; $('prompt').dispatchEvent(new Event('input', { bubbles: true })); $('prompt').setSelectionRange(9, 9);
-    storedDraft = { ...storedDraft, text: 'Late remote draft must not overwrite current typing' };
+    storedDraft = { ...storedDraft, text: 'Late remote draft must not overwrite current typing' }; sync.draftRevision++;
     finishSync(structuredClone(sync)); await refreshing;
     check(running() && $('prompt').value === 'Typed while the metadata refresh was waiting' && document.activeElement === $('prompt') && $('prompt').selectionStart === 9, 'An asynchronous metadata refresh overwrote concurrent typing or moved composer focus');
     api.conversationSync = async () => structuredClone(sync); storedDraft.text = $('prompt').value;
@@ -4005,23 +4565,27 @@ async function checks() {
     $('prompt').value = 'Keep my unsaved text after a disk failure'; $('prompt').dispatchEvent(new Event('input', { bubbles: true }));
     api.saveDraft = () => { throw new Error('Temporary draft write failure'); };
     check(saveComposerDraft() === false && drafts.dirty, 'Failed deferred saving discarded its dirty state');
-    storedDraft.text = 'Remote draft must not replace a failed local save';
+    storedDraft.text = 'Remote draft must not replace a failed local save'; sync.draftRevision++;
     await notify();
     check($('prompt').value === 'Keep my unsaved text after a disk failure' && running(), 'A sync refresh overwrote locally typed text after its deferred save failed');
     api.saveDraft = healthyDraftWriter;
     check(saveComposerDraft() && !drafts.dirty && storedDraft.text === $('prompt').value, 'Retrying a failed draft did not save the latest text');
     $('error').hidden = true;
-    sync.conflicts = [{ key: 'metadata-draft-conflict', kind: 'draft', local: 'Local draft version', remote: 'Remote draft version' }];
+    const draftConflictKey = JSON.stringify(['draft', accessKey(), JSON.stringify(['composer', thread.id, null])]);
+    sync.conflicts = [{ key: draftConflictKey, kind: 'draft', local: 'Local draft version', remote: 'Remote draft version' }];
     await notify();
-    const notice = $('conversation-sync-notice'); notice.querySelector('details').open = true;
+    const notice = $('conversation-sync-notice');
+    check(!notice.checkVisibility(), 'A draft conflict automatically opened sync details over the workspace');
+    $('conversation-sync-status').click(); notice.querySelector('details').open = true;
     check(!notice.hidden && notice.querySelector('pre').textContent.includes('This computer:\nLocal draft version') && notice.querySelector('pre').textContent.includes('Other computer:\nRemote draft version') && notice.textContent.includes('Keep this version') && notice.textContent.includes('Use other version') && resolutions.length === 0, 'A sync conflict hid either version or resolved itself without an explicit choice');
     await [...notice.querySelectorAll('button')].find(button => button.textContent === 'Keep this version').onclick();
-    check(resolutions[0]?.key === 'metadata-draft-conflict' && resolutions[0]?.choice === 'local' && notice.hidden && running(), 'Keeping a local conflict version called the wrong choice or interrupted the chat');
-    sync.conflicts = [{ key: 'metadata-shortcut-conflict', kind: 'shortcuts', local: 'Local shortcut version', remote: 'Remote shortcut version' }];
+    check(resolutions[0]?.key === draftConflictKey && resolutions[0]?.choice === 'local' && notice.hidden && running(), 'Keeping a local conflict version called the wrong choice or interrupted the chat');
+    const shortcutConflictKey = JSON.stringify(['shortcuts', 'access:local', 'shortcuts']);
+    sync.conflicts = [{ key: shortcutConflictKey, kind: 'shortcuts', local: 'Local shortcut version', remote: 'Remote shortcut version' }];
     await notify();
     check(notice.querySelector('summary').textContent.includes('Shortcuts changed') && notice.querySelector('pre').textContent.includes('Remote shortcut version'), 'Shortcut conflicts were missing their own label or remote version');
     await [...notice.querySelectorAll('button')].find(button => button.textContent === 'Use other version').onclick();
-    check(resolutions[1]?.key === 'metadata-shortcut-conflict' && resolutions[1]?.choice === 'remote' && running(), 'Choosing a remote conflict version called the wrong choice or disconnected active work');
+    check(resolutions[1]?.key === shortcutConflictKey && resolutions[1]?.choice === 'remote' && running(), 'Choosing a remote conflict version called the wrong choice or disconnected active work');
     const foreignRoot = '/foreign-computer/project', localRoot = '/local/chosen-project';
     const ghost = { id: 'sync-project:metadata-ghost', sharedId: 'metadata-shared-project', name: 'Project from another computer', provider: 'codex', needsFolder: true, roots: [{ path: foreignRoot }] };
     const ghostThread = { id: 'metadata-ghost-chat', name: 'Synced ghost chat', projectId: ghost.id, sharedProject: ghost.sharedId, needsFolder: true, cwd: foreignRoot };
@@ -4043,7 +4607,7 @@ async function checks() {
   results.push('conversation metadata sync preserves running chats and focused typing, applies clean remote drafts, protects concurrent edits, offers explicit conflict choices, and maps ghost projects only to chosen local folders');
   {
     const previousOptions = state.options, previousSync = { ...conversationSync };
-    const methods = ['conversationSync', 'preferences', 'pins', 'draft', 'saveDraft', 'retryHistorySync'];
+    const methods = ['conversationSync', 'preferences', 'pins', 'draft', 'saveDraft', 'retryHistorySync', 'retryConversationSync'];
     const previousApi = Object.fromEntries(methods.map(method => [method, api[method]]));
     api.saveDraft = undefined; resetThread();
     const healthy = { id: 'sync-healthy-chat', cwd: '/work/project' }, broken = { id: 'sync-broken-chat', cwd: '/work/project' };
@@ -4057,10 +4621,31 @@ async function checks() {
     await refreshConversationSync();
     check($('conversation-sync-notice').hidden && state.active.get(healthy.id) === 'sync-healthy-turn' && $('prompt').value === 'Keep my running chat draft' && document.activeElement === $('prompt') && $('prompt').selectionStart === 2, 'Another chat’s history error affected a healthy running chat or its draft');
     setThread(broken);
-    check(!$('conversation-sync-notice').hidden && $('conversation-sync-notice').textContent.includes('Local history kept'), 'The affected conversation did not show its own history warning');
-    setThread(healthy); check($('conversation-sync-notice').hidden, 'A history warning leaked when switching chats without another sync request');
+    check(!$('conversation-sync-notice').hidden && $('conversation-sync-notice').textContent.includes('Local history kept') && !$('conversation-sync-status').hidden && $('conversation-sync-status').dataset.status === 'error', 'The affected conversation did not show its own history warning and header status');
+    check(!$('conversation-sync-notice').checkVisibility() && !$('conversation-sync-panel').matches(':popover-open') && !$('conversation-sync-notice').closest('.compose-area'), 'A background sync warning occupied the composer or opened details automatically');
+    const syncTooltip = $('conversation-sync-tooltip'), hoverFocus = document.activeElement;
+    $('conversation-sync-status').onpointerenter();
+    check(syncTooltip.matches(':popover-open') && syncTooltip.checkVisibility() && syncTooltip.textContent.includes('A linked conversation history file is missing or ambiguous.') && !$('conversation-sync-status').hasAttribute('title') && document.activeElement === hoverFocus && !$('conversation-sync-panel').matches(':popover-open'), 'Hovering the red dot did not immediately show the actual error or disturbed focus/click details');
+    $('conversation-sync-status').onpointerleave();
+    check(!syncTooltip.matches(':popover-open'), 'Leaving the sync dot did not immediately hide its tooltip');
+    $('conversation-sync-status').blur(); $('conversation-sync-status').focus();
+    $('conversation-sync-status').dispatchEvent(new FocusEvent('focus'));
+    check(syncTooltip.matches(':popover-open'), 'Keyboard focus did not immediately reveal sync status: ' + JSON.stringify({ active: document.activeElement.id, hidden: $('conversation-sync-status').hidden, detailsOpen: $('conversation-sync-panel').matches(':popover-open') }));
+    $('conversation-sync-status').click();
+    check(!syncTooltip.matches(':popover-open'), 'Clicking sync details left a duplicate tooltip open');
+    check($('conversation-sync-panel').matches(':popover-open') && $('conversation-sync-notice').checkVisibility() && $('conversation-sync-status').tagName === 'BUTTON', 'Clicking the header dot did not reveal accessible sync details');
+    const noticeContent = $('conversation-sync-notice').firstChild;
+    renderConversationSyncNotice();
+    check($('conversation-sync-panel').matches(':popover-open') && $('conversation-sync-notice').firstChild === noticeContent, 'An unchanged sync refresh rebuilt or closed the open panel');
+    $('conversation-sync-status').click();
+    check(!$('conversation-sync-panel').matches(':popover-open'), 'Clicking the header dot again did not close sync details');
+    $('conversation-sync-status').click();
+    setThread(healthy); check($('conversation-sync-notice').hidden && $('conversation-sync-status').hidden && !$('conversation-sync-panel').matches(':popover-open'), 'A history warning leaked when switching chats without another sync request');
     sync.error = 'Storage is offline'; await refreshConversationSync();
     check(!$('conversation-sync-notice').hidden && $('conversation-sync-notice').textContent.includes('Storage is offline'), 'A real server connection error was incorrectly hidden');
+    check(!$('conversation-sync-status').hidden && !$('conversation-sync-notice').checkVisibility(), 'A storage error did not stay behind its header dot');
+    $('conversation-sync-status').click(); $('close-conversation-sync').click();
+    check(!$('conversation-sync-panel').matches(':popover-open'), 'The sync panel close button did not dismiss it');
     sync.error = null; await refreshConversationSync(); check($('conversation-sync-notice').hidden, 'A recovered server left its global warning visible');
     setThread(broken); sync.historyErrors = []; await refreshConversationSync();
     check($('conversation-sync-notice').hidden, 'Repairing the affected conversation left a stale history warning');
@@ -4071,18 +4656,29 @@ async function checks() {
     check($('conversation-sync-notice').hidden, 'A queued upload error leaked into another chat');
     setThread(broken); await refreshConversationSync();
     check($('conversation-sync-notice').textContent.includes('missing dependency'), 'The affected chat did not show its upload dependency error');
+    $('conversation-sync-status').click();
     await [...$('conversation-sync-notice').querySelectorAll('button')].find(button => button.textContent === 'Retry sync').onclick();
     check(retries.join() === broken.id && $('conversation-sync-notice').hidden && state.active.get(healthy.id) === 'sync-healthy-turn', 'Retry sync targeted the wrong chat or interrupted healthy work');
+    const metadataKey = JSON.stringify(['note', accessKey(), broken.id]), metadataRetries = [];
+    api.retryConversationSync = async key => { metadataRetries.push(key); sync.queueErrors = []; };
+    sync.queueErrors = [{ kind: 'note', machine: accessKey(), id: broken.id, key: metadataKey, message: 'Temporary metadata failure' }];
+    await refreshConversationSync();
+    await [...$('conversation-sync-notice').querySelectorAll('button')].find(button => button.textContent === 'Retry sync').onclick();
+    check(metadataRetries.join() === metadataKey && $('conversation-sync-notice').hidden && $('conversation-sync-status').hidden && state.active.get(healthy.id) === 'sync-healthy-turn', 'Metadata Retry did not target the paused item or disturbed another running chat');
+    sync.queueErrors = [{ kind: 'note', machine: 'access:other-machine', id: broken.id, key: JSON.stringify(['note', 'access:other-machine', broken.id]), message: 'Another machine failure' }];
+    await refreshConversationSync();
+    check($('conversation-sync-notice').hidden && $('conversation-sync-status').hidden, 'A different machine sync status leaked into the selected chat header');
+    sync.queueErrors = [];
     sync.historyErrors = [{ id: broken.id, message: 'Missing segment' }]; await refreshConversationSync();
     state.options = { mode: 'ssh', host: 'another-machine' }; updateBusy();
     check($('conversation-sync-notice').hidden, 'A previous connection’s history warning leaked into another connection');
     state.active.delete(healthy.id); state.options = previousOptions; Object.assign(conversationSync, previousSync); resetThread();
     for (const method of methods) api[method] = previousApi[method];
-    results.push('history sync failures show only in the affected chat, preserve healthy running chats and focused drafts, recover cleanly, and keep real connection errors visible');
+    results.push('sync warnings stay behind a clickable header dot, preserve focused work, retain targeted retries, toggle or close on request, and clear on recovery or conversation changes');
   }
 
   {
-    const methods = ['preferences', 'pins', 'conversationSync', 'draft', 'saveDraft', 'clearDraft', 'hasDraft', 'editLock', 'scheduledTask', 'rpc'];
+    const methods = ['preferences', 'pins', 'conversationSync', 'draft', 'saveDraft', 'clearDraft', 'draftIndicators', 'editLock', 'scheduledTask', 'rpc'];
     const previousApi = Object.fromEntries(methods.map(method => [method, api[method]]));
     const before = { options: state.options, connected: state.connected, threads: state.threads, active: new Map(state.active), queues: new Map(state.queues), pinnedIds: new Set(state.pinnedIds), pinnedThreads: new Map(state.pinnedThreads), unread: new Set(state.unread), completions: new Map(state.completions), drafts: { ...drafts, pending: new Map(drafts.pending) }, sync: { ...conversationSync, catalog: conversationSync.catalog }, preferences: { conversationStates: preferences.conversationStates, messagePins: preferences.messagePins, shortcuts: preferences.shortcuts }, projects: projects.data, agent: agents.current };
     resetThread(); state.active.clear(); state.queues.clear(); state.pinnedIds.clear(); state.pinnedThreads.clear();
@@ -4097,7 +4693,7 @@ async function checks() {
     api.conversationSync = async () => structuredClone(sync);
     api.draft = target => structuredClone(saved.get(key(target)) || null);
     api.saveDraft = (target, patch, expected) => { writes.push({ target: structuredClone(target), patch: structuredClone(patch), expected: structuredClone(expected) }); saved.set(key(target), { ...saved.get(key(target)), ...structuredClone(patch) }); };
-    api.clearDraft = (target, expected) => { clears.push({ target: structuredClone(target), expected: structuredClone(expected) }); saved.delete(key(target)); }; api.hasDraft = () => false;
+    api.clearDraft = (target, expected) => { clears.push({ target: structuredClone(target), expected: structuredClone(expected) }); saved.delete(key(target)); }; api.draftIndicators = async () => [];
     api.editLock = async (_threadId, token) => token ? undefined : 'synced-editor-lock';
     api.rpc = async method => { throw new Error('Open-editor metadata sync must not execute agent operations: ' + method); };
     setThread(thread);
@@ -4173,7 +4769,7 @@ async function checks() {
   }
   results.push('open message, queue and schedule editors refresh clean remote drafts without losing focus/caret, preserve concurrent typing, restore cleared fallbacks, and save or cancel against the last-read text/date baseline');
   {
-    const methods = ['preferences', 'pins', 'conversationSync', 'requestConversation', 'draft', 'saveDraft', 'rpc', 'connect', 'disconnect'];
+    const methods = ['preferences', 'pins', 'conversationSync', 'requestConversation', 'cancelConversationRequest', 'draft', 'saveDraft', 'rpc', 'connect', 'disconnect'];
     const previousApi = Object.fromEntries(methods.map(method => [method, api[method]]));
     const before = { options: state.options, connected: state.connected, threads: state.threads, models: state.models, active: new Map(state.active), owned: new Set(state.owned), queues: new Map(state.queues), pinnedIds: new Set(state.pinnedIds), pinnedThreads: new Map(state.pinnedThreads), drafts: { ...drafts, pending: new Map(drafts.pending) }, sync: { ...conversationSync, ownership: new Map(conversationSync.ownership), requesting: conversationSync.requesting }, preferences: { conversationStates: preferences.conversationStates, messagePins: preferences.messagePins, shortcuts: preferences.shortcuts }, projects: projects.data, agent: agents.current };
     resetThread(); state.active.clear(); state.owned.clear(); state.queues.clear(); state.pinnedIds.clear(); state.pinnedThreads.clear(); drafts.target = null; drafts.suspended = false;
@@ -4219,6 +4815,25 @@ async function checks() {
     check(requests.join() === thread.id && $('take-conversation').disabled && $('prompt').value === draft && intact(), 'Repeated ownership clicks sent multiple requests or changed active work');
     sync.ownership = [{ ...foreign, requested: true, waiting: true }]; releaseRequest(); await Promise.all([requesting, repeated]);
     check($('take-conversation').disabled && $('take-conversation').textContent === 'Transfer requested' && $('conversation-owner').textContent.includes('Waiting for Other Mac') && $('send').disabled && $('prompt').value === draft && intact(), 'A transfer request did not remain visibly pending while preserving drafts and other active chats');
+    const cancellations = []; let releaseCancel;
+    api.cancelConversationRequest = id => { cancellations.push(id); return new Promise(resolve => { releaseCancel = resolve; }); };
+    check(!$('cancel-conversation-request').hidden && !$('cancel-conversation-request').disabled, 'A pending requester has no Cancel transfer action');
+    const cancelling = $('cancel-conversation-request').onclick(), duplicateCancel = $('cancel-conversation-request').onclick();
+    check(cancellations.join() === thread.id && $('cancel-conversation-request').disabled, 'Repeated cancellation clicks bypassed the pending request guard');
+    sync.ownership = [foreign]; releaseCancel(); await Promise.all([cancelling, duplicateCancel]);
+    check($('cancel-conversation-request').hidden && !$('take-conversation').disabled && conversationReadOnly() && $('prompt').value === draft && !calls.length && intact(), 'Cancelling a transfer changed ownership, ran inference, or lost the draft');
+    sync.enabled = true; sync.historyEnabled = false; state.connected = false;
+    sync.ownership = [{ ...foreign, requested: true, waiting: true }]; await notify();
+    check(!$('cancel-conversation-request').hidden && !$('cancel-conversation-request').disabled && $('send').disabled, 'A disconnected local agent hid server-only transfer cancellation or enabled sends');
+    api.cancelConversationRequest = async id => { cancellations.push(id); sync.ownership = [foreign]; };
+    await $('cancel-conversation-request').onclick();
+    check($('cancel-conversation-request').hidden && $('send').disabled && $('prompt').value === draft, 'Offline cancellation changed the draft or enabled inference');
+    state.connected = true; sync.historyEnabled = true;
+    sync.ownership = [{ ...foreign, requested: true, waiting: true }]; await notify();
+    api.cancelConversationRequest = async () => { throw new Error('Cancellation rejected by server'); };
+    await $('cancel-conversation-request').onclick();
+    check(!$('cancel-conversation-request').hidden && !$('cancel-conversation-request').disabled && $('error-text').textContent.includes('Cancellation rejected') && conversationReadOnly() && intact(), 'Failed cancellation lost the pending request or bypassed the server');
+    $('error').hidden = true;
     sync.ownership = [{ ...foreign, requested: true, waiting: true, busy: false }]; await notify();
     check($('send').disabled && conversationReadOnly(), 'Native completion alone enabled sending before history upload and ownership handoff');
     sync.ownership = [{ ...foreign, owned: true, requested: false, waiting: false, busy: false }]; holdHistory = true;
@@ -4227,6 +4842,15 @@ async function checks() {
     check(calls.find(call => call.method === 'thread/read').params.refreshSyncedHistory === true && !Object.hasOwn(calls.find(call => call.method === 'thread/turns/list').params, 'refreshSyncedHistory'), 'Ownership handoff did not explicitly refresh history or leaked its refresh flag into pagination');
     holdHistory = false; releaseHistory(); await handingOff; question = state.items.get('ownership-question');
     check(!conversationReadOnly() && $('conversation-ownership').hidden && !$('send').disabled && !question.label.querySelector('.edit-message').disabled && $('prompt').value === draft && intact(), 'Completed ownership handoff failed to enable send/edit or changed the typed draft');
+    sync.ownership = [{ ...foreign, owned: true, requested: false, waiting: false, syncPending: true }]; await notify();
+    const syncDot = $('conversation-sync-status');
+    check($('conversation-ownership').hidden && !syncDot.hidden && syncDot.dataset.status === 'pending' && syncDot.getAttribute('aria-label') === 'History upload pending' && !syncDot.hasAttribute('title') && syncDot.nextElementSibling === $('mark-finished') && syncDot.getBoundingClientRect().height <= 10, 'Background upload added a compose row or missed the compact indicator left of Mark finished');
+    syncDot.onpointerenter();
+    check($('conversation-sync-tooltip').matches(':popover-open') && $('conversation-sync-tooltip').textContent === 'History upload pending', 'Hovering the yellow dot did not immediately show pending status');
+    const dotBounds = syncDot.getBoundingClientRect(), finishedBounds = $('mark-finished').getBoundingClientRect();
+    check(Math.abs(dotBounds.y + dotBounds.height / 2 - finishedBounds.y - finishedBounds.height / 2) < 1, 'Header sync indicator was not vertically centered beside Mark finished');
+    sync.ownership = [{ ...foreign, owned: true, requested: false, waiting: false }]; await notify();
+    check(syncDot.hidden && !$('conversation-sync-tooltip').matches(':popover-open'), 'The sync indicator or hover tooltip stayed visible after this chat finished uploading');
     check(state.items.get('ownership-final-reply')?.body.textContent.includes('Final peer reply after ownership handoff'), 'Ownership handoff left the old read-only snapshot visible instead of the final peer reply');
     await notify();
     check(calls.filter(call => call.method === 'thread/read').length === 1 && calls.filter(call => call.method === 'thread/turns/list').length === 1, 'Unchanged owned metadata repeatedly reloaded conversation history');
@@ -4261,6 +4885,12 @@ async function checks() {
     api.requestConversation = async id => { requests.push(id); throw new Error('Transfer request failed'); };
     await $('take-conversation').onclick();
     check(!$('error').hidden && $('error-text').textContent.includes('Transfer request failed') && !$('take-conversation').disabled && $('prompt').value === 'Retain the request-error draft' && intact(), 'An ownership request error vanished, locked the button, or changed the draft/other active work');
+    sync.ownership = [{ ...foreign, requested: true, waiting: true }]; await notify();
+    api.cancelConversationRequest = () => new Promise(resolve => { releaseCancel = resolve; });
+    const staleCancel = $('cancel-conversation-request').onclick(), beforeCancelRefresh = refreshes;
+    state.options = { ...options, host: 'another-machine', mode: 'ssh' }; releaseCancel(); await staleCancel;
+    check(refreshes === beforeCancelRefresh, 'A stale transfer cancellation refreshed the old machine metadata');
+    state.options = options; sync.ownership = [foreign]; await notify();
     let finishStale;
     api.requestConversation = id => { requests.push(id); return new Promise(resolve => { finishStale = resolve; }); };
     $('error').hidden = true; const stale = $('take-conversation').onclick(), beforeStaleRefresh = refreshes;
@@ -4390,11 +5020,31 @@ module.exports = async () => {
         conversationSync.ownership = new Map([[id, { id, name: 'Other Mac', owned: false, requested: false, waiting: false, busy: true, updatesAvailable: true }]]);
         state.active.delete(id); state.owned.delete(id); updateBusy();
       };
+      globalThis.previewPendingSync = () => {
+        const id = state.thread.id;
+        conversationSync.historyEnabled = true; conversationSync.status = { enabled: true, conflicts: [], queueErrors: [], historyErrors: [], error: null }; conversationSync.statusOptions = state.options;
+        conversationSync.ownership = new Map([[id, { id, name: 'This Mac', owned: true, requested: false, waiting: false, syncPending: true }]]);
+        updateBusy();
+      };
+      globalThis.previewSyncWarning = () => {
+        previewPendingSync();
+        conversationSync.status.historyErrors = [{ id: state.thread.id, message: 'Conversation changed while exporting; it will be retried.' }];
+        updateBusy();
+      };
+      globalThis.previewCancelTransfer = () => {
+        const id = state.thread.id;
+        conversationSync.ownership = new Map([[id, { id, name: 'Other Mac', owned: false, requested: true, waiting: true }]]);
+        updateBusy();
+      };
       globalThis.previewNote = () => {
         conversationSync.historyEnabled = false; $('conversation-ownership').hidden = true;
         setThread({id:'note-preview',name:'Mac-runners health',cwd:'/Users/EugeneBos/Websites/rapidcode',status:{type:'idle'}});
         preferences.conversationNotes ||= {}; preferences.conversationNotes[accessKey()] = {'note-preview':'Check the runner health report before the next release.'};
         renderConversationNote(); $('thread-menu').hidden = true;
+      };
+      globalThis.previewError = () => {
+        $('note-dialog').close();
+        showError(new Error(JSON.stringify({ error: { message: 'The request exceeds the model context limit. Reduce the conversation size and try again.\\n' + 'Additional request diagnostics remain readable here. '.repeat(24), code: 'context_length_exceeded' } })));
       };
       globalThis.previewSync = async () => {
         api.scheduleSharing = async () => ({ enabled: true, host: 'root@warmer', port: 22, key: '', folder: '~/.local/share/remote-codex/schedule-sync', connected: true });
@@ -4489,10 +5139,47 @@ module.exports = async () => {
     await new Promise(resolve => setTimeout(resolve, 100));
     if (!await testWindow.webContents.executeJavaScript("document.getElementById('conversation-ownership').checkVisibility() && document.getElementById('take-conversation').checkVisibility() && document.getElementById('load-synced-history').checkVisibility() && document.getElementById('send').disabled && document.getElementById('prompt').value === 'My unsent draft stays here'")) throw new Error('Ownership screenshot omitted its read-only panel/actions or changed the draft');
     fs.writeFileSync(path.join(__dirname, '..', 'artifacts', 'conversation-ownership.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript('previewPendingSync()');
+    await new Promise(resolve => setTimeout(resolve, 150));
+    if (!await testWindow.webContents.executeJavaScript("document.getElementById('conversation-sync-status').checkVisibility() && document.getElementById('conversation-ownership').hidden && document.getElementById('conversation-sync-status').nextElementSibling.id === 'mark-finished'")) throw new Error('Pending sync screenshot missed the compact header indicator');
+    fs.writeFileSync(path.join(artifacts, 'header-sync-pending.png'), (await testWindow.webContents.capturePage()).toPNG());
+    const syncHover = await testWindow.webContents.executeJavaScript("(() => { previewSyncWarning(); document.activeElement.blur(); const rect = document.getElementById('conversation-sync-status').getBoundingClientRect(); return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) }; })()");
+    testWindow.webContents.sendInputEvent({ type: 'mouseMove', ...syncHover });
+    await testWindow.webContents.executeJavaScript('new Promise(requestAnimationFrame)');
+    if (!await testWindow.webContents.executeJavaScript("(() => { const tooltip = document.getElementById('conversation-sync-tooltip'), rect = tooltip.getBoundingClientRect(); return tooltip.matches(':popover-open') && tooltip.textContent.includes('Conversation changed while exporting') && rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight && !document.getElementById('conversation-sync-panel').matches(':popover-open'); })()")) throw new Error('Real pointer hover did not show a bounded sync tooltip on the first frame');
+    fs.writeFileSync(path.join(artifacts, 'header-sync-hover.png'), (await testWindow.webContents.capturePage()).toPNG());
+    testWindow.webContents.sendInputEvent({ type: 'mouseMove', x: 5, y: 5 });
+    await testWindow.webContents.executeJavaScript('new Promise(requestAnimationFrame)');
+    if (await testWindow.webContents.executeJavaScript("document.getElementById('conversation-sync-tooltip').matches(':popover-open')")) throw new Error('Real pointer exit left the sync tooltip visible');
+    await testWindow.webContents.executeJavaScript("document.getElementById('conversation-sync-status').focus()");
+    if (await testWindow.webContents.executeJavaScript("document.getElementById('conversation-sync-notice').checkVisibility()")) throw new Error('A sync error displayed a warning before clicking its dot');
+    testWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+    testWindow.webContents.sendInputEvent({ type: 'char', keyCode: '\r' });
+    testWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (!await testWindow.webContents.executeJavaScript("(() => { const panel = document.getElementById('conversation-sync-panel'), rect = panel.getBoundingClientRect(); return panel.matches(':popover-open') && panel.checkVisibility() && rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight && document.getElementById('conversation-sync-status').getAttribute('aria-expanded') === 'true'; })()")) throw new Error('Keyboard opening sync details failed or its panel exceeded the viewport');
+    fs.writeFileSync(path.join(artifacts, 'header-sync-details.png'), (await testWindow.webContents.capturePage()).toPNG());
+    testWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+    testWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (await testWindow.webContents.executeJavaScript("document.getElementById('conversation-sync-panel').matches(':popover-open')")) throw new Error('Escape did not dismiss sync details');
+    await testWindow.webContents.executeJavaScript("document.getElementById('conversation-sync-status').click()");
+    testWindow.webContents.sendInputEvent({ type: 'mouseDown', x: 500, y: 10, button: 'left', clickCount: 1 });
+    testWindow.webContents.sendInputEvent({ type: 'mouseUp', x: 500, y: 10, button: 'left', clickCount: 1 });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (await testWindow.webContents.executeJavaScript("document.getElementById('conversation-sync-panel').matches(':popover-open') || document.getElementById('conversation-sync-status').getAttribute('aria-expanded') !== 'false'")) throw new Error('Clicking outside did not dismiss sync details or reset its accessible state');
+    await testWindow.webContents.executeJavaScript('previewCancelTransfer()');
+    await new Promise(resolve => setTimeout(resolve, 150));
+    fs.writeFileSync(path.join(artifacts, 'cancel-transfer.png'), (await testWindow.webContents.capturePage()).toPNG());
     await testWindow.webContents.executeJavaScript('previewNote()');
     fs.writeFileSync(path.join(artifacts, 'conversation-note.png'), (await testWindow.webContents.capturePage()).toPNG());
     await testWindow.webContents.executeJavaScript("document.getElementById('conversation-note').click()");
     fs.writeFileSync(path.join(artifacts, 'conversation-note-editor.png'), (await testWindow.webContents.capturePage()).toPNG());
+    await testWindow.webContents.executeJavaScript('previewError()');
+    fs.writeFileSync(path.join(artifacts, 'error-details.png'), (await testWindow.webContents.capturePage()).toPNG());
+    testWindow.setContentSize(620, 720);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    fs.writeFileSync(path.join(artifacts, 'error-details-narrow.png'), (await testWindow.webContents.capturePage()).toPNG());
     return results;
   } finally { testWindow.destroy(); }
 };

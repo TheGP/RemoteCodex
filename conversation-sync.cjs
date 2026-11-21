@@ -6,8 +6,8 @@ const { stateKey, hash, blobGraceMs } = require('./sync-state.cjs');
 const { writePrivate } = require('./shared-schedules.cjs');
 
 class ConversationSync {
-  constructor({ directory, shared, apply, changed = () => {}, log = () => {} }) {
-    Object.assign(this, { directory, shared, apply, changed, log });
+  constructor({ directory, shared, apply, applyShortcutMove, changed = () => {}, log = () => {} }) {
+    Object.assign(this, { directory, shared, apply, applyShortcutMove, changed, log });
     this.namespace = null; this.running = false; this.error = null;
   }
   load() {
@@ -34,6 +34,7 @@ class ConversationSync {
     this.state.pending = this.state.pending.map(op => op && typeof op === 'object' && !Array.isArray(op) ? op : { original: op });
     const failures = new Map();
     for (const op of this.state.pending) {
+      if (op.retryable && op.retryAt <= Date.now()) { delete op.error; delete op.retryable; delete op.retryAt; }
       try {
         const key = stateKey(op.kind, op.machine, op.id);
         if (!op.key) op.key = key;
@@ -70,6 +71,11 @@ class ConversationSync {
   queueErrors() {
     this.load(); return this.state.pending.filter(op => op.invalid || op.error).map(op => ({ key: op.key, kind: op.kind, machine: op.machine, id: op.id, message: op.invalid || op.error }));
   }
+  retry(key) {
+    this.load();
+    for (const op of this.state.pending) if (op.key === key) { delete op.error; delete op.retryable; delete op.retryAt; }
+    this.normalizeQueue(); this.savePending(); this.changed(); this.soon(); return this.queueErrors();
+  }
   save(state = this.state, file = this.file) {
     if (state === this.state) this.dirty = true;
     state.sequence = (state.sequence || 0) + 1;
@@ -77,10 +83,20 @@ class ConversationSync {
     if (state === this.state) this.dirty = false;
     try { fs.unlinkSync(file + '.outbox'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
-  savePending() {
+  savePending(pending = this.state.pending) {
     const dirty = this.dirty;
     this.dirty = true; this.state.sequence = (this.state.sequence || 0) + 1;
-    writePrivate(this.file + '.outbox', { sequence: this.state.sequence, pending: this.state.pending, conflicts: this.state.conflicts });
+    const outbox = this.file + '.outbox';
+    const value = { sequence: this.state.sequence, pending, conflicts: this.state.conflicts };
+    try { writePrivate(outbox, value); }
+    catch (error) {
+      // A directory sync can fail after the outbox was replaced.
+      if (pending === this.state.pending) throw error;
+      let saved;
+      try { saved = fs.readFileSync(outbox, 'utf8'); } catch { throw error; }
+      if (saved !== JSON.stringify(value)) throw error;
+      return;
+    }
     this.dirty = dirty;
   }
   pending() { this.load(); return this.state.pending.length > 0; }
@@ -91,19 +107,35 @@ class ConversationSync {
     this.load();
     return this.shared.enabled || fs.existsSync(this.file) || fs.existsSync(this.file + '.outbox');
   }
-  capture(kind, machine, id, value, seed = false, observedTurn, stale = false) {
+  capture(kind, machine, id, value, seed = false, observedTurn, stale = false, { localShortcutMove = false } = {}) {
     if (!this.canCapture()) return;
     this.load();
     const key = stateKey(kind, machine, id), current = this.state.entries[key];
-    const previous = this.state.pending.findLast(op => op.key === key);
-    if (seed && (current || previous) || !previous && isDeepStrictEqual(current?.value ?? null, value)) return;
+    const pending = localShortcutMove ? this.state.pending.slice() : this.state.pending;
+    const previous = pending.findLast(op => op.key === key);
+    if (seed && (current || previous) || !previous && isDeepStrictEqual(current?.value ?? null, value) && !(kind === 'thread' && value === null && !current)) return;
     const op = { kind, machine, id, key, opId: randomUUID(), base: previous ? null : current?.revision || 0, value: structuredClone(value), seed, ...(observedTurn ? { observedTurn } : {}) };
     if (stale || previous?.stale) op.stale = true;
+    if (localShortcutMove) op.localShortcutMove = true;
     if (previous && (!previous.sent || previous.error)) {
       op.base = previous.base; if (previous.parent) op.parent = previous.parent;
-      this.state.pending[this.state.pending.indexOf(previous)] = op;
-    } else { if (previous) op.parent = previous.opId; this.state.pending.push(op); }
-    this.savePending(); this.soon();
+      pending[pending.indexOf(previous)] = op;
+    } else { if (previous) op.parent = previous.opId; pending.push(op); }
+    this.savePending(pending);
+    this.state.pending = pending; this.soon();
+    return true;
+  }
+  pendingShortcutMove() {
+    const key = stateKey('shortcuts', 'access:local', 'shortcuts');
+    const op = this.state?.pending.findLast(op => op.key === key);
+    return op?.localShortcutMove && !op.invalid ? op : null;
+  }
+  retryShortcutMove() {
+    const move = this.pendingShortcutMove();
+    if (!move) return true;
+    try { if (this.applyShortcutMove?.(move.value)) this.changed(); }
+    catch (error) { this.log('conversation.shortcut-move.save-failed', { error: error.message }); return false; }
+    return true;
   }
   soon() {
     clearTimeout(this.timer);
@@ -177,6 +209,10 @@ class ConversationSync {
     const state = this.state, namespace = this.namespace;
     this.checkState(state, namespace);
     if ((state.entries[entry.key]?.revision || 0) > entry.revision) return false;
+    if (entry.kind === 'thread' && entry.value === null) {
+      state.pending = state.pending.filter(op => op.key !== entry.key);
+      delete state.conflicts[entry.key];
+    }
     const pending = state.pending.some(op => op.key === entry.key);
     if (state.conflicts[entry.key]) state.conflicts[entry.key] = { remote: entry };
     if (pending || state.conflicts[entry.key]) { state.entries[entry.key] = entry; return false; }
@@ -191,16 +227,26 @@ class ConversationSync {
     const namespace = this.namespace, state = this.state;
     const current = () => this.checkState(state, namespace);
     try {
+      let shortcutMoveReady = this.retryShortcutMove();
       if (this.dirty) this.save();
       await this.shared.online();
       current();
       let changed = false;
       if (this.normalizeQueue()) this.savePending();
-      const ready = () => this.state.pending.filter(op => !op.parent && !op.invalid && !op.error && Number.isSafeInteger(op.base) && !this.state.conflicts[op.key]);
+      const ready = () => this.state.pending.filter(op => !op.parent && !op.invalid && !op.error && Number.isSafeInteger(op.base) && !this.state.conflicts[op.key] && (shortcutMoveReady || op.kind !== 'shortcuts'));
       const attachments = op => [...op.value?.images || [], ...op.value?.blobs || []];
+      const reject = (op, result) => {
+        op.error = result.error;
+        if (result.retryable) { op.retryable = true; op.retryAt = Date.now() + 60000; }
+        changed = true;
+      };
       const small = () => ready().filter(op => op.kind !== 'history' && !attachments(op).length).slice(0, 50);
       const push = async operations => {
         current();
+        if (operations.some(op => op.kind === 'shortcuts') && !this.retryShortcutMove()) {
+          shortcutMoveReady = false;
+          operations = operations.filter(op => op.kind !== 'shortcuts');
+        }
         if (!operations.length) return;
         for (const op of operations) op.sent = true;
         this.save();
@@ -209,7 +255,7 @@ class ConversationSync {
         for (const result of results) {
           const op = this.state.pending.find(op => op.opId === result.opId);
           if (!op) continue;
-          if (result.error) { op.error = result.error; changed = true; continue; }
+          if (result.error) { reject(op, result); continue; }
           if (result.conflict || result.seeded && ['draft', 'shortcuts', 'history', 'note'].includes(op.kind) && !isDeepStrictEqual(op.value, result.current?.value)) {
             if (['unread', 'completion'].includes(op.kind)) {
               this.state.pending = this.state.pending.filter(item => item !== op);
@@ -241,10 +287,9 @@ class ConversationSync {
         } while (more);
       };
       await push(small()); await pull();
-      let uploaded = 0;
-      for (const op of ready().filter(op => op.kind === 'history' || attachments(op).length).slice(0, 5)) {
-        if (!this.state.pending.includes(op) || this.state.conflicts[op.key]) continue;
-        op.sent = true; this.save();
+      let uploaded = 0, recoveryPending = false;
+      const upload = async op => {
+        op.sent = true; delete op.error; delete op.blobError; this.save();
         const hashes = [...new Set(attachments(op).map(image => image.hash))];
         let unavailable = false, yielded = false;
         for (let offset = 0; offset < hashes.length; offset += 500) {
@@ -256,7 +301,11 @@ class ConversationSync {
             try {
               data = fs.readFileSync(this.blobFile(id));
               if (hash(data) !== id) throw new Error('Cached conversation attachment checksum does not match.');
-            } catch (error) { op.error = error.message; op.blobError = id; changed = unavailable = true; this.save(); break; }
+            } catch (error) {
+              op.error = error.message; op.blobError = id; changed = unavailable = true;
+              if (op.kind === 'draft' && this.state.pending.some(next => next.parent === op.opId && !next.error)) recoveryPending = true;
+              this.save(); break;
+            }
             await this.shared.bridge.call('blob-put', { hash: id, data: data.toString('base64') });
             current();
             uploaded++;
@@ -264,6 +313,32 @@ class ConversationSync {
           }
           if (unavailable || yielded) break;
         }
+        return { unavailable, yielded };
+      };
+      for (const root of this.state.pending.filter(op => op.kind === 'draft' && !op.parent && op.blobError)) {
+        const chain = this.state.pending.filter(op => op.key === root.key), latest = chain.at(-1);
+        if (latest === root || !Number.isSafeInteger(root.base) || root.base < 0 || this.state.conflicts[root.key] || [latest.value?.images, latest.value?.blobs].some(list => list !== undefined && !Array.isArray(list))) continue;
+        let node = latest; const seen = new Set();
+        while (node && node !== root && !seen.has(node)) { seen.add(node); node = chain.find(op => op.opId === node.parent); }
+        if (node !== root || seen.size !== chain.length - 1 || chain.some(op => op !== root && op.error && !op.blobError)) continue;
+        const { unavailable, yielded } = await upload(latest);
+        if (unavailable) continue;
+        if (yielded) { recoveryPending = true; break; }
+        const result = await this.shared.bridge.call('state-recover', { operation: latest, ancestors: chain.slice(0, -1).map(op => op.opId), base: root.base });
+        current();
+        if (result.error) reject(latest, result);
+        else if (result.conflict || result.seeded && !isDeepStrictEqual(latest.value, result.current?.value)) this.state.conflicts[root.key] = { remote: result.current };
+        else {
+          this.state.pending = this.state.pending.filter(op => !chain.includes(op));
+          for (const next of this.state.pending) if (next.parent === latest.opId) { next.base = result.revision; delete next.parent; }
+          if (result.current) await this.applyEntry(result.current);
+          current();
+        }
+        changed = true; this.save(); await push(small()); await pull();
+      }
+      for (const op of ready().filter(op => op.kind === 'history' || attachments(op).length).slice(0, 5)) {
+        if (!this.state.pending.includes(op) || this.state.conflicts[op.key]) continue;
+        const { unavailable, yielded } = await upload(op);
         if (!unavailable && !yielded) await push([op]);
         await push(small()); await pull();
         if (yielded) break;
@@ -272,7 +347,11 @@ class ConversationSync {
       const recovered = Boolean(this.error); this.error = null;
       try { this.pruneBlobs(); } catch (error) { this.log('conversation.blob-cleanup.failed', { error: error.message }); }
       if (changed || recovered) this.changed();
-      if (ready().length) this.soon();
+      if (ready().length || recoveryPending) this.soon();
+      else {
+        const retryAt = Math.min(...this.state.pending.filter(op => op.retryable).map(op => op.retryAt));
+        if (Number.isFinite(retryAt)) { clearTimeout(this.timer); this.timer = setTimeout(() => this.tick().catch(error => this.failed(error)), Math.max(500, retryAt - Date.now())); this.timer.unref(); }
+      }
     } finally { this.running = false; }
   }
   async resolve(key, choice, version, afterRemote) {
@@ -286,7 +365,7 @@ class ConversationSync {
     this.state.pending = this.state.pending.filter(op => op.key !== key); delete this.state.conflicts[key];
     if (conflict) this.state.entries[key] = conflict; else delete this.state.entries[key];
     try {
-      if (choice === 'local') this.capture(latest.kind, latest.machine, latest.id, latest.value);
+      if (choice === 'local') this.capture(latest.kind, latest.machine, latest.id, latest.value, false, undefined, false, { localShortcutMove: latest.localShortcutMove === true });
       else {
         this.save();
         await this.applyEntry(conflict || { key, kind: latest.kind, machine: latest.machine, id: latest.id, value: null, revision: 0 });

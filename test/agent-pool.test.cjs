@@ -66,6 +66,117 @@ test('parallel agents share a machine while models, chats, history and turns ret
   assert.equal(adapters.get('codex').calls.length + adapters.get('sample').calls.length, before);
 });
 
+test('providers without projects inherit a unique matching workspace group without changing their owner', async t => {
+  const { pool, registry, adapters } = fixture(t);
+  registry.sample.methods = registry.sample.methods.filter(method => !method.startsWith('project/'));
+  await pool.connect({ mode: 'local' });
+  const project = { id: 'rapidcode', name: 'Rapidcode', roots: [{ path: '/work/rapidcode' }] };
+  adapters.get('codex').call = async () => ({ data: [project], nextCursor: null });
+  await pool.call('project/list');
+  const thread = { id: 'sample-chat', cwd: '/work/rapidcode/' };
+  assert.equal(pool.thread('sample', thread).projectId, project.id);
+  assert.equal(pool.thread('sample', thread).provider, 'sample');
+  assert.equal(pool.thread('sample', thread).id, agentId('sample', 'thread', thread.id));
+  assert.equal(pool.thread('codex', thread).projectId, undefined, 'native project choices must stay authoritative');
+  assert.equal(pool.thread('sample', { ...thread, cwd: '/work/rapidcode-other' }).projectId, undefined);
+  assert.equal(pool.thread('sample', { ...thread, projectId: 'explicit' }).projectId, agentId('sample', 'project', 'explicit'));
+  pool.project('codex', { id: 'multi-root', roots: [{ path: '/work/primary' }, { path: '/work/secondary' }] });
+  assert.equal(pool.thread('sample', { ...thread, cwd: '/work/secondary' }).projectId, undefined, 'secondary roots must not silently redirect a conversation to the bound primary root');
+  await pool.call('turn/start', { threadId: agentId('sample', 'thread', thread.id) });
+  assert.equal(adapters.get('sample').calls.at(-1).params.threadId, thread.id);
+  pool.project('codex', { ...project, id: 'ambiguous-duplicate' });
+  assert.equal(pool.thread('sample', thread).projectId, undefined, 'ambiguous workspaces must not choose an arbitrary project');
+  pool.disconnect(); assert.equal(pool.projects.size, 0);
+});
+
+test('project pages include workspace-only providers and keep unmatched chats in Other across pagination', async t => {
+  const { pool, registry, adapters } = fixture(t);
+  registry.sample.methods = registry.sample.methods.filter(method => !method.startsWith('project/'));
+  await pool.connect({ mode: 'local' });
+  pool.project('codex', { id: 'rapidcode', roots: [{ path: '/work/rapidcode' }] });
+  const sample = [
+    { id: 'outside', cwd: '/work/other', updatedAt: 40 },
+    { id: 'matched-one', cwd: '/work/rapidcode', updatedAt: 10 },
+    { id: 'matched-two', cwd: '/work/rapidcode', updatedAt: 5 }
+  ];
+  adapters.get('codex').call = async (_method, params) => ({ data: params.projectId === 'rapidcode' ? [{ id: 'native-member', projectId: 'rapidcode', updatedAt: 20 }] : [], nextCursor: null });
+  adapters.get('sample').call = async (method, params) => {
+    adapters.get('sample').calls.push({ method, params });
+    assert.equal(params.projectId, null, 'foreign project identities must never reach the workspace-only provider');
+    const offset = Number(params.cursor || 0);
+    return { data: sample.slice(offset, offset + 1), nextCursor: offset + 1 < sample.length ? String(offset + 1) : null };
+  };
+  const found = []; let cursor;
+  do {
+    const page = await pool.call('thread/list', { projectId: 'rapidcode', limit: 1, cursor }, undefined, { provider: 'codex' });
+    found.push(...page.data); cursor = page.nextCursor;
+  } while (cursor);
+  assert.deepEqual(found.map(thread => thread.id), ['native-member', agentId('sample', 'thread', 'matched-one'), agentId('sample', 'thread', 'matched-two')]);
+  const other = await pool.call('thread/list', { projectId: null, limit: 10 });
+  assert.deepEqual(other.data.map(thread => thread.id), [agentId('sample', 'thread', 'outside')]);
+});
+
+test('sidebar search merges Codex message matches and provider title matches across pages', async t => {
+  const { pool, registry, adapters } = fixture(t);
+  registry.codex.methods.push('thread/search');
+  await pool.connect({ mode: 'local' });
+  const table = '| Error Type | Occurrences | Can Fix? | Notes';
+  const titleMatch = { id: 'title-match', updatedAt: 30 };
+  const messageMatch = { id: 'message-match', projectId: 'rapidcode', updatedAt: 20 };
+  let hasHistorySearch = true;
+  adapters.get('codex').call = async (method, params) => {
+    assert.equal(params.searchTerm, table);
+    assert.ok(!Object.hasOwn(params, 'projectId'));
+    if (method === 'thread/list') return { data: [titleMatch], nextCursor: null };
+    assert.equal(method, 'thread/search');
+    if (!hasHistorySearch) throw new Error('Invalid request: unknown variant `thread/search`');
+    return params.cursor
+      ? { data: [{ thread: messageMatch }], nextCursor: null }
+      : { data: [{ thread: titleMatch }], nextCursor: 'more-history' };
+  };
+  const query = { limit: 1, searchTerm: table, sortKey: 'updated_at' };
+  const first = await pool.call('thread/list', query);
+  const second = await pool.call('thread/list', { ...query, cursor: first.nextCursor });
+  const third = await pool.call('thread/list', { ...query, cursor: second.nextCursor });
+  assert.deepEqual([first, second, third].flatMap(page => page.data.map(thread => thread.id)),
+    ['title-match', agentId('sample', 'thread', 'same-chat'), 'message-match']);
+  assert.equal(third.data[0].projectId, 'rapidcode');
+  assert.equal(third.nextCursor, null);
+  hasHistorySearch = false;
+  const legacy = await pool.call('thread/list', { ...query, limit: 10 });
+  assert.deepEqual(legacy.data.map(thread => thread.id), ['title-match', agentId('sample', 'thread', 'same-chat')]);
+  assert.equal(legacy.errors, undefined);
+});
+
+test('completed project refreshes remove obsolete groups and partial or stale catalogs keep valid folders', async t => {
+  const { pool, registry, adapters } = fixture(t);
+  registry.sample.methods = registry.sample.methods.filter(method => !method.startsWith('project/'));
+  await pool.connect({ mode: 'local' });
+  const old = { id: 'removed', roots: [{ path: '/work/old' }] }, current = { id: 'retained', roots: [{ path: '/work/current' }] };
+  pool.project('codex', old);
+  adapters.get('codex').call = async () => ({ data: [current], nextCursor: null });
+  await pool.call('project/list');
+  assert.equal(pool.projects.has(old.id), false);
+  assert.equal(pool.thread('sample', { id: 'old-workspace', cwd: '/work/old' }).projectId, undefined);
+  pool.project('codex', old);
+  adapters.get('codex').call = async (_method, params) => {
+    if (params.cursor) throw new Error('Catalog page unavailable');
+    return { data: [current], nextCursor: 'more-native-projects' };
+  };
+  const page = await pool.call('project/list', { limit: 1 });
+  assert.ok(pool.projects.has(old.id), 'a partial project catalog must retain undiscovered groups');
+  await assert.rejects(pool.call('project/list', { limit: 1, cursor: page.nextCursor }), /Catalog page unavailable/);
+  assert.ok(pool.projects.has(old.id), 'a failed later catalog page must retain cached groups');
+  let release, started;
+  const held = new Promise(resolve => { started = resolve; });
+  adapters.get('codex').call = async () => { started(); return new Promise(resolve => { release = () => resolve({ data: [old], nextCursor: null }); }); };
+  const stale = pool.call('project/list'); await held;
+  adapters.get('codex').call = async () => ({ data: [current], nextCursor: null });
+  await pool.call('project/list'); release(); await stale;
+  assert.equal(pool.projects.has(old.id), false, 'an older catalog reply must not restore a removed group');
+  assert.ok(pool.projects.has(current.id));
+});
+
 test('direct message reads preserve wrapped identities and reject foreign or invalid item lists', async t => {
   const { pool, adapters } = fixture(t);
   await pool.connect({ mode: 'local' });
