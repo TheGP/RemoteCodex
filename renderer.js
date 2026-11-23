@@ -2743,10 +2743,11 @@ function renderSchedules() {
   }
 }
 function queueKey(threadId) { return accessKey() + ':' + threadId; }
+function markQueuePaused(queue) { queue.paused = true; queue.retry = null; }
 async function persistQueue(queue) {
   queue.saving = (queue.saving || 0) + 1; renderQueue();
   try { await api.saveQueue({ key: queue.key, machine: queue.machine, thread: queue.thread, messages: queue.messages, paused: queue.paused }); }
-  catch (error) { trace('queue.save.failed', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, error: error.message }); queue.paused = true; renderQueue(); throw new Error(`Could not save queued messages: ${error.message}`); }
+  catch (error) { trace('queue.save.failed', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, error: error.message }); markQueuePaused(queue); renderQueue(); throw new Error(`Could not save queued messages: ${error.message}`); }
   finally { queue.saving--; renderQueue(); }
 }
 async function restoreQueues() {
@@ -2759,20 +2760,32 @@ async function restoreQueues() {
     state.queues.set(queue.key, { ...queue, editing: false }); trace('queue.restored', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, paused: true });
   }
 }
-function pauseQueue(queue, reason = 'requested') { trace('queue.paused', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, reason }); queue.paused = true; queue.retry = null; return persistQueue(queue); }
+function pauseQueue(queue, reason = 'requested') { trace('queue.paused', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, reason }); markQueuePaused(queue); return persistQueue(queue); }
 function pauseQueues(reason = 'reconnect') {
   for (const queue of state.queues.values()) if (queue.machine === accessKey() && queue.messages.length) pauseQueue(queue, reason).catch(showError);
 }
-async function retryQueue(queue) {
-  if (queueLocked(queue)) return;
+function pendingQueueRetry(queue) {
+  const retry = queue?.retry;
+  return retry && retry.options === state.options && queue.messages.includes(retry.message) ? retry : null;
+}
+async function retryQueue(queue, message = queue.messages[0]) {
+  if (!message || !queue.messages.includes(message) || !queue.paused || pendingQueueRetry(queue) || queue.saving || queue.editing || queueLocked(queue) || state.dispatching.has(queue.key)) return;
   trace('queue.retry', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length });
-  const retry = {}; queue.retry = retry;
-  const current = () => queue.retry === retry && state.connected && queue.machine === accessKey() && state.queues.get(queue.key) === queue;
-  await ensureWritable(queue.thread.id);
-  if (!current()) return;
-  await reconcileActiveTurn(queue.thread.id, retry);
-  if (!current()) return;
-  queue.paused = false; await persistQueue(queue); renderQueue(); await flushQueue(queue.thread.id, true);
+  const retry = { message, options: state.options, ready: false };
+  queue.retry = retry;
+  renderQueue();
+  const current = () => pendingQueueRetry(queue) === retry && state.connected && queue.machine === accessKey() && state.queues.get(queue.key) === queue;
+  try {
+    await ensureWritable(queue.thread.id);
+    if (!current()) return;
+    await reconcileActiveTurn(queue.thread.id, retry);
+    if (!current()) return;
+    retry.ready = true;
+    renderQueue();
+    await flushQueue(queue.thread.id);
+  } finally {
+    if (!retry.ready && queue.retry === retry) { queue.retry = null; renderQueue(); }
+  }
 }
 function renderQueue() {
   const queue = state.queues.get(queueKey(state.thread?.id));
@@ -2783,6 +2796,7 @@ function renderQueue() {
   }
   $('queued-messages').replaceChildren();
   $('queued-messages').hidden = !queue?.messages.length && !native?.items.length;
+  const retry = pendingQueueRetry(queue);
   for (const message of queue?.messages || []) {
     const row = document.createElement('div'); row.className = 'queued-message';
     const handle = document.createElement('button'); handle.type = 'button'; handle.className = 'queue-drag-handle';
@@ -2805,15 +2819,16 @@ function renderQueue() {
     label.title = 'Edit queued message';
     label.disabled = state.dispatching.has(queue.key) || Boolean(queue.saving || queue.editing) || queueLocked(queue);
     label.onclick = () => editQueuedMessage(queue, message);
-    label.textContent = (queue.paused ? 'Waiting · ' : 'Queued · ') + (message.text || `${message.images.length} image(s)`);
+    const retrying = retry?.message === message;
+    label.textContent = (queue.paused && !retrying ? 'Waiting · ' : 'Queued · ') + (message.text || `${message.images.length} image(s)`);
     row.append(label);
-    const action = (text, run) => {
+    const action = (text, run, disabled = false) => {
       const button = document.createElement('button'); button.type = 'button'; button.className = 'subtle'; button.textContent = text;
-      button.disabled = state.sending || state.dispatching.has(queue.key) || Boolean(queue.saving || queue.editing) || queueLocked(queue) || !state.connected;
+      button.disabled = disabled || state.sending || state.dispatching.has(queue.key) || Boolean(queue.saving || queue.editing) || queueLocked(queue) || !state.connected;
       button.onclick = () => { if (!queueLocked(queue)) return run().catch(showError); }; row.append(button);
     };
     action('Edit', async () => editQueuedMessage(queue, message));
-    if (queue.paused) action('Retry', async () => retryQueue(queue));
+    if (queue.paused && !retrying) action('Retry', async () => retryQueue(queue, message), Boolean(retry));
     if (state.owned.has(queue.thread.id) && state.active.has(queue.thread.id)) action('Steer', async () => {
       const options = state.options;
       await reconcileActiveTurn(queue.thread.id);
@@ -2938,6 +2953,7 @@ async function submitMessage(message, steer = false, repairReasoning = false) {
   const visible = () => accessKey() === message.machine && state.thread?.id === message.thread.id;
   const temporary = 'pending-' + crypto.randomUUID();
   if (visible()) { renderItem({ type: 'userMessage', id: temporary, content: message.input }); scrollToBottom(); }
+  let startedTurn;
   try {
     if (!state.owned.has(message.thread.id)) await ensureWritable(message.thread.id);
     if (steer) await rpc('turn/steer', { threadId: message.thread.id, input: message.input, expectedTurnId: turnId });
@@ -2945,18 +2961,25 @@ async function submitMessage(message, steer = false, repairReasoning = false) {
       const settings = turnSettings(message);
       if (message.review) await rpc('thread/settings/update', settings);
       const result = message.review ? await rpc('review/start', { threadId: message.thread.id, target: { type: 'uncommittedChanges' }, delivery: 'inline' }) : await rpc('turn/start', { ...settings, input: message.input }, repairReasoning);
-      if (accessKey() === message.machine && result.turn.status === 'inProgress' && !state.finished.has(result.turn.id)) state.active.set(message.thread.id, result.turn.id);
+      startedTurn = result.turn;
+      if (accessKey() === message.machine && startedTurn.status === 'inProgress' && !state.finished.has(startedTurn.id)) state.active.set(message.thread.id, startedTurn.id);
     }
     if (accessKey() === message.machine) { state.newThreads.delete(message.thread.id); requestTitle({ ...message.thread, preview: message.text }); }
     trace('message.accepted', { machine: message.machine, threadId: message.thread.id, steer });
+    return startedTurn;
   } catch (error) {
     trace('message.failed', { machine: message.machine, threadId: message.thread.id, steer, error: error.message });
     if (visible()) { state.items.get(temporary)?.element.remove(); state.items.delete(temporary); }
     throw error;
   } finally { state.dispatching.delete(key); updateBusy(); }
 }
-async function sendQueued(queue, message, steer = false, repairReasoning = false) {
-  const ready = () => state.connected && accessKey() === queue.machine && state.queues.get(queue.key) === queue && (steer ? queue.messages.includes(message) : queue.messages[0] === message) && !state.sending && !state.dispatching.has(queue.key) && !queue.saving && !queueLocked(queue) && (steer || !queue.paused && !queue.editing && !state.active.has(queue.thread.id));
+async function sendQueued(queue, message, steer = false, repairReasoning = false, retry = null) {
+  const options = state.options;
+  const selected = () => {
+    if (retry) return queue.retry === retry && queue.messages.includes(message);
+    return steer ? queue.messages.includes(message) : !queue.paused && queue.messages[0] === message;
+  };
+  const ready = () => state.options === options && state.connected && accessKey() === queue.machine && state.queues.get(queue.key) === queue && selected() && !state.sending && !state.dispatching.has(queue.key) && !queue.saving && !queueLocked(queue) && (steer || !queue.editing && !state.active.has(queue.thread.id));
   const deferred = phase => trace('queue.deferred', { machine: queue.machine, threadId: queue.thread.id, phase, connected: state.connected, working: state.active.has(queue.thread.id), paused: queue.paused, queueLength: queue.messages.length });
   if (!ready()) return;
   try {
@@ -2964,22 +2987,29 @@ async function sendQueued(queue, message, steer = false, repairReasoning = false
     if (!ready()) { deferred('after-save'); return; }
     if (!state.owned.has(queue.thread.id)) await ensureWritable(queue.thread.id);
     if (!ready()) { deferred('after-resume'); return; }
-    await submitMessage(message, steer, repairReasoning);
+    if (retry) retry.completedTurns = new Set();
+    const turn = await submitMessage(message, steer, repairReasoning);
+    if (retry?.completedTurns.has(turn?.id) && state.connected && state.options === options) playCompletionSound();
+    if (queue.retry?.message === message) queue.retry = null;
     queue.messages = queue.messages.filter(entry => entry !== message);
     await persistQueue(queue);
   } catch (error) {
     trace('queue.failed', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, error: error.message });
     await pauseQueue(queue, 'send-failed').catch(showError);
     showError(`Queued message was not confirmed: ${error.message} Check history before retrying.`);
+  } finally {
+    if (retry) delete retry.completedTurns;
   }
   renderQueue();
 }
 async function flushQueue(threadId, repairReasoning = false) {
   const queue = state.queues.get(queueKey(threadId));
-  if (!queue || queue.paused || queue.editing || queue.saving || queueLocked(queue) || !state.connected || state.sending || state.dispatching.has(queue.key) || state.active.has(threadId) || (state.loading && state.thread?.id === threadId)) return;
-  const message = queue.messages[0];
+  if (!queue || queue.editing || queue.saving || queueLocked(queue) || !state.connected || state.sending || state.dispatching.has(queue.key) || state.active.has(threadId) || (state.loading && state.thread?.id === threadId)) return;
+  const pendingRetry = queue.paused ? pendingQueueRetry(queue) : null;
+  const retry = pendingRetry?.ready ? pendingRetry : null;
+  const message = queue.paused ? retry?.message : queue.messages[0];
   if (!message) return;
-  await sendQueued(queue, message, false, repairReasoning);
+  await sendQueued(queue, message, false, repairReasoning || Boolean(retry), retry);
   if (!queue.paused && queue.messages.length && !state.active.has(threadId)) await flushQueue(threadId);
 }
 function shortcutUnavailable(shortcut) {
@@ -3121,8 +3151,8 @@ renderShortcuts();
 async function enqueueMessage(message, paused = false) {
   const key = message.machine + ':' + message.thread.id;
   const queue = state.queues.get(key) || { key, machine: message.machine, thread: message.thread, messages: [], paused: false };
-  if (!queue.messages.length) queue.paused = Boolean(paused);
-  else if (paused) queue.paused = true;
+  if (paused) markQueuePaused(queue);
+  else if (!queue.messages.length) queue.paused = false;
   queue.messages.push(message); state.queues.set(key, queue);
   try { await persistQueue(queue); } catch (error) { queue.messages = queue.messages.filter(entry => entry !== message); throw error; }
   trace('send.queued', { machine: queue.machine, threadId: queue.thread.id, queueLength: queue.messages.length, paused: queue.paused });
@@ -3397,7 +3427,7 @@ async function resendMessage(target, text) {
     reverted = true;
     trace('edit.reverted', { machine, threadId: thread.id, turnId: target.turnId });
     queue = state.queues.get(key) || { key, machine, thread, messages: [], paused: true };
-    queue.messages.unshift(message); queue.paused = true; state.queues.set(key, queue);
+    queue.messages.unshift(message); markQueuePaused(queue); state.queues.set(key, queue);
     await persistQueue(queue);
     saved = true;
     if (!current()) return;
@@ -3710,7 +3740,11 @@ function handleNotification(message, reconciledRetry) {
         else setCompletion(params.threadId, params.turn.status);
       }
       const queue = state.queues.get(queueKey(params.threadId));
-      if (state.connected && params.turn.status === 'completed' && (!queue?.messages.length || queue.paused)) playCompletionSound();
+      if (state.connected && params.turn.status === 'completed') {
+        const retry = pendingQueueRetry(queue);
+        if (retry) retry.completedTurns?.add(params.turn.id);
+        else if (!queue?.messages.length || queue.paused) playCompletionSound();
+      }
       if (queue && ['failed', 'interrupted'].includes(params.turn.status) && (!reconciledRetry || queue.retry !== reconciledRetry)) pauseQueue(queue, 'turn-' + params.turn.status).catch(showError);
     }
     state.finished.add(params.turn.id);

@@ -1001,7 +1001,7 @@ async function checks() {
 
   {
     const previousRpc = api.rpc, options = state.options;
-    const calls = []; let latest, hold, release;
+    const calls = []; let latest, hold, release, fastRetry;
     const queueFor = (id, paused = true) => {
       state.finished.delete(id); state.active.set(threadA.id, id); state.owned.add(threadA.id);
       threadA.status = { type: 'active' };
@@ -1016,7 +1016,11 @@ async function checks() {
         if (hold) return new Promise(resolve => { release = () => resolve({ data: [latest], nextCursor: null }); });
         return { data: [latest], nextCursor: null };
       }
-      if (method === 'turn/start') return { turn: { id: 'recovered-follow-up-' + calls.length, status: 'inProgress' } };
+      if (method === 'turn/start') {
+        const turn = { id: 'recovered-follow-up-' + calls.length, status: 'inProgress' };
+        if (fastRetry) handleNotification({ method: 'turn/completed', params: { threadId: threadA.id, turn: { ...turn, status: 'completed' } } });
+        return { turn };
+      }
       return { data: [], nextCursor: null };
     };
     setThread(threadA); $('prompt').value = 'Keep my typed recovery draft'; $('prompt').focus(); $('prompt').setSelectionRange(5, 5);
@@ -1069,9 +1073,48 @@ async function checks() {
       release(); await checking; await retrying; await settle();
       check(calls.filter(call => call.method === 'turn/start').length === before + (cancel ? 0 : 1) && queue.messages.length === (cancel ? 1 : 0), 'Retry joining an existing reconciliation lost its authorization or ignored cancellation');
     }
+    hold = false;
+    const savedSound = { ...completionSound }, soundEnabled = preferences.completionSound, soundVolume = $('completion-volume').value;
+    let chimes = 0;
+    completionSound.audio = { pause() {}, play: async () => { chimes++; } };
+    preferences.completionSound = true; $('completion-volume').value = '50';
+    for (const scenario of ['completed', 'inProgress', 'fast']) {
+      const id = 'retry-second-' + scenario;
+      queue = queueFor(id);
+      const first = queue.messages[0];
+      const second = { ...first, draftId: crypto.randomUUID(), text: 'Retry only this message', input: [{ type: 'text', text: 'Retry only this message' }] };
+      queue.messages.push(second);
+      latest = { id, status: scenario === 'completed' ? 'completed' : 'inProgress', items: [] };
+      fastRetry = scenario === 'fast';
+      renderQueue();
+      const before = calls.length;
+      const beforeChimes = chimes;
+      completionSound.lastAt = -Infinity;
+      const row = $('queued-messages').children[1];
+      const retrying = [...row.querySelectorAll('button')].find(button => button.textContent === 'Retry').onclick();
+      const otherRetry = () => [...$('queued-messages').children[0].querySelectorAll('button')].find(button => button.textContent === 'Retry');
+      check(otherRetry()?.disabled, 'Another Retry was enabled during history reconciliation');
+      await retrying;
+      if (scenario !== 'completed') {
+        check(!calls.slice(before).some(call => call.method === 'turn/start'), 'Retry sent while the previous turn was still running');
+        check(otherRetry()?.disabled, 'Another Retry was enabled while a selected message was pending');
+        await retryQueue(queue, first);
+        handleNotification({ method: 'turn/completed', params: { threadId: threadA.id, turn: { id, status: 'completed' } } });
+      }
+      check(chimes === beforeChimes, 'The previous turn chimed before the selected retry ran');
+      await settle();
+      const sent = calls.slice(before).filter(call => call.method === 'turn/start');
+      check(sent.length === 1 && sent[0].params.input[0].text === second.text, 'Retry on the second row sent a different draft');
+      if (!fastRetry) handleNotification({ method: 'turn/completed', params: { threadId: threadA.id, turn: { id: state.active.get(threadA.id), status: 'completed' } } });
+      await settle();
+      check(calls.slice(before).filter(call => call.method === 'turn/start').length === 1 && queue.paused && queue.messages.length === 1 && savedQueues.get(queue.key)?.messages[0].draftId === first.draftId, 'Retry sent or discarded the remaining paused draft');
+      check(chimes === beforeChimes + 1 && otherRetry() && !otherRetry().disabled, 'Retry completion failed to chime or re-enable the remaining Retry');
+    }
+    Object.assign(completionSound, savedSound); preferences.completionSound = soundEnabled; $('completion-volume').value = soundVolume;
     state.options = options; state.queues.clear(); state.active.clear(); state.requests.clear(); activeChecks.clear(); $('prompt').value = ''; $('error').hidden = true; api.rpc = previousRpc;
   }
   results.push('idle notifications reconcile only the latest native turn, recover Retry and normal unsent queues, preserve uncertain drafts and focus, and fence newer turns, questions and machine switches');
+  results.push('Retry sends the selected queued message and keeps other drafts paused, blocks competing retries, and chimes once on completion');
 
   state.threads = [{ id: 'title-test', cwd: '/private/project', preview: 'PRIVATE PROMPT CONTENT', updatedAt: 1 }];
   state.pinnedIds.clear(); state.names.clear(); state.titling.clear(); state.titleRetries.clear();
